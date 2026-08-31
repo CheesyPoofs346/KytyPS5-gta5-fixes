@@ -464,10 +464,9 @@ IsSupportedDisplayRenderTargetTileMode(Prospero::TileMode tile_mode) noexcept {
 		return encoded <= 0.04045f ? encoded / 12.92f : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
 	};
 	switch (format) {
-		// A single-plane float target carries the clear as raw float bits, the same encoding the
+		// A single-plane float target carries its clear as raw float bits, the same encoding the
 		// depth decoder below uses. Without this the clear is discarded and the target keeps stale
-		// contents, which GTA5 shows as an enormous value in its R32_SFLOAT targets and a white frame.
-		// Reject non-finite bit patterns rather than materializing them.
+		// contents. Reject non-finite bit patterns rather than materializing them.
 		case vk::Format::eR32Sfloat: {
 			const auto value = std::bit_cast<float>(packed);
 			if (!std::isfinite(value)) {
