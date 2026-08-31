@@ -801,10 +801,56 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			return true;
 		}
 	}
+	// Report the mapping around the faulting address. GTA5 faults writing just past the end of a
+	// valid region, so where the preceding mapping ends says whether we under-sized an allocation
+	// or never mapped the page. Folded into the EXIT text because LOGF is silenced by default.
+	std::string fault_regions;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		const auto               vaddr = info->access_violation_vaddr;
+		MEMORY_BASIC_INFORMATION mbi {};
+		if (VirtualQuery(reinterpret_cast<LPCVOID>(vaddr), &mbi, sizeof(mbi)) != 0) {
+			fault_regions += fmt::format(" | at base=0x{:016x} size=0x{:x} state=0x{:x} protect=0x{:x}",
+			                             reinterpret_cast<uintptr_t>(mbi.BaseAddress),
+			                             static_cast<uint64_t>(mbi.RegionSize), mbi.State, mbi.Protect);
+		}
+		MEMORY_BASIC_INFORMATION prev {};
+		const auto probe = (vaddr & ~static_cast<uint64_t>(0xfffu)) - 0x1000u;
+		if (VirtualQuery(reinterpret_cast<LPCVOID>(probe), &prev, sizeof(prev)) != 0) {
+			const auto pb = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prev.BaseAddress));
+			fault_regions += fmt::format(" | prev base=0x{:016x} end=0x{:016x} state=0x{:x} protect=0x{:x}",
+			                             pb, pb + static_cast<uint64_t>(prev.RegionSize), prev.State,
+			                             prev.Protect);
+		}
+		// Name the guest allocation on each side of the fault. A write landing past the end of a
+		// committed guest range says which allocation is short, which host-level VirtualQuery cannot.
+		Libs::LibKernel::Memory::VirtualQueryInfo guest {};
+		if (vaddr != 0 &&
+		    Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(vaddr - 1u), 0,
+		                                                &guest, sizeof(guest)) == 0) {
+			fault_regions += fmt::format(
+			    " | guest_before start=0x{:016x} end=0x{:016x} type={} direct={} flex={} committed={} name={}",
+			    static_cast<uint64_t>(guest.start), static_cast<uint64_t>(guest.end), guest.memory_type,
+			    static_cast<uint32_t>(guest.is_direct), static_cast<uint32_t>(guest.is_flexible),
+			    static_cast<uint32_t>(guest.is_committed), guest.name);
+		}
+		Libs::LibKernel::Memory::VirtualQueryInfo guest_at {};
+		if (Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(vaddr), 0,
+		                                                &guest_at, sizeof(guest_at)) == 0) {
+			fault_regions += fmt::format(" | guest_at start=0x{:016x} end=0x{:016x} committed={} name={}",
+			                             static_cast<uint64_t>(guest_at.start),
+			                             static_cast<uint64_t>(guest_at.end), static_cast<uint32_t>(guest_at.is_committed),
+			                             guest_at.name);
+		} else {
+			fault_regions += " | guest_at=UNMAPPED";
+		}
+	}
+#endif
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
-	     " access=%u address=0x%016" PRIx64 "\n",
+	     " access=%u address=0x%016" PRIx64 "%s\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,
-	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr);
+	     static_cast<unsigned>(info->access_violation_type), info->access_violation_vaddr,
+	     fault_regions.c_str());
 }
 
 static void EncodeId64(uint16_t in_id, std::string* out_id) {

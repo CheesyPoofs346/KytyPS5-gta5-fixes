@@ -319,7 +319,8 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (!g_mount_slots.Empty()) {
-		return SAVE_DATA_ERROR_BUSY;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_BUSY");
+	return SAVE_DATA_ERROR_BUSY;
 	}
 	g_save_data_events.clear();
 
@@ -436,6 +437,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	     mount->user_id, mount->dir_name->data, mount->blocks, mount->system_blocks,
 	     mount->mount_mode, mount->resource);
 
+	// Always visible: the normal log channel is silenced by default, so a failing save mount left
+	// no trace at all. Save mounts are rare, so an unconditional line here costs nothing.
+	::printf("SaveDataMount3: dir=%s mode=%u blocks=%" PRIu64 "\n", mount->dir_name->data,
+	         mount->mount_mode, mount->blocks);
 	*mount_result = {};
 
 	Common::LockGuard lock(g_mount_mutex);
@@ -451,7 +456,8 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		return SAVE_DATA_ERROR_BUSY;
 	}
 	if (slot == SaveDataMountSlots::FULL) {
-		return SAVE_DATA_ERROR_MOUNT_FULL;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_MOUNT_FULL");
+	return SAVE_DATA_ERROR_MOUNT_FULL;
 	}
 
 	if (!create && !create2 && !open) {
@@ -459,11 +465,13 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 	}
 
 	if (open && !Common::File::IsDirectoryExisting(mount_dir)) {
-		return SAVE_DATA_ERROR_NOT_FOUND;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_NOT_FOUND");
+	return SAVE_DATA_ERROR_NOT_FOUND;
 	}
 
 	if (create && Common::File::IsDirectoryExisting(mount_dir)) {
-		return SAVE_DATA_ERROR_EXISTS;
+		::printf("SaveDataMount3: refused (%s)\n", "SAVE_DATA_ERROR_EXISTS");
+	return SAVE_DATA_ERROR_EXISTS;
 	}
 
 	bool created = false;
@@ -474,7 +482,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
-	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	const int mount_rc = mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
+	::printf("SaveDataMount3: dir=%s created=%d result=0x%08x\n", dir_name.c_str(),
+	         static_cast<int>(created), static_cast<unsigned>(mount_rc));
+	return mount_rc;
 }
 
 int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup_param,

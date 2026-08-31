@@ -781,11 +781,22 @@ public:
 			EXIT_IF(!AddMappedUnlocked(vaddr, size, MappingType::Backing));
 			return true;
 		}
+		// A failed backing map leaves the pages reserved but not committed. If a caller records the
+		// guest range as mapped anyway, the guest later writes memory that does not exist and faults
+		// somewhere unrelated, so make the failure itself visible.
+		::printf("MapBacking FAILED: vaddr=0x%016" PRIx64 " size=0x%" PRIx64 " offset=0x%" PRIx64 "\n",
+		         vaddr, size, backing_offset);
 		AddFreeUnlocked(vaddr, size);
 		return false;
 	}
 
 	bool UnmapBacking(uint64_t vaddr, uint64_t size) {
+		// Releasing backing returns the pages to reserved. If the guest range record is not
+		// updated to match, the guest keeps believing the memory is committed and faults on it.
+		static std::atomic<uint32_t> unmap_log {0};
+		if (unmap_log.fetch_add(1, std::memory_order_relaxed) < 400) {
+			::printf("UnmapBacking: vaddr=0x%016" PRIx64 " size=0x%" PRIx64 "\n", vaddr, size);
+		}
 		std::lock_guard lock(m_mutex);
 		if (!ContainsMappedUnlocked(vaddr, size, MappingType::Backing)) {
 			return false;

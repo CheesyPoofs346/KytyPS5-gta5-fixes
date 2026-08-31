@@ -175,6 +175,10 @@ bool SkipSceneSoftTransparent() {
 	return g_config->skip_scene_soft_transparent;
 }
 
+bool WaitImageReadback() {
+	return g_config->wait_image_readback;
+}
+
 bool ForceDepthAlways() {
 	return g_config->force_depth_always;
 }

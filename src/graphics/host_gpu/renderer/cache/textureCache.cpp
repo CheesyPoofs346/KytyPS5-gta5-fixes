@@ -1706,10 +1706,19 @@ bool TextureCache::TryDownloadImage(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
+	// The copy back into guest memory only happens once the submit completes. Without waiting for
+	// it, the guest CPU can read the previous contents of a GPU-produced image - stale or
+	// uninitialised - which is how a NaN reaches the lighting/exposure maths and pins the frame
+	// white. The buffer download path already waits like this; images did not.
+	const auto completion_tick = m_scheduler.CurrentTick();
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
 	});
+	if (Config::WaitImageReadback()) {
+		m_scheduler.Finish();
+		m_scheduler.WaitPriorityOperations(completion_tick);
+	}
 	return true;
 }
 

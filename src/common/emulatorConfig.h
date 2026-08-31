@@ -81,6 +81,9 @@ struct ConfigOptions {
 	// Diagnostic: drop blended depth-read-only draws using a LESS-family compare, to identify
 	// whether those draws are the props that render on top.
 	bool                   skip_scene_soft_transparent = false;
+	// Wait for a GPU image download to land in guest memory before returning, so the CPU cannot
+	// read stale contents of a GPU-produced image (a NaN source for the HDR runaway).
+	bool                   wait_image_readback         = true;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;
@@ -138,6 +141,7 @@ bool ForceDepthAlways();
 bool DepthClearOnce();
 bool FixInvertedDepthCompare();
 bool SkipSceneSoftTransparent();
+bool WaitImageReadback();
 bool DepthClearPerFrame();
 bool SuppressBandPass();
 bool FixDegenerateViewportZ();
