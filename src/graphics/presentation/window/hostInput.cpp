@@ -142,9 +142,11 @@ public:
 				}
 			}
 
-			const bool reserved = binding.key == SDLK_ESCAPE || binding.key == SDLK_SPACE ||
-			                      binding.key == SDLK_F1 || binding.key == SDLK_F7 ||
-			                      binding.key == SDLK_F11;
+			// SPACE and ESC are no longer emulator hotkeys (pause moved to F2, quit needs a
+			// modifier), so they are free to bind - SPACE especially, since jump belongs there on a
+			// keyboard. F1/F2/F7/F11 remain reserved for capture, pause, mouse-look and fullscreen.
+			const bool reserved = binding.key == SDLK_F1 || binding.key == SDLK_F2 ||
+			                      binding.key == SDLK_F7 || binding.key == SDLK_F11;
 			if (binding.control == INVALID_CONTROL || reserved ||
 			    (binding.key == SDLK_UNKNOWN && binding.mouse_button == 0)) {
 				EXIT("Invalid input mapping: %s\n", value.c_str());

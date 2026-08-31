@@ -179,6 +179,10 @@ bool WaitImageReadback() {
 	return g_config->wait_image_readback;
 }
 
+bool RetryTransientMapFaults() {
+	return g_config->retry_transient_map_faults;
+}
+
 bool ForceDepthAlways() {
 	return g_config->force_depth_always;
 }

@@ -84,6 +84,9 @@ struct ConfigOptions {
 	// Wait for a GPU image download to land in guest memory before returning, so the CPU cannot
 	// read stale contents of a GPU-produced image (a NaN source for the HDR runaway).
 	bool                   wait_image_readback         = true;
+	// Retry a fault on memory our own map says is committed, instead of aborting. Covers the
+	// non-atomic window while guest direct memory is being remapped.
+	bool                   retry_transient_map_faults  = true;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;
@@ -142,6 +145,7 @@ bool DepthClearOnce();
 bool FixInvertedDepthCompare();
 bool SkipSceneSoftTransparent();
 bool WaitImageReadback();
+bool RetryTransientMapFaults();
 bool DepthClearPerFrame();
 bool SuppressBandPass();
 bool FixDegenerateViewportZ();

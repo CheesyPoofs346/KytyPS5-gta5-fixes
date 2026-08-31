@@ -48,6 +48,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
+
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
@@ -138,6 +139,23 @@ bool ResolveComputeConstantBufferFill(const ShaderComputeInputInfo& input, uint3
 	}
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
+	// Report near-miss candidates: a two-buffer compute dispatch with no images or samplers is the
+	// shape of a metadata fill. GTA5 never satisfies the exact fingerprint above, so print what its
+	// dispatches actually look like to see whether the check can be widened rather than guessed at.
+	{
+		static std::atomic<uint32_t> shape_log {0};
+		if (program.info.buffers.size() == 2 && resources.buffers.size() == 2 &&
+		    program.info.images.empty() && program.info.samplers.empty() &&
+		    shape_log.fetch_add(1, std::memory_order_relaxed) < 30) {
+			::printf("DccFillShape: thr=%dx%dx%d wave=%u gid=%d%d%d tids=%d tg=%d grp=%ux%ux%u mode=0x%x dispatch_dims=%d blocks=%zu fallback=%d dma=%d\n",
+			         input.threads_num[0], input.threads_num[1], input.threads_num[2], input.wave_size,
+			         static_cast<int>(input.group_id[0]), static_cast<int>(input.group_id[1]),
+			         static_cast<int>(input.group_id[2]), input.thread_ids_num,
+			         static_cast<int>(input.tg_size_en), group_x, group_y, group_z, mode,
+			         static_cast<int>(input.dispatch_thread_dimensions), program.block_info.size(),
+			         static_cast<int>(program.dispatcher_fallback), static_cast<int>(program.info.uses_dma));
+		}
+	}
 	if (program.dispatcher_fallback || program.block_info.empty() ||
 	    program.info.buffers.size() != 2 || resources.buffers.size() != 2 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||

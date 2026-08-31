@@ -380,6 +380,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--retry-transient-map-faults") {
+			if (!ParseBool(value, options.config.retry_transient_map_faults)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--wait-image-readback") {
 			if (!ParseBool(value, options.config.wait_image_readback)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

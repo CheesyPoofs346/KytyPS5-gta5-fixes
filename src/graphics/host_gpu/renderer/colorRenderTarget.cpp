@@ -38,6 +38,18 @@ static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool h
 		case vk::Format::eR16G16B16A16Sfloat: info.metadata_fixed_clear_supported = has_dcc; break;
 		default: info.metadata_fixed_clear_supported = false; break;
 	}
+	// Does this target carry DCC at all, and is its clear being honoured? The GTA5 white-out was
+	// measured as 2.65e36 sitting in two R32_SFLOAT targets; if those have no DCC then every
+	// clear-path theory is dead and the producer is what needs finding.
+	{
+		static std::atomic<uint32_t> dcc_log {0};
+		if (dcc_log.fetch_add(1, std::memory_order_relaxed) < 60) {
+			::printf("ClearInfo: fmt=%d has_dcc=%d packed=0x%08x reg_clear=%d fixed_clear=%d\n",
+			         static_cast<int>(format), static_cast<int>(has_dcc), packed_clear,
+			         static_cast<int>(info.metadata_clear_supported),
+			         static_cast<int>(info.metadata_fixed_clear_supported));
+		}
+	}
 	if (!info.metadata_clear_supported) {
 		info.color_clear_value = {};
 	}
