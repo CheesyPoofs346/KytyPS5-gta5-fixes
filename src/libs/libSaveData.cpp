@@ -16,6 +16,8 @@
 #include <cstring>
 #include <deque>
 #include <vector>
+#include <ctime>
+#include <fstream>
 
 namespace Libs {
 
@@ -343,6 +345,42 @@ int KYTY_SYSV_ABI SaveDataDeleteTransactionResource(int32_t resource) {
 	return OK;
 }
 
+// Save metadata (title, subtitle, detail, mtime) has to survive a restart or the game cannot tell
+// a real save from an empty slot. It is stored beside the save data as a small binary file.
+static std::string param_file_path(const std::string& dir_name) {
+	return Common::FixDirectorySlash(std::string(SAVE_DATA_DIR) + "/" + get_title_id() + "/" +
+	                                 dir_name) +
+	       "/sce_param.bin";
+}
+
+static bool read_save_param(const std::string& dir_name, SaveDataParam* out) {
+	if (out == nullptr) {
+		return false;
+	}
+	std::ifstream file(param_file_path(dir_name), std::ios::binary);
+	if (!file.is_open()) {
+		return false;
+	}
+	SaveDataParam stored {};
+	file.read(reinterpret_cast<char*>(&stored), sizeof(stored));
+	if (file.gcount() != static_cast<std::streamsize>(sizeof(stored))) {
+		return false;
+	}
+	*out = stored;
+	return true;
+}
+
+static void write_save_param(const std::string& dir_name, const SaveDataParam& param) {
+	SaveDataParam stored = param;
+	if (stored.mtime == 0) {
+		stored.mtime = static_cast<int64_t>(::time(nullptr));
+	}
+	std::ofstream file(param_file_path(dir_name), std::ios::binary | std::ios::trunc);
+	if (file.is_open()) {
+		file.write(reinterpret_cast<const char*>(&stored), sizeof(stored));
+	}
+}
+
 int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
                                         SaveDataDirNameSearchResult*     result) {
 	PRINT_NAME();
@@ -409,7 +447,10 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		std::snprintf(result->dir_names[i].data, sizeof(result->dir_names[i].data), "%s",
 		              dir_list[i].c_str());
 		if (result->params != nullptr) {
+			// Report what was stored: a blank title or mtime reads as an empty slot and the game
+			// starts a new game instead of offering the save.
 			result->params[i] = {};
+			(void)read_save_param(dir_list[i], &result->params[i]);
 		}
 		if (result->infos != nullptr) {
 			result->infos[i]             = {};
@@ -726,6 +767,14 @@ int KYTY_SYSV_ABI SaveDataGetParam(const SaveDataMountPoint* mount_point, uint32
 			return SAVE_DATA_ERROR_PARAMETER;
 		}
 		std::memset(param_buf, 0, sizeof(SaveDataParam));
+		{
+			Common::LockGuard lock(g_mount_mutex);
+			const int slot = g_mount_slots.Find(mount_point->data);
+			if (slot >= 0) {
+				(void)read_save_param(g_mount_slots.Directory(static_cast<size_t>(slot)),
+				                      static_cast<SaveDataParam*>(param_buf));
+			}
+		}
 		if (got_size != nullptr) {
 			*got_size = sizeof(SaveDataParam);
 		}
@@ -848,6 +897,11 @@ int KYTY_SYSV_ABI SaveDataSetParam(const SaveDataMountPoint* mount_point, uint32
 		     "\t detail     = %s\n"
 		     "\t user_param = %u\n",
 		     p->title, p->sub_title, p->detail, p->user_param);
+		Common::LockGuard lock(g_mount_mutex);
+		const int slot = g_mount_slots.Find(mount_point->data);
+		if (slot >= 0) {
+			write_save_param(g_mount_slots.Directory(static_cast<size_t>(slot)), *p);
+		}
 	} else {
 		LOGF("\t unsupported param_type, accepting as no-op\n");
 	}
