@@ -256,8 +256,19 @@ static void TrackComputeDccAttachmentFill(const ShaderComputeInputInfo& input,
 	std::array<uint32_t, 4> value {};
 	// A CPU mirror must not specialize a fill whose constants are still GPU-owned.
 	if (!LibKernel::Memory::TryReadGpuCleanBacking(constants.Base48(), value.data(),
-	                                               sizeof(value)) ||
-	    !std::ranges::all_of(value, [](uint32_t word) { return word == 0x40404040u; })) {
+	                                               sizeof(value))) {
+		return;
+	}
+	if (!std::ranges::all_of(value, [](uint32_t word) { return word == 0x40404040u; })) {
+		// The accepted code (0x40404040) is the opaque-black DCC clear for the layout this was
+		// developed against. Report the fills we reject so a title using a different clear code can
+		// be identified rather than silently falling through.
+		static std::atomic<uint32_t> reject_log {0};
+		if (reject_log.fetch_add(1, std::memory_order_relaxed) < 40) {
+			::printf("DccFillRejected: words=%08x %08x %08x %08x dst=0x%010" PRIx64 " size=0x%" PRIx64 "\n",
+			         value[0], value[1], value[2], value[3], destination.Base48(),
+			         BufferDescriptorSize(destination));
+		}
 		return;
 	}
 	(void)command.GetContext().GetTextureCache().TrackFullDccAttachmentFill(

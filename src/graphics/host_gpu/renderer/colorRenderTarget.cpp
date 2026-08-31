@@ -34,6 +34,7 @@ static void ResolveDccClearInfo(RenderColorInfo& info, vk::Format format, bool h
 		case vk::Format::eB8G8R8A8Srgb:
 		case vk::Format::eA2B10G10R10UnormPack32:
 		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eR32Sfloat:
 		case vk::Format::eR16G16B16A16Sfloat: info.metadata_fixed_clear_supported = has_dcc; break;
 		default: info.metadata_fixed_clear_supported = false; break;
 	}
