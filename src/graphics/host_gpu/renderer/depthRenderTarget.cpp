@@ -18,6 +18,8 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
+#include <unordered_map>
+#include <mutex>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -25,6 +27,69 @@
 #include <limits>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// GTA5 establishes its scene depth buffer as reversed-Z: the opaque pass writes it with
+// GREATER/GEQUAL and clears it to 0. A handful of read-only transparency draws then test that same
+// buffer with a LESS-family compare, which under reversed-Z is the mirror of what it means under
+// standard-Z, so those surfaces ignore the geometry in front of them and render through walls.
+//
+// Orientation is *observed*, never assumed: only draws that actually write depth vote, and a buffer
+// is only treated as reversed once its writers clearly agree. Read-only draws never vote, so a
+// mirrored compare cannot feed back into the orientation it was derived from.
+class DepthOrientation {
+public:
+	void NoteWrite(uint64_t addr, vk::CompareOp op) {
+		if (addr == 0) {
+			return;
+		}
+		std::lock_guard lock(m_mutex);
+		auto&           votes = m_votes[addr];
+		if (op == vk::CompareOp::eGreater || op == vk::CompareOp::eGreaterOrEqual) {
+			votes.reversed++;
+		} else if (op == vk::CompareOp::eLess || op == vk::CompareOp::eLessOrEqual) {
+			votes.standard++;
+		}
+	}
+
+	// True once the writers of this buffer agree it is reversed-Z. The margin keeps a few stray
+	// writes from flipping a buffer that is genuinely standard-Z.
+	[[nodiscard]] bool IsReversed(uint64_t addr) {
+		if (addr == 0) {
+			return false;
+		}
+		std::lock_guard lock(m_mutex);
+		const auto      it = m_votes.find(addr);
+		if (it == m_votes.end()) {
+			return false;
+		}
+		return it->second.reversed >= 8 && it->second.reversed > it->second.standard * 4;
+	}
+
+private:
+	struct Votes {
+		uint32_t reversed = 0;
+		uint32_t standard = 0;
+	};
+	std::mutex                          m_mutex;
+	std::unordered_map<uint64_t, Votes> m_votes;
+};
+
+DepthOrientation g_depth_orientation; // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
+
+[[nodiscard]] vk::CompareOp MirrorDepthCompare(vk::CompareOp op) {
+	switch (op) {
+		case vk::CompareOp::eLess: return vk::CompareOp::eGreater;
+		case vk::CompareOp::eLessOrEqual: return vk::CompareOp::eGreaterOrEqual;
+		case vk::CompareOp::eGreater: return vk::CompareOp::eLess;
+		case vk::CompareOp::eGreaterOrEqual: return vk::CompareOp::eLessOrEqual;
+		default: return op;
+	}
+}
+
+} // namespace
+
 
 [[noreturn]] static void DepthFatal(const char* format, ...) {
 	std::fputs("Depth target fatal: ", stderr);
@@ -275,13 +340,41 @@ void RenderExecutor::ResolveRenderDepthTarget(uint64_t submit_id, CommandBuffer&
 	r.stencil_buffer_vaddr    = has_stencil ? z.stencil_read_base_addr : 0;
 	r.htile_buffer_size       = has_htile ? htile_backing_size : 0;
 	r.htile_buffer_vaddr      = has_htile ? z.htile_data_base_addr : 0;
-	r.depth_clear_enable      = rc.depth_clear_enable;
+	// The clear bit is edge-triggered in effect: release it for one materialization, and rearm
+	// only after the guest lowers the register again.
+	if (!rc.depth_clear_enable) {
+		m_depth_clear_consumed      = false;
+		m_depth_clear_consumed_addr = 0;
+	}
+	const bool clear_already_consumed =
+	    m_depth_clear_consumed && m_depth_clear_consumed_addr == z.z_read_base_addr;
+	r.depth_clear_enable =
+	    rc.depth_clear_enable && !(Config::DepthClearOnce() && clear_already_consumed);
 	r.depth_meta_clear_enable = false;
 	r.depth_load_clear_enable = r.depth_clear_enable;
 	r.depth_clear_value       = hw.GetDepthClearValue();
 	r.depth_test_enable       = dc.z_enable;
 	r.depth_write_enable      = dc.z_write_enable && !z.depth_view.depth_write_disable;
 	r.depth_compare_op        = static_cast<vk::CompareOp>(dc.zfunc);
+
+	// A draw that writes depth defines the buffer's orientation; one that only reads it must agree
+	// with that orientation or it is testing against inverted values.
+	if (r.depth_test_enable && r.depth_write_enable) {
+		g_depth_orientation.NoteWrite(z.z_read_base_addr, r.depth_compare_op);
+	} else if (Config::FixInvertedDepthCompare() && r.depth_test_enable && !r.depth_write_enable) {
+		const bool less_family = r.depth_compare_op == vk::CompareOp::eLess ||
+		                         r.depth_compare_op == vk::CompareOp::eLessOrEqual;
+		if (less_family && g_depth_orientation.IsReversed(z.z_read_base_addr)) {
+			const auto                   mirrored = MirrorDepthCompare(r.depth_compare_op);
+			static std::atomic<uint32_t> flip_log {0};
+			if (flip_log.fetch_add(1, std::memory_order_relaxed) < 40) {
+				LOGF("InvertedDepthCompare: depth=0x%010" PRIx64 " op=%u -> %u\n",
+				     z.z_read_base_addr, static_cast<uint32_t>(r.depth_compare_op),
+				     static_cast<uint32_t>(mirrored));
+			}
+			r.depth_compare_op = mirrored;
+		}
+	}
 
 	r.depth_bounds_test_enable = dc.depth_bounds_enable;
 	r.depth_min_bounds         = hw.GetDepthBoundsMin();

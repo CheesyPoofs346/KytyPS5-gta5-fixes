@@ -527,6 +527,7 @@ bool  ValidateProgram(const Program& program, bool require_ssa, std::string* err
 void  ResolveControlFlowIdentities(Program& program);
 bool  EquivalentValue(const Program& program, Value left, Value right);
 Value ResolveInvariantPhi(const Program& program, Value value);
+Value ResolveFirstPhiLeaf(const Program& program, Value value);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

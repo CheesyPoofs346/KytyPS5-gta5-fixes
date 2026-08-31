@@ -784,6 +784,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (layer >= 0) {
 			if (cached.binding.is_target) {
+				// No content copy here on purpose: the target is flagged needs_rebind and will be
+				// rediscovered and re-rendered. Adding a CopyImageMip looked like a fix for "lost"
+				// rendered pixels, but that premise is wrong - see CheckUnifiedTextureCacheFlow, which
+				// asserts discard-and-reload-from-guest-memory is intentional in this cache.
 				cached.binding.needs_rebind = true;
 				if (merged_id) {
 					m_slot_images[merged_id].binding.is_target = true;
@@ -1153,6 +1157,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				// Deliberate: an exact backing with insufficient resources is discarded and recreated
+				// from guest memory rather than expanded, because the guest mip layout differs once
+				// the resource count grows. Asserted by CheckUnifiedTextureCacheFlow
+				// ("insufficient-resource replacement"). Do not "fix" this into ExpandImage.
 				FreeImage(result);
 				result = {};
 			}

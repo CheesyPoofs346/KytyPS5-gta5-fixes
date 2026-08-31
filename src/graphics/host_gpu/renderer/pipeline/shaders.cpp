@@ -709,7 +709,12 @@ void CreatePipelineInternal(
 	rasterizer.pNext = &clip_ext;
 #endif
 	rasterizer.flags                   = {};
-	rasterizer.depthClampEnable        = VK_FALSE;
+	// Disabling Z clipping on GCN does not discard geometry outside the depth range - it CLAMPS it
+	// to the near/far plane and still rasterises it, which is how distant scenery stays visible
+	// instead of vanishing. Vulkan splits that into two toggles: turning depthClip off only stops
+	// the clipping, so without depthClamp the geometry keeps an out-of-range depth and can land in
+	// front of the scene rather than pinned behind it.
+	rasterizer.depthClampEnable        = static_params.depth_clip_enable ? VK_FALSE : VK_TRUE;
 	rasterizer.rasterizerDiscardEnable = VK_FALSE;
 	rasterizer.polygonMode             = vk::PolygonMode::eFill;
 	rasterizer.cullMode                = cull_mode;

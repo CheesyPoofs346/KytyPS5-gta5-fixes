@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -311,7 +312,8 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const RenderColorInfo* colors, uint32_t color_count,
-                                     const RenderDepthInfo& depth) {
+                                     const RenderDepthInfo& depth,
+                                     uint32_t ps_mrt_output_mask, uint32_t index_count) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(colors == nullptr);
@@ -337,12 +339,84 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	viewport.height   = vp.viewports[0].yscale * 2.0f;
 	viewport.minDepth = vp.viewports[0].zoffset;
 	viewport.maxDepth = vp.viewports[0].zscale + vp.viewports[0].zoffset;
+	// A collapsed Z range pins every fragment to one depth value. This must be substituted for
+	// EVERY affected draw, not just depth-writing ones: correcting the Z-prepass alone while
+	// leaving the shading pass on the collapsed range guarantees a compare mismatch. The
+	// zoffset test keeps the legitimate [1,1] sky/probe range out of this.
+	// A backdrop/skybox legitimately pins itself to the far plane with a collapsed Z range, and it
+	// draws as a fullscreen quad (a handful of indices). Remapping those to [0,1] lifts the sky off
+	// the far plane and it paints over the scene, so only rescue real meshes.
+	//
+	// This is load-bearing, not cosmetic. Measured: when the guest collapses the range to [0,0],
+	// z = z_ndc * zscale + zoffset makes EVERY depth write land on 0. The depth buffer then reads
+	// all-zero even though ~247 depth-writing passes ran, deferred lighting reconstructs every
+	// pixel at the far plane, and the scene renders black - which looks like geometry vanishing at
+	// certain camera angles. Substituting a usable range is what keeps depth meaningful.
+	constexpr uint32_t FullscreenQuadIndexLimit = 32;
+	if (Config::FixDegenerateViewportZ() && vp.viewports[0].zscale < 0.001f &&
+	    vp.viewports[0].zoffset < 0.001f && index_count > FullscreenQuadIndexLimit) {
+		viewport.minDepth = 0.0f;
+		viewport.maxDepth = 1.0f;
+	}
+	// The "mountain range" and the missing models appear/disappear together, so they are the same
+	// geometry drawn into a squashed viewport rather than two separate problems. Record the actual
+	// viewport rectangle for these draws against the framebuffer it targets.
+	if (viewport.height < 0.0f ? (-viewport.height) * 2.0f < static_cast<float>(framebuffer_extent.height)
+	                           : viewport.height * 2.0f < static_cast<float>(framebuffer_extent.height)) {
+		static std::atomic<uint32_t> squash_log {0};
+		if (squash_log.fetch_add(1, std::memory_order_relaxed) < 30) {
+			LOGF("SquashedViewport: vp=(%.1f,%.1f) %.1fx%.1f fb=%ux%u idx=%" PRIu32
+			     " ps=0x%010" PRIx64 " zs=%.9f\n",
+			     static_cast<double>(viewport.x), static_cast<double>(viewport.y),
+			     static_cast<double>(viewport.width), static_cast<double>(viewport.height),
+			     framebuffer_extent.width, framebuffer_extent.height, index_count,
+			     buffer.GetShaders().GetPs().ps_regs.data_addr,
+			     static_cast<double>(vp.viewports[0].zscale));
+		}
+	}
+	// Is scene geometry being rendered into a narrow horizontal strip instead of the full target?
+	// If so, everything visible lives inside that strip and pitching it off-screen would blank the
+	// view - which matches the reported symptom exactly.
+	{
+		static std::atomic<uint32_t> vp_log {0};
+		const float vh = viewport.height < 0.0f ? -viewport.height : viewport.height;
+		// Log ONLY partial-height viewports on a full-size target: that is the guest asking us to
+		// render into a strip of the scene, which is the state that coincides with the artifact.
+		const bool partial = framebuffer_extent.height >= 720 &&
+		                     vh + 2.0f < static_cast<float>(framebuffer_extent.height);
+		if (index_count > 32 && partial &&
+		    vp_log.fetch_add(1, std::memory_order_relaxed) < 60) {
+			LOGF("SceneViewport: vp=(%.0f,%.0f) %.0fx%.0f fb=%ux%u idx=%" PRIu32 "\n",
+			     static_cast<double>(viewport.x), static_cast<double>(viewport.y),
+			     static_cast<double>(viewport.width), static_cast<double>(vh),
+			     framebuffer_extent.width, framebuffer_extent.height, index_count);
+		}
+	}
 	vk_buffer.setViewport(0, 1, &viewport);
 
 	vk::Rect2D scissor {};
 	scissor.offset = {final_scissor.left, final_scissor.top};
 	scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
 	                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
+	// Diagnostic: a scissor far shorter than the framebuffer confines a full-screen pass to a
+	// horizontal band. That is the signature of the sky/terrain strip artifact.
+	if (framebuffer_extent.height >= 64 &&
+	    scissor.extent.height * 2u < framebuffer_extent.height) {
+		static std::atomic<uint32_t> band_log {0};
+		if (band_log.fetch_add(1, std::memory_order_relaxed) < 24) {
+			LOGF("BandScissor: scissor=(%d,%d) %ux%u framebuffer=%ux%u vp_y=%.1f vp_h=%.1f"
+			     " window_offset=%d,%d window_br=%d,%d\n",
+			     scissor.offset.x, scissor.offset.y, scissor.extent.width, scissor.extent.height,
+			     framebuffer_extent.width, framebuffer_extent.height,
+			     static_cast<double>(viewport.y), static_cast<double>(viewport.height),
+			     vp.window_offset_x, vp.window_offset_y, vp.window_scissor_right, vp.window_scissor_bottom);
+		}
+		if (Config::SuppressBandPass()) {
+			// Collapse the scissor to nothing so the band never reaches the framebuffer. Scissoring
+			// rather than skipping the draw keeps all other pipeline state and side effects intact.
+			scissor.extent = {0, 0};
+		}
+	}
 	vk_buffer.setScissor(0, 1, &scissor);
 
 	float line_width = ctx.GetLineWidth();
@@ -398,14 +472,54 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// Color-control operation selects special color-buffer paths, not the normal component write
 	// mask. Attachment availability therefore follows the target write mask.
 	for (uint32_t i = 0; i < color_count; i++) {
-		enable[i] = render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0
-		                ? VK_TRUE
-		                : VK_FALSE;
+		// The CB leaves an MRT untouched when the pixel shader does not export it, but Vulkan
+		// leaves an unwritten attachment UNDEFINED. Binding a G-buffer target the shader never
+		// writes would therefore fill it with garbage instead of preserving it, so mask those
+		// attachments off. A zero mask means "unknown", and keeps the previous behaviour.
+		// Only meaningful for real MRT passes; a single attachment cannot hit this, so leave the
+		// common path exactly as it was.
+		// Off by default: unverified, and if mrt_output_mask ever under-reports a shader export
+		// this would disable a colour write that should happen - i.e. it could CAUSE missing
+		// geometry, the very symptom being debugged. Enable with --mask-unwritten-mrt to A/B it.
+		const bool shader_writes_slot =
+		    !Config::MaskUnwrittenMrt() || color_count < 2 || ps_mrt_output_mask == 0 ||
+		    (ps_mrt_output_mask & (1u << colors[i].target_slot)) != 0;
+		enable[i] =
+		    (render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot) != 0 &&
+		     shader_writes_slot)
+		        ? VK_TRUE
+		        : VK_FALSE;
 	}
 	if (color_count != 0) {
 		vk_buffer.setColorWriteEnableEXT(color_count, enable);
 	}
 #endif
+}
+
+// Draw-acceptance census: every early return in the draw path is silent, so missing geometry
+// is invisible without counting each reason.
+static std::atomic<uint64_t> g_draw_accepted {0};
+static std::atomic<uint64_t> g_draw_skip_empty {0};
+static std::atomic<uint64_t> g_draw_skip_metadata {0};
+static std::atomic<uint64_t> g_draw_skip_no_vs {0};
+static std::atomic<uint64_t> g_draw_skip_ge {0};
+
+static std::atomic<uint64_t> g_draw_census_total {0};
+
+// Runs for every draw, so keep the common path to one relaxed increment and a modulo; only
+// gather the individual counters on the rare reporting tick.
+static void DrawCensusTick() {
+	const auto total = g_draw_census_total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (total % 20000 != 0) {
+		return;
+	}
+	LOGF("DrawCensus: accepted=%" PRIu64 " skip_empty=%" PRIu64 " skip_metadata=%" PRIu64
+	     " skip_no_vs=%" PRIu64 " skip_ge=%" PRIu64 "\n",
+	     g_draw_accepted.load(std::memory_order_relaxed),
+	     g_draw_skip_empty.load(std::memory_order_relaxed),
+	     g_draw_skip_metadata.load(std::memory_order_relaxed),
+	     g_draw_skip_no_vs.load(std::memory_order_relaxed),
+	     g_draw_skip_ge.load(std::memory_order_relaxed));
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -606,7 +720,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, target.samples);
 		}
-		const auto& view   = target.desc.view_info;
+		const auto& view = target.desc.view_info;
+		// Sample the target's incoming contents before this pass writes to it. The
+		// following Transit restores the attachment layout.
+		// GetGpu() aborts when no GPU is attached (the host test harness drives RenderContext
+		// directly), so only reach for the frame number when the probe is actually enabled.
+		if (m_context.GetHdrProbe().Enabled()) {
+			m_context.GetHdrProbe().Capture(
+			    image, static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()), view.base_level,
+			    view.base_layer, image.binding.is_bound,
+			    static_cast<uint32_t>(target.export_mapping.packed));
+		}
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
 		image.Transit(layout,
@@ -684,9 +808,48 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
-		attachment.depth_clear    = depth.depth_load_clear_enable;
+		bool depth_clear_allowed = depth.depth_load_clear_enable;
+		if (Config::DepthClearPerFrame() && depth_clear_allowed && m_context.HasGpu()) {
+			const auto frame_now = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+			const bool already_has_geometry = m_depth_dirty_frame == frame_now &&
+			                                  m_depth_dirty_addr == depth.depth_buffer_vaddr;
+			if (already_has_geometry) {
+				// The prepass has already filled this buffer this frame; clearing now would discard
+				// it and every later depth-testing pass would fail.
+				depth_clear_allowed = false;
+			} else if (m_depth_clear_frame == frame_now &&
+			           m_depth_clear_frame_addr == depth.depth_buffer_vaddr) {
+				// Already cleared this buffer this frame: a second clear would discard the depth a
+				// Z-prepass just produced, which later GEQUAL passes read back.
+				depth_clear_allowed = false;
+			} else {
+				m_depth_clear_frame      = frame_now;
+				m_depth_clear_frame_addr = depth.depth_buffer_vaddr;
+			}
+		}
+		attachment.depth_clear    = depth_clear_allowed;
+		if (!depth_clear_allowed && depth.depth_write_enable && m_context.HasGpu()) {
+			// Geometry is about to write depth into this buffer; remember that so a later clear in the
+			// same frame cannot wipe it.
+			m_depth_dirty_frame = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+			m_depth_dirty_addr  = depth.depth_buffer_vaddr;
+		}
+		if (depth.depth_load_clear_enable) {
+			// The clear has now been folded into a render state and will be applied as a loadOp.
+			// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE is a persistent context register, so without
+			// consuming it here every later render-state change in the same episode would re-arm the
+			// clear and wipe depth mid-frame. ResolveRenderDepthTarget re-arms it once the guest
+			// lowers the register again.
+			m_depth_clear_consumed      = true;
+			m_depth_clear_consumed_addr = depth.depth_buffer_vaddr;
+		}
 		attachment.has_stencil    = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eStencil);
 		attachment.stencil_clear  = depth.stencil_clear_enable;
+		m_context.GetHdrProbe().NoteDepthClear(depth.depth_load_clear_enable,
+		                                       depth.depth_meta_clear_enable,
+		                                       depth.depth_clear_value, depth.depth_test_enable,
+		                                       depth.depth_write_enable,
+		                                       static_cast<uint32_t>(depth.depth_compare_op));
 	}
 	if (color_count == 0 && !depth.image_id) {
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
@@ -1162,6 +1325,68 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawIndexBufferSource& index_source,
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug) {
+	m_context.GetHdrProbe().NoteDrawShader(buffer.GetShaders().GetPs().ps_regs.data_addr, 0);
+	{
+		const auto& dc_probe  = buffer.GetRegisters().GetDepthControl();
+		const auto& vp_probe  = buffer.GetRegisters().GetScreenViewport().viewports[0];
+		const auto& z_probe   = buffer.GetRegisters().GetDepthRenderTarget();
+		const auto& clip_probe = buffer.GetRegisters().GetClipControl();
+		// A depth-tested draw whose viewport Z range has collapsed pins every fragment to a single
+		// depth, so under GEQUAL (reversed-Z) it is rejected anywhere earlier geometry already wrote
+		// depth. Log what these draws actually are: a full-screen quad is a legitimate depth reset,
+		// a high index count is real geometry being wrongly discarded.
+		if (dc_probe.z_enable && vp_probe.zscale < 0.001f && vp_probe.zoffset < 0.001f) {
+			static std::atomic<uint32_t> degenerate_log {0};
+			if (degenerate_log.fetch_add(1, std::memory_order_relaxed) < 40) {
+				LOGF("DegenerateViewportZ: zscale=%.9f zoffset=%.9f xscale=%.1f index_count=%" PRIu32
+				     " instances=%" PRIu32 " ps=0x%010" PRIx64 " zfunc=%u zwrite=%d zmin=%.4f zmax=%.4f dx_clip=%d zexport=%d colors=%" PRIu32 " ps_active=%d\n",
+				     static_cast<double>(vp_probe.zscale), static_cast<double>(vp_probe.zoffset),
+				     static_cast<double>(vp_probe.xscale), draw.index_count, draw.instance_count,
+				     buffer.GetShaders().GetPs().ps_regs.data_addr,
+				     static_cast<uint32_t>(dc_probe.zfunc),
+				     static_cast<int>(dc_probe.z_write_enable),
+				     static_cast<double>(vp_probe.zmin), static_cast<double>(vp_probe.zmax),
+				     static_cast<int>(clip_probe.dx_clip_space),
+				     static_cast<int>(
+				         buffer.GetRegisters().GetShaderRegisters().db_shader_control
+				             .shader_z_export_enable),
+				     state.color_count, static_cast<int>(state.ps_active));
+			}
+		}
+		// The horizon band is distant geometry landing on the composited image. Identify every draw
+		// that runs with depth testing OFF, since those cannot be occluded by the interior and are
+		// the only things that can paint over a finished scene.
+		if (!dc_probe.z_enable) {
+			static std::atomic<uint32_t> nodepth_log {0};
+			if (nodepth_log.fetch_add(1, std::memory_order_relaxed) < 60) {
+				LOGF("NoDepthDraw: ps=0x%010" PRIx64 " index_count=%" PRIu32 " prim=%" PRIu32
+				     " zfunc=%u vp=%.0fx%.0f vp_y=%.0f\n",
+				     buffer.GetShaders().GetPs().ps_regs.data_addr, draw.index_count,
+				     static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()),
+				     static_cast<uint32_t>(dc_probe.zfunc),
+				     static_cast<double>(vp_probe.xscale * 2.0f),
+				     static_cast<double>(vp_probe.yscale * -2.0f),
+				     static_cast<double>(vp_probe.yoffset));
+			}
+		}
+		// The collapsed-Z pass writes depth ~0, so it only survives where the buffer is still 0.
+		// Record which depth buffer it binds and what clear state that buffer is in, to see whether
+		// the guest expects a freshly cleared target here.
+		if (vp_probe.zscale < 0.001f && vp_probe.zoffset < 0.001f && draw.index_count > 32) {
+			static std::atomic<uint32_t> cz_log {0};
+			if (cz_log.fetch_add(1, std::memory_order_relaxed) < 30) {
+				LOGF("CollapsedZDraw: ps=0x%010" PRIx64 " idx=%" PRIu32 " zread=0x%010" PRIx64
+				     " zwrite_base=0x%010" PRIx64 " z=%d/%d func=%u\n",
+				     buffer.GetShaders().GetPs().ps_regs.data_addr, draw.index_count,
+				     z_probe.z_read_base_addr, z_probe.z_write_base_addr,
+				     static_cast<int>(dc_probe.z_enable), static_cast<int>(dc_probe.z_write_enable),
+				     static_cast<uint32_t>(dc_probe.zfunc));
+			}
+		}
+		m_context.GetHdrProbe().NoteDrawDepth(
+		    dc_probe.z_enable, dc_probe.z_write_enable, dc_probe.zfunc, vp_probe.zoffset,
+		    vp_probe.zscale + vp_probe.zoffset, z_probe.z_write_base_addr);
+	}
 	EXIT_IF(draw.name == nullptr);
 	auto& ucfg = buffer.GetUserConfig();
 
@@ -1170,16 +1395,53 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	                                        state.ps_active);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
+	// GTA's missing world models all arrive here with the same pixel shader and reversed-Z
+	// GEQUAL. Capture the target immediately before that test; AcquireRenderTargets restores the
+	// attachment layout after this diagnostic copy.
+	constexpr uint64_t GtaModelDepthProbePs = 0x025b20b200ull;
+	if (m_context.GetHdrProbe().Enabled() && state.depth_info.image_id &&
+	    buffer.GetShaders().GetPs().ps_regs.data_addr == GtaModelDepthProbePs) {
+		auto& depth_image = m_context.GetTextureCache().GetImage(state.depth_info.image_id);
+		m_context.GetHdrProbe().CaptureDepth(
+		    depth_image, static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
+		    state.depth_info.desc.view_info.base_layer, state.depth_info.depth_buffer_vaddr);
+	}
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
-
+	{
+		const auto& dc_probe = buffer.GetRegisters().GetDepthControl();
+		const auto& vp_probe = buffer.GetRegisters().GetScreenViewport().viewports[0];
+		// The GTA model draws use reversed-Z GEQUAL with a near-zero viewport depth range. Record
+		// the fully resolved attachment state after AcquireRenderTargets() so the next run can prove
+		// whether a lingering clear, metadata clear, or wrong target is rejecting them.
+		if (dc_probe.z_enable && vp_probe.zscale < 0.001f && vp_probe.zoffset < 0.001f) {
+			static std::atomic<uint32_t> depth_attachment_log {0};
+			if (depth_attachment_log.fetch_add(1, std::memory_order_relaxed) < 64) {
+				LOGF("GtaDegenerateDepth: ps=0x%010" PRIx64
+				     " index_count=%" PRIu32 " addr=0x%010" PRIx64
+				     " size=%ux%u fmt=%u clear=%d load_clear=%d meta_clear=%d value=%.9f"
+				     " test=%d write=%d compare=%u consumed=%d consumed_addr=0x%010" PRIx64 "\n",
+				     buffer.GetShaders().GetPs().ps_regs.data_addr, draw.index_count,
+				     state.depth_info.depth_buffer_vaddr, state.depth_info.width,
+				     state.depth_info.height, static_cast<uint32_t>(state.depth_info.format),
+				     static_cast<int>(state.depth_info.depth_clear_enable),
+				     static_cast<int>(state.depth_info.depth_load_clear_enable),
+				     static_cast<int>(state.depth_info.depth_meta_clear_enable),
+				     static_cast<double>(state.depth_info.depth_clear_value),
+				     static_cast<int>(state.depth_info.depth_test_enable),
+				     static_cast<int>(state.depth_info.depth_write_enable),
+				     static_cast<uint32_t>(state.depth_info.depth_compare_op),
+				     static_cast<int>(m_depth_clear_consumed), m_depth_clear_consumed_addr);
+			}
+		}
+	}
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.vertex_program, state.pixel_program);
+	    state.vertex_program, state.pixel_program, draw.index_count);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1207,7 +1469,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	CommitIndexBuffer(vk_buffer, index_binding);
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
-	                         state.depth_info);
+	                         state.depth_info,
+	                         state.ps_active ? state.ps_input_info.mrt_output_mask : 0u, draw.index_count);
 
 	LogDrawPhase(draw.name, "BeginRendering");
 	if (set_auto_debug) {
@@ -1218,7 +1481,33 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	if (Config::ShouldSkipPixelShader(buffer.GetShaders().GetPs().ps_regs.data_addr)) {
+		// Diagnostic: drop every draw that uses this guest pixel shader.
+		LogDrawPhase(draw.name, "DrawSkippedByShaderFilter");
+	} else {
+		g_draw_accepted.fetch_add(1, std::memory_order_relaxed);
+		// Per-frame draw count: if geometry vanishes at some camera angles while this stays flat,
+		// the draws are being submitted and failing to render. If it drops, the guest is culling.
+		{
+			static std::atomic<uint32_t> last_frame {UINT32_MAX};
+			static std::atomic<uint32_t> frame_draws {0};
+			const auto frame_now = m_context.HasGpu()
+			                           ? static_cast<uint32_t>(m_context.GetGpu().GetFrameNum())
+			                           : 0u;
+			const auto prev = last_frame.load(std::memory_order_relaxed);
+			if (prev != frame_now) {
+				if (prev != UINT32_MAX) {
+					LOGF("FrameDraws: frame=%" PRIu32 " draws=%" PRIu32 "\n", prev,
+					     frame_draws.load(std::memory_order_relaxed));
+				}
+				last_frame.store(frame_now, std::memory_order_relaxed);
+				frame_draws.store(0, std::memory_order_relaxed);
+			}
+			frame_draws.fetch_add(1, std::memory_order_relaxed);
+		}
+		DrawCensusTick();
+		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+	}
 
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
@@ -1258,20 +1547,69 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	Common::LockGuard lock(m_context.GetMutex());
 	if (index_count == 0 || instance_count == 0) {
+		g_draw_skip_empty.fetch_add(1, std::memory_order_relaxed);
+		DrawCensusTick();
 		return;
 	}
 
 	if (ConsumeMetadataColorOperation(buffer)) {
+		g_draw_skip_metadata.fetch_add(1, std::memory_order_relaxed);
+		DrawCensusTick();
 		ResetBindings();
 		return;
 	}
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
+		g_draw_skip_no_vs.fetch_add(1, std::memory_order_relaxed);
+		DrawCensusTick();
 		return;
 	}
 
 	if (ShouldSkipGeShader(buffer)) {
+		g_draw_skip_ge.fetch_add(1, std::memory_order_relaxed);
+		DrawCensusTick();
 		return;
+	}
+
+	// Diagnostic: the backdrop/sky pass is identified by its collapsed viewport Z range. Dropping
+	// it tests whether its presence is what triggers the guest to cull scene geometry.
+	if (Config::SkipBackdropPass()) {
+		const auto& vp_skip = buffer.GetRegisters().GetScreenViewport().viewports[0];
+		if (vp_skip.zscale < 0.001f && vp_skip.zoffset < 0.001f) {
+			return;
+		}
+	}
+
+	// Identification aid for the "props render on top, through walls" bug. GTA5 draws a small group
+	// of blended, depth-read-only geometry that tests the reversed-Z scene depth with a LESS-family
+	// compare. Mirroring that compare was tried and made them cover the scene instead, which says
+	// their Z is wrong rather than their compare. Skipping them answers the remaining question:
+	// whether these draws ARE the visible panels/props.
+	if (Config::SkipSceneSoftTransparent()) {
+		const auto& bc_skip = buffer.GetRegisters().GetBlendControl(0);
+		const auto& dc_skip = buffer.GetRegisters().GetDepthControl();
+		const bool  less_family =
+		    dc_skip.zfunc == static_cast<uint8_t>(vk::CompareOp::eLess) ||
+		    dc_skip.zfunc == static_cast<uint8_t>(vk::CompareOp::eLessOrEqual);
+		if (bc_skip.enable && dc_skip.z_enable && !dc_skip.z_write_enable && less_family) {
+			static std::atomic<uint32_t> skip_log {0};
+			if (skip_log.fetch_add(1, std::memory_order_relaxed) < 20) {
+				LOGF("SkipSoftTransparent: idx=%" PRIu32 " zfunc=%u ps=0x%010" PRIx64 "\n",
+				     index_count, static_cast<uint32_t>(dc_skip.zfunc),
+				     buffer.GetShaders().GetPs().ps_regs.data_addr);
+			}
+			return;
+		}
+	}
+
+	// The distant-scenery layer renders into a variable-height strip of a 1536x768 HDR target; its
+	// composite is what appears as the horizon band. Dropping it removes the band at the cost of
+	// distant detail.
+	if (Config::SkipDistantLayer()) {
+		const auto& rt_skip = buffer.GetRegisters().GetRenderTarget(render_target_first_bound_slot(buffer));
+		if (rt_skip.attrib2.width + 1u == 1536u && rt_skip.attrib2.height + 1u == 768u) {
+			return;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {

@@ -33,6 +33,30 @@ namespace Libs::Graphics {
 
 namespace {
 
+// A dirty tree can change the shaders we generate, so the cache must not survive a rebuild.
+// Fingerprinting the running executable (size + last-write time) does exactly that: the signature
+// changes the moment the binary is relinked. That lets an uncommitted tree reuse pipelines across
+// runs of the SAME binary - otherwise every session recompiles every shader from scratch.
+std::string BuildFingerprint() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	wchar_t module_path[MAX_PATH] = {};
+	if (GetModuleFileNameW(nullptr, module_path, MAX_PATH) == 0) {
+		return {};
+	}
+	std::error_code             ec;
+	const std::filesystem::path path(module_path);
+	const auto                  size  = std::filesystem::file_size(path, ec);
+	const auto                  stamp = std::filesystem::last_write_time(path, ec);
+	if (ec) {
+		return {};
+	}
+	return fmt::format("{:x}.{:x}", static_cast<uint64_t>(size),
+	                   static_cast<uint64_t>(stamp.time_since_epoch().count()));
+#else
+	return {};
+#endif
+}
+
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -40,7 +64,7 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	return fmt::format("KytyPC1:{}:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION, BuildFingerprint(),
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
@@ -207,7 +231,7 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
+	if (git_hash.ends_with("-dirty") && BuildFingerprint().empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
@@ -374,7 +398,7 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
     const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
     const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
     bool primitive_restart_enable, const ShaderProgram& vertex_program,
-    const ShaderProgram& pixel_program) {
+    const ShaderProgram& pixel_program, uint32_t index_count) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 
 	EXIT_IF(colors.size() > RENDER_COLOR_ATTACHMENTS_MAX);
@@ -462,8 +486,37 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	}
 	static_params.with_depth         = with_depth;
 	static_params.depth_test_enable  = depth.depth_test_enable;
+	// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE is a persistent context register, and the clear is
+	// already materialized as a Vulkan loadOp. Suppressing depth writes here is only correct for
+	// the guest's dedicated fast-clear draw; if the guest leaves the bit set while drawing real
+	// geometry, that geometry silently writes no depth and stops occluding anything. Count how
+	// often the suppression actually changes the outcome so the cost is visible.
 	static_params.depth_write_enable = (depth.depth_write_enable && !depth.depth_clear_enable);
-	static_params.depth_compare_op   = depth.depth_compare_op;
+	if (depth.depth_write_enable && depth.depth_clear_enable) {
+		static std::atomic<uint64_t> suppressed {0};
+		const auto count = suppressed.fetch_add(1, std::memory_order_relaxed) + 1;
+		if ((count & (count - 1)) == 0) {
+			LOGF("DepthWriteSuppressed: %" PRIu64 " pipeline(s) built with depth writes disabled by"
+			     " DEPTH_CLEAR_ENABLE (test=%d compare=%u)\n",
+			     count, static_cast<int>(depth.depth_test_enable),
+			     static_cast<uint32_t>(depth.depth_compare_op));
+		}
+	}
+	// Diagnostic switch: if geometry reappears with this on, it was being depth-rejected; if it
+	// stays invisible, depth is not the cause and the problem is upstream of the depth test.
+	// A pass whose viewport Z range has collapsed pins every fragment to ~0, which under reversed-Z
+	// GEQUAL is rejected everywhere the prepass already wrote real depth - so its geometry appears
+	// or vanishes depending on where the camera looks. Let those draws through instead of testing
+	// against depths they were never given. Fullscreen quads are excluded: a sky/backdrop uses the
+	// same collapsed range deliberately to sit at the far plane, and must keep its normal compare.
+	const auto&        vp_z          = ctx.GetScreenViewport().viewports[0];
+	constexpr uint32_t QuadIndexLimit = 32;
+	const bool         collapsed_mesh = vp_z.zscale < 0.001f && vp_z.zoffset < 0.001f &&
+	                             index_count > QuadIndexLimit;
+	static_params.depth_compare_op =
+	    (Config::ForceDepthAlways() || (Config::FixCollapsedDepthCompare() && collapsed_mesh))
+	        ? vk::CompareOp::eAlways
+	        : depth.depth_compare_op;
 	static_params.depth_bounds_test_enable = depth.depth_bounds_test_enable;
 	static_params.depth_min_bounds         = depth.depth_min_bounds;
 	static_params.depth_max_bounds         = depth.depth_max_bounds;

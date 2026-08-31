@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
+#include "graphics/guest_gpu/occlusionQueries.h"
 #include "graphics/presentation/renderDoc.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -1003,6 +1004,28 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 	}
 
+	// Census: this early return sits UPSTREAM of RenderExecutor::DrawIndex, so a batch dropped
+	// here is invisible to the draw census. GPU-driven batches take their count from memory a
+	// compute pass writes; if that never reaches the CPU the whole batch silently disappears.
+	{
+		static std::atomic<uint64_t> multi_total {0};
+		static std::atomic<uint64_t> multi_zero {0};
+		static std::atomic<uint64_t> multi_draws {0};
+		const auto total = multi_total.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (draw_count == 0) {
+			multi_zero.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			multi_draws.fetch_add(draw_count, std::memory_order_relaxed);
+		}
+		if (total % 2000 == 0) {
+			LOGF("IndirectMultiCensus: calls=%" PRIu64 " zero_count=%" PRIu64 " draws_issued=%" PRIu64
+			     " from_count_addr=%d\n",
+			     total, multi_zero.load(std::memory_order_relaxed),
+			     multi_draws.load(std::memory_order_relaxed),
+			     static_cast<int>(count_addr != nullptr));
+		}
+	}
+
 	if (draw_count == 0) {
 		return;
 	}
@@ -1519,6 +1542,14 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			if (Config::RealOcclusionQueries()) {
+				if (!m_occlusion.Enabled() && GetScheduler().Active()) {
+					m_occlusion.Initialize(m_renderer.GetGraphics(), GetScheduler());
+				}
+				if (m_occlusion.Dump(event_address)) {
+					break;
+				}
+			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are currently treated as "
@@ -1527,15 +1558,30 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 
 			// Until host occlusion queries are implemented, publish an always-visible result. The
 			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
-			constexpr uint64_t ready_bit    = 1ull << 63u;
-			constexpr uint64_t counter_mask = ready_bit - 1u;
-			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
-			const auto         value        = ready_bit | m_synthetic_occlusion_counter;
+			// ready. The guest issues this event twice at addresses one qword apart - once for the
+			// begin counters and once for the end counters - so each dump writes ONE value per DB at a
+			// 16-byte stride and the counter advances between them. Writing both halves here would
+			// clobber the end slot during the begin pass (see CheckPm4SyntheticOcclusionCounterDump).
+			//
+			// The advance must be a PLAUSIBLE sample count, not 1. The guest compares the returned
+			// count against how much of the screen the queried object covers; a single sample reads as
+			// ~100% occluded, so the game culls the object from rendering while still simulating it -
+			// producing geometry you can collide with but cannot see. This is roughly a quarter of a
+			// 4K frame per DB, comfortably "fully visible" without approaching the 63-bit counter range.
+			constexpr uint64_t ready_bit       = 1ull << 63u;
+			constexpr uint64_t counter_mask    = ready_bit - 1u;
+			// Must EXCEED the largest coverage any object can have, or the guest compares our fixed
+			// answer against a bigger expected screen area, concludes the object is mostly occluded
+			// and culls it - which shows up as geometry vanishing at particular camera angles. A
+			// full 2560x1440 frame is ~3.7M samples, so stay comfortably above that.
+			constexpr uint64_t visible_samples = 0x00800000ull;
+			auto*              results         = reinterpret_cast<volatile uint64_t*>(event_address);
+			const auto         value           = ready_bit | m_synthetic_occlusion_counter;
 			for (uint32_t db = 0; db < 16u; db++) {
 				results[db * 2u] = value;
 			}
-			m_synthetic_occlusion_counter = (m_synthetic_occlusion_counter + 1u) & counter_mask;
+			m_synthetic_occlusion_counter =
+			    (m_synthetic_occlusion_counter + visible_samples) & counter_mask;
 			break;
 		}
 		default:

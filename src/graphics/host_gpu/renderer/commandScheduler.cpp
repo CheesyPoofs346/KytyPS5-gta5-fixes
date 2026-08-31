@@ -365,6 +365,10 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	// Close anything that must not straddle the buffer boundary (GPU queries) before ending it.
+	if (m_before_submit) {
+		m_before_submit();
+	}
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);
 
@@ -417,6 +421,10 @@ void CommandScheduler::BeginNext() {
 	EXIT_IF(!m_command.IsInvalid());
 	BindCurrent();
 	BeginCommand();
+	// Re-open anything that had to be closed for the previous submit.
+	if (m_after_begin) {
+		m_after_begin();
+	}
 }
 
 } // namespace Libs::Graphics

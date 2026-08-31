@@ -3,6 +3,7 @@
 #include "graphics/shader/shader.h"
 
 #include <fmt/format.h>
+#include <deque>
 #include <map>
 #include <new>
 #include <unordered_map>
@@ -147,6 +148,37 @@ Value ResolveInvariantPhi(const Program& program, Value value) {
 		}
 	}
 	return invariant;
+}
+
+// Resource-tracking fallback for a phi whose branches select DIFFERENT descriptors (GTA5 does this
+// for a sampler behind a conditional). Fully supporting it needs runtime descriptor selection; until
+// then, returning one leaf lets the shader compile and the draw render with one of the two
+// descriptors, which is far better than aborting the emulator on an otherwise legal shader.
+// Deterministic: always the first leaf in argument order, so the choice is stable across runs.
+Value ResolveFirstPhiLeaf(const Program& program, Value value) {
+	const auto invariant = ResolveInvariantPhi(program, value);
+	if (!invariant.IsEmpty()) {
+		return invariant;
+	}
+	value = value.Resolve();
+	std::deque<Value>               pending {value};
+	std::unordered_set<const Inst*> visited;
+	while (!pending.empty()) {
+		const auto current = pending.front().Resolve();
+		pending.pop_front();
+		const auto* inst = current.TryInstruction();
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::Phi) {
+			if (!visited.insert(inst).second) {
+				continue;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+			continue;
+		}
+		return current;
+	}
+	return {};
 }
 
 bool ValidateProgram(const Program& program, bool require_ssa, std::string* error) {

@@ -721,7 +721,15 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
 
-	auto frame_format = info.pixel_format;
+	// Use the format the resolved image ACTUALLY has, not the one that was requested. The texture
+	// cache matches surfaces with SameBacking(exact_format=false), which accepts any
+	// format-compatible image - eR8G8B8A8Unorm and eB8G8R8A8Unorm are in the same class - so the
+	// image handed back here can carry the opposite channel order. CopyFrom() below is a raw
+	// vkCmdCopyImage with no format conversion, so configuring the frame from the requested
+	// format instead would copy RGBA bytes into a BGRA image and swap red and blue in everything
+	// presented. The swapchain blit converts properly afterwards, so mirroring the source here is
+	// both correct and sufficient.
+	auto frame_format = image.backing.format;
 	switch (frame_format) {
 		case vk::Format::eR8G8B8A8Srgb: frame_format = vk::Format::eR8G8B8A8Unorm; break;
 		case vk::Format::eB8G8R8A8Srgb: frame_format = vk::Format::eB8G8R8A8Unorm; break;

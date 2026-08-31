@@ -184,6 +184,24 @@ private:
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
 
+	// DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE is a persistent context register, but the clear it
+	// requests must happen ONCE. Without this, every render-state change re-materialized the
+	// loadOp clear and wiped the depth written by earlier geometry in the same frame.
+	// Address of the depth buffer whose pending clear has already been folded into a render
+	// state. Tracked per buffer: consuming the clear for one depth target must not suppress it
+	// for a different one bound later in the same frame.
+	bool                                  m_depth_clear_consumed      = false;
+	uint64_t                              m_depth_clear_consumed_addr = 0;
+	// Last frame in which each depth buffer was cleared, so a Z-prepass filled earlier in the
+	// frame is not wiped by a second clear before the passes that consume it.
+	uint64_t                              m_depth_clear_frame_addr    = 0;
+	// Depth buffer that has had geometry written into it since its last clear, and the frame that
+	// happened in. A clear arriving after the Z-prepass has filled the buffer would wipe exactly the
+	// depth the later passes read back, so it must be suppressed no matter how many clears the frame
+	// has already issued.
+	uint64_t                              m_depth_dirty_addr          = 0;
+	uint32_t                              m_depth_dirty_frame         = UINT32_MAX;
+	uint32_t                              m_depth_clear_frame         = UINT32_MAX;
 	RenderContext&                        m_context;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;

@@ -6,6 +6,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
+#include "graphics/guest_gpu/occlusionQueries.h"
+
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -158,6 +160,7 @@ private:
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
 	GpuResourceManager& GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
+	OcclusionQueries m_occlusion;
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;
 	HW::Context      m_saved_ctx;

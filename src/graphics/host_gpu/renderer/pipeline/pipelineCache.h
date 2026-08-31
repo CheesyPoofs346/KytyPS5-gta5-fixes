@@ -145,7 +145,7 @@ public:
 	    const ShaderVertexInputInfo& vs_input_info, CommandBuffer& command,
 	    const ShaderPixelInputInfo* ps_input_info, vk::PrimitiveTopology topology,
 	    bool primitive_restart_enable, const ShaderProgram& vertex_program,
-	    const ShaderProgram& pixel_program);
+	    const ShaderProgram& pixel_program, uint32_t index_count);
 	ComputePipeline& CreateComputePipeline(ShaderComputeInputInfo& input_info,
 	                                       const ShaderProgram&    compute_program);
 

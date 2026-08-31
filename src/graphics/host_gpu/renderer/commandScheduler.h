@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 
 #include <queue>
@@ -38,6 +39,14 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Hooks around the command-buffer boundary. A GPU query must begin and end in the SAME command
+	// buffer, so anything spanning a flush has to close its query before the submit and re-open it
+	// on the next buffer.
+	void SetBufferBoundaryHooks(std::function<void()> before_submit, std::function<void()> after_begin) {
+		m_before_submit = std::move(before_submit);
+		m_after_begin   = std::move(after_begin);
+	}
+
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
@@ -102,6 +111,9 @@ private:
 	HW::Context*                 m_registers            = nullptr;
 	HW::UserConfig*              m_user_config          = nullptr;
 	HW::Shader*                  m_shaders              = nullptr;
+	// Invoked immediately before a submit and immediately after the next buffer begins.
+	std::function<void()>        m_before_submit;
+	std::function<void()>        m_after_begin;
 };
 
 } // namespace Libs::Graphics

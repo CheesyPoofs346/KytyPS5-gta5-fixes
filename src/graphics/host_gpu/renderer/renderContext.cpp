@@ -16,6 +16,7 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_hdr_probe.Initialize(graphics, m_command_scheduler);
 }
 
 RenderContext::~RenderContext() {

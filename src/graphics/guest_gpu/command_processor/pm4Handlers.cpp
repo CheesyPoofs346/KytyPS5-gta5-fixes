@@ -1235,7 +1235,16 @@ KYTY_HW_CTX_PARSER(HwCtxSetViewportScaleOffset) {
 			case 1: cp.GetCtx().SetViewportXOffset(viewport, value); break;
 			case 2: cp.GetCtx().SetViewportYScale(viewport, value); break;
 			case 3: cp.GetCtx().SetViewportYOffset(viewport, value); break;
-			case 4: cp.GetCtx().SetViewportZScale(viewport, value); break;
+			case 4: {
+				static std::atomic<uint32_t> zs_log {0};
+				if (viewport == 0 && value < 0.001f &&
+				    zs_log.fetch_add(1, std::memory_order_relaxed) < 12) {
+					LOGF("ViewportZWrite[direct]: vp0 ZSCALE raw=0x%08" PRIx32 " float=%.9f\n",
+					     *reinterpret_cast<const uint32_t*>(buffer + i), static_cast<double>(value));
+				}
+				cp.GetCtx().SetViewportZScale(viewport, value);
+				break;
+			}
 			case 5: cp.GetCtx().SetViewportZOffset(viewport, value); break;
 			default: EXIT("invalid viewport scale/offset field\n");
 		}
@@ -3334,6 +3343,13 @@ void GraphicsInitJmpTablesCxIndirect() {
 	for (auto cmd_offset = Pm4::PA_CL_VPORT_ZSCALE; cmd_offset <= Pm4::PA_CL_VPORT_ZSCALE_15;
 	     cmd_offset += 6) {
 		g_hw_ctx_indirect_func[cmd_offset] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
+			static std::atomic<uint32_t> zs_log2 {0};
+			if (cmd_offset == Pm4::PA_CL_VPORT_ZSCALE &&
+			    *reinterpret_cast<const float*>(&value) < 0.001f &&
+			    zs_log2.fetch_add(1, std::memory_order_relaxed) < 12) {
+				LOGF("ViewportZWrite[indirect]: vp0 ZSCALE raw=0x%08" PRIx32 " float=%.9f\n",
+				     value, static_cast<double>(*reinterpret_cast<const float*>(&value)));
+			}
 			cp.GetCtx().SetViewportZScale((cmd_offset - Pm4::PA_CL_VPORT_ZSCALE) / 6,
 			                              *reinterpret_cast<const float*>(&value));
 		};

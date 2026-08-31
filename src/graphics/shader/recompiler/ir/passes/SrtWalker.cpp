@@ -175,10 +175,15 @@ private:
 			return finish(true);
 		}
 		if (op == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(m_program, value);
+			auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
-				reason = "contains a control-dependent phi";
-				return finish(false);
+				// Different descriptors per branch. Accept one leaf rather than failing the
+				// shader: aborting the emulator over a legal shader is the worse outcome.
+				invariant = ResolveFirstPhiLeaf(m_program, value);
+				if (invariant.IsEmpty()) {
+					reason = "contains a control-dependent phi";
+					return finish(false);
+				}
 			}
 			return finish(Validate(invariant, reason));
 		}
@@ -469,7 +474,10 @@ private:
 	}
 
 	bool EvaluatePhi(const Inst& inst, uint64_t& result, std::string* error) {
-		const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+		auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+		if (value.IsEmpty()) {
+			value = ResolveFirstPhiLeaf(m_program, Value(const_cast<Inst*>(&inst)));
+		}
 		return !value.IsEmpty() ? EvaluateWide(value, result, error)
 		                        : Fail(error, "typed phi has runtime-dependent values");
 	}

@@ -147,7 +147,13 @@ void GameController::Disconnect(int id) {
 	Common::LockGuard lock(m_mutex);
 
 	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
-	EXIT_IF(it == m_connected_ids.end());
+	if (it == m_connected_ids.end()) {
+		// Disconnecting an id that is not connected is a no-op, mirroring Connect() above, which
+		// already returns early when the id is present. The guest can legitimately issue a
+		// redundant disconnect (or one for a pad that was never connected); aborting there took
+		// the whole emulator down mid-run.
+		return;
+	}
 
 	m_connected_ids.erase(it);
 

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "common/emulatorConfig.h"
 
 #include <algorithm>
 
@@ -465,6 +466,25 @@ void EmitExport(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                           mapping.Map(3)});
 				value = mapped;
 			}
+		}
+		// Diagnostic workaround for the GTA5 HDR runaway: bound what a pixel shader can write
+		// into a float colour target. Measured legitimate scene values sit below ~30, while the
+		// runaway pins every channel at the format ceiling (~65024), so a limit well above real
+		// content still stops the saturation cascade.
+		const auto export_clamp = Config::HdrExportClamp();
+		// Clamp ONLY FP16_ABGR (RGBA16F) targets. Clamping every float target crushes the
+		// intermediate HDR buffers the bloom and tonemap chain needs, which reads as a washed-out
+		// haze over the whole image; the runaway that whites the screen out lives in the 16F target.
+		if (export_clamp > 0.0f && !uint_output && state.stage == ShaderType::Pixel &&
+		    exp.kind == IR::ExportTargetKind::Mrt && MrtOutputMode(state, exp) == 4u) {
+			const auto scalar = ConstantF32Value(state, export_clamp);
+			const auto limit  = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpCompositeConstruct, vector_type, limit, scalar, scalar, scalar, scalar});
+			const auto clamped = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {OpExtInst, vector_type, clamped, GlslStd450(state), GlslFMin, value, limit});
+			value = clamped;
 		}
 		if (exp.kind == IR::ExportTargetKind::Position) {
 			const auto pointer = state.builder.AllocateId();

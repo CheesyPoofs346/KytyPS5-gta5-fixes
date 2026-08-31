@@ -71,6 +71,33 @@ static void PrintUsage() {
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	::printf("  --hdr-probe <true|false>             Log max/mean of every float color target.\n");
+	::printf("  --hdr-probe-interval <num>           Probe every Nth frame. Default: 60.\n");
+	::printf("  --skip-distant-layer <t|f>           Drop the variable-height distant-scenery\n"
+	         "                                       strip that shows up as the horizon band.\n");
+	::printf("  --skip-backdrop-pass <t|f>           Diagnostic: drop the collapsed-viewport-Z\n"
+	         "                                       backdrop/sky draws entirely.\n");
+	::printf("  --real-occlusion-queries <t|f>       Use real GPU occlusion queries instead of a\n"
+	         "                                       synthetic constant. Default true.\n");
+	::printf("  --fix-collapsed-depth-compare <t|f>  Let collapsed-viewport-Z MESHES through the\n"
+	         "                                       depth test instead of rejecting them.\n");
+	::printf("  --fix-degenerate-viewport-z <t|f>    Substitute [0,1] when a depth-WRITING draw\n"
+	         "                                       has a collapsed viewport Z range.\n");
+	::printf("  --suppress-band-pass <t|f>           Scissor out the horizon/sky band pass drawn\n"
+	         "                                       into the presentation framebuffer.\n");
+	::printf("  --depth-clear-per-frame <t|f>        Allow only ONE depth clear per buffer per\n"
+	         "                                       frame, so a Z-prepass is not wiped mid-frame.\n");
+	::printf("  --skip-scene-soft-transparent <t|f>  Drop blended LESS-compare scene draws (diagnostic)\n");
+	::printf("  --fix-inverted-depth-compare <t|f>   Mirror LESS depth tests on reversed-Z\n");
+	::printf("  --depth-clear-once <t|f>             Materialize a depth clear once per clear\n"
+	         "                                       episode. Default true; false re-clears per\n"
+	         "                                       render pass as before.\n");
+	::printf("  --force-depth-always <t|f>           Diagnostic: force depth compare to ALWAYS,\n"
+	         "                                       so nothing can be depth-rejected.\n");
+	::printf("  --mask-unwritten-mrt <t|f>          Mask off MRT attachments the pixel shader\n"
+	         "                                       never writes. Experimental; default off.\n");
+	::printf("  --hdr-clamp <float>                  Clamp pixel-shader colour exports to this\n"
+	         "                                       value on float targets. 0 disables.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	::printf("  --redzone                            Protect the guest SysV red zone.\n");
@@ -304,6 +331,82 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--hdr-probe") {
+			if (!ParseBool(value, options.config.hdr_probe_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--hdr-probe-interval") {
+			const int32_t hdr_interval = Common::ToInt32(value);
+			options.config.hdr_probe_interval =
+			    static_cast<uint32_t>(hdr_interval < 1 ? 1 : hdr_interval);
+		} else if (arg == "--hdr-probe-start") {
+			const int32_t hdr_start = Common::ToInt32(value);
+			options.config.hdr_probe_start = static_cast<uint32_t>(hdr_start < 0 ? 0 : hdr_start);
+		} else if (arg == "--skip-ps") {
+			options.config.skip_ps.push_back(std::strtoull(value.c_str(), nullptr, 0));
+		} else if (arg == "--skip-distant-layer") {
+			if (!ParseBool(value, options.config.skip_distant_layer)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-backdrop-pass") {
+			if (!ParseBool(value, options.config.skip_backdrop_pass)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--real-occlusion-queries") {
+			if (!ParseBool(value, options.config.real_occlusion_queries)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--fix-collapsed-depth-compare") {
+			if (!ParseBool(value, options.config.fix_collapsed_depth_compare)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--fix-degenerate-viewport-z") {
+			if (!ParseBool(value, options.config.fix_degenerate_viewport_z)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--suppress-band-pass") {
+			if (!ParseBool(value, options.config.suppress_band_pass)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--depth-clear-per-frame") {
+			if (!ParseBool(value, options.config.depth_clear_per_frame)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--skip-scene-soft-transparent") {
+			if (!ParseBool(value, options.config.skip_scene_soft_transparent)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--fix-inverted-depth-compare") {
+			if (!ParseBool(value, options.config.fix_inverted_depth_compare)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--depth-clear-once") {
+			if (!ParseBool(value, options.config.depth_clear_once)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--force-depth-always") {
+			if (!ParseBool(value, options.config.force_depth_always)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--mask-unwritten-mrt") {
+			if (!ParseBool(value, options.config.mask_unwritten_mrt)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--hdr-clamp") {
+			options.config.hdr_export_clamp = std::strtof(value.c_str(), nullptr);
 		} else if (arg == "--keymap") {
 			const auto split = value.find('=');
 			if (split == std::string::npos || split == 0 || split + 1 == value.size()) {

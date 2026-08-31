@@ -119,6 +119,78 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool HdrProbeEnabled() {
+	return g_config->hdr_probe_enabled;
+}
+
+uint32_t HdrProbeInterval() {
+	return g_config->hdr_probe_interval;
+}
+
+bool ShouldSkipPixelShader(uint64_t ps_addr) {
+	if (g_config->skip_ps.empty() || ps_addr == 0) {
+		return false;
+	}
+	return std::find(g_config->skip_ps.begin(), g_config->skip_ps.end(), ps_addr) !=
+	       g_config->skip_ps.end();
+}
+
+bool SkipDistantLayer() {
+	return g_config->skip_distant_layer;
+}
+
+bool SkipBackdropPass() {
+	return g_config->skip_backdrop_pass;
+}
+
+bool RealOcclusionQueries() {
+	return g_config->real_occlusion_queries;
+}
+
+bool FixCollapsedDepthCompare() {
+	return g_config->fix_collapsed_depth_compare;
+}
+
+bool FixDegenerateViewportZ() {
+	return g_config->fix_degenerate_viewport_z;
+}
+
+bool SuppressBandPass() {
+	return g_config->suppress_band_pass;
+}
+
+bool DepthClearPerFrame() {
+	return g_config->depth_clear_per_frame;
+}
+
+bool DepthClearOnce() {
+	return g_config->depth_clear_once;
+}
+
+bool FixInvertedDepthCompare() {
+	return g_config->fix_inverted_depth_compare;
+}
+
+bool SkipSceneSoftTransparent() {
+	return g_config->skip_scene_soft_transparent;
+}
+
+bool ForceDepthAlways() {
+	return g_config->force_depth_always;
+}
+
+bool MaskUnwrittenMrt() {
+	return g_config->mask_unwritten_mrt;
+}
+
+uint32_t HdrProbeStart() {
+	return g_config->hdr_probe_start;
+}
+
+float HdrExportClamp() {
+	return g_config->hdr_export_clamp;
+}
+
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

@@ -242,8 +242,15 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	if (key.down) {
 		switch (key.key_code) {
-			case SDLK_ESCAPE: game.need_exit = true; break;
-			case SDLK_SPACE: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			// ESC and SPACE are pressed constantly during normal play (menus, jump), so binding
+			// them to "quit now" and "freeze the renderer" made the emulator look like it was
+			// crashing or hanging. Quit needs a modifier; pause moved to a function key.
+			case SDLK_ESCAPE:
+				if ((SDL_GetModState() & (KMOD_CTRL | KMOD_SHIFT)) != 0) {
+					game.need_exit = true;
+				}
+				break;
+			case SDLK_F2: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();

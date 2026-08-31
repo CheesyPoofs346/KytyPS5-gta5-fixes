@@ -844,8 +844,9 @@ static void ApplyPixelOutputs(ShaderPixelInputInfo&                info,
 static bool LogPermutationMismatch(const ShaderRecompiler::IR::Program& program,
                                    const char* stage, const std::string& error) {
 	static std::atomic<uint32_t> log_count {0};
-	if (Config::GraphicsDebugDumpEnabled() &&
-	    log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
+	// Always report these. A failed materialization silently REUSES the previous stage, so a draw
+	// renders with the wrong shader or resources and nothing else in the log shows it.
+	if (log_count.fetch_add(1, std::memory_order_relaxed) < 64) {
 		LOGF("ShaderProgramCache native runtime mismatch %s shader=0x%016" PRIx64 ": %s\n",
 		     stage, program.shader_hash, error.c_str());
 	}
@@ -1264,6 +1265,17 @@ static vk::ShaderModule CompileModule(vk::Device device, const ShaderParams& par
 		ExitShaderRecompilerFailure(label, options.shader_hash, "SPIR-V validation failed");
 	}
 	DumpShaderRecompilerSpirv(stage_name, options.shader_hash, result.spirv);
+
+	// The SPIR-V dumps are named by shader_hash, but every runtime diagnostic (draw logs, the HDR
+	// probe) identifies a shader by its GUEST address. Publish the join so a suspect address can
+	// be traced to its dumped shader without guessing.
+	{
+		static std::atomic<uint32_t> log_count {0};
+		if (log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+			LOGF("ShaderCompiled: stage=%s hash=0x%016" PRIx64 " guest_addr=0x%010" PRIx64 "\n",
+			     stage_name, options.shader_hash, options.shader_base);
+		}
+	}
 
 	stage.program =
 	    std::make_shared<const ShaderRecompiler::IR::Program>(std::move(result.program));

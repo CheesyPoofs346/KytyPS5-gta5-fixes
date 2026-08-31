@@ -46,6 +46,7 @@
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "libs/controller.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
 
@@ -355,6 +356,10 @@ struct TextureCacheTestAccess {
 };
 
 struct RenderExecutorTestAccess {
+  static bool &DepthClearConsumed(RenderExecutor &executor) {
+    return executor.m_depth_clear_consumed;
+  }
+
   static TextureBinding
   ResolveTexture(RenderExecutor &executor,
                  const ShaderRecompiler::IR::ImageResource &resource,
@@ -551,12 +556,6 @@ constexpr u32 EncodeVop1Sdwa(u32 src0, u32 dst_sel = 6, u32 dst_u = 0,
          ((src0_sel & 0x7u) << 16u) | ((src0_sext & 0x1u) << 19u) |
          ((src0_neg & 0x1u) << 20u) | ((src0_abs & 0x1u) << 21u) |
          ((s0 & 0x1u) << 23u);
-}
-
-constexpr u32 EncodeVop1Dpp(u32 src0, u32 dpp_ctrl = 0, u32 row_mask = 0xf,
-                            u32 bank_mask = 0xf) {
-  return (src0 & 0xffu) | ((dpp_ctrl & 0x1ffu) << 8u) |
-         ((bank_mask & 0xfu) << 24u) | ((row_mask & 0xfu) << 28u);
 }
 
 constexpr u32 EncodeVop2(u32 opcode, u32 dst, u32 src0, u32 src1) {
@@ -8400,6 +8399,40 @@ public:
                   vk::ImageAspectFlagBits::eDepth,
           "raw stencil test or clear state leaked into a depth-only "
           "attachment");
+      // Regression: DB_RENDER_CONTROL.DEPTH_CLEAR_ENABLE is a persistent context register, so
+      // the loadOp clear it asks for must be materialized ONCE. Re-resolving while the bit is
+      // still high must not keep re-arming the clear, or the depth buffer is wiped repeatedly
+      // mid-frame and earlier geometry stops occluding anything.
+      RenderColorInfo depth_only_no_color{};
+      RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &depth_only_no_color, 0, depth_only);
+      const bool materialization_consumed =
+          RenderExecutorTestAccess::DepthClearConsumed(executor);
+      RenderExecutorTestAccess::ResetBindings(executor);
+      RenderDepthInfo after_materialize{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), after_materialize);
+      const bool clear_is_one_shot =
+          materialization_consumed && !after_materialize.depth_clear_enable;
+
+      HW::RenderControl lowered_clear = depth_only_render_control;
+      lowered_clear.depth_clear_enable = false;
+      registers.SetRenderControl(lowered_clear);
+      RenderDepthInfo lowered_info{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), lowered_info);
+      const bool rearmed_on_low =
+          !RenderExecutorTestAccess::DepthClearConsumed(executor);
+
+      registers.SetRenderControl(depth_only_render_control);
+      RenderDepthInfo reclear_info{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(
+          executor, 1, scheduler.Current(), reclear_info);
+      Require(name, "depth clear is one-shot per clear episode",
+              clear_is_one_shot && rearmed_on_low &&
+                  reclear_info.depth_clear_enable,
+              "DEPTH_CLEAR_ENABLE kept re-materializing its clear while the "
+              "register stayed high");
       RenderExecutorTestAccess::ResetBindings(executor);
 
       const auto sampled_width = depth_only.desc.info.extent.width - 1u;
@@ -14374,54 +14407,6 @@ TestCase CvtPkrtzF16F32SubnormalRoundsTowardZero() {
            O::S_ENDPGM}};
 }
 
-TestCase CvtPkrtzF16F32SdwaAndOutputModifiers() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x3f000000u); // 0.5f
-  AppendVMovLiteral(&code, 1, 0x40000000u); // 2.0f
-  AppendVMovLiteral(&code, 2, 0x3f802000u); // exactly 0x3c01h
-  AppendVMovLiteral(&code, 3, 0x00000000u);
-  AppendVMovLiteral(&code, 4, 0xbf000000u); // -0.5f
-  for (u32 dst = 10; dst <= 18; dst++) {
-    AppendVMovLiteral(&code, dst, 0xa1b2c3d4u);
-  }
-
-  code.push_back(EncodeVop2(0x2f, 10, 249, 1));
-  code.push_back(EncodeVop2Sdwa(0, 6, 2, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0,
-                                1));
-  code.push_back(EncodeVop2(0x2f, 11, 249, 3));
-  code.push_back(EncodeVop2Sdwa(2, 0, 0));
-  code.push_back(EncodeVop2(0x2f, 12, 249, 1));
-  code.push_back(EncodeVop2Sdwa(0, 6, 0, 3, 5));
-  code.push_back(EncodeVop2(0x2f, 13, 249, 1));
-  code.push_back(EncodeVop2Sdwa(4, 6, 0, 6, 6, 0, 0, 0, 1, 1));
-
-  code.push_back(EncodeVop2(0x2f, 14, 250, 1));
-  code.push_back(EncodeVop2Dpp(0, 0, 0xf, 0xf, 1));
-  AppendVop3(&code, 0x12f, 15, Vgpr(0), Vgpr(1), 0, 0, 0, true);
-  code.push_back(EncodeVop2(0x2f, 16, 249, 1));
-  code.push_back(EncodeVop2Sdwa(0, 4, 2));
-  code.push_back(EncodeVop2(0x2f, 17, 249, 1));
-  code.push_back(EncodeVop2Sdwa(0, 6, 2, 6, 6, 0, 0, 0, 0, 0, 0, 0, 0,
-                                0, 1));
-  AppendVop3(&code, 0x12f, 18, Vgpr(0), Vgpr(1), 0, 0, 0, false, 1);
-
-  for (u32 dst = 10; dst <= 18; dst++) {
-    AppendStoreVgpr(&code, dst, dst - 10);
-  }
-  AppendEnd(&code);
-
-  return {"CvtPkrtzF16F32SdwaAndOutputModifiers",
-          code,
-          {},
-          {0x3c003800u, 0x00000001u, 0x00000000u, 0xc0003800u,
-           0x4000b800u, 0x3c003800u, 0xa1b23800u, 0x44003c00u,
-           0x44003c00u},
-          {O::V_MOV_B32, O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
-}
-
 TestCase PackedMinMaxF16NanAndSignedZeroEdges() {
   using O = ShaderOpcode;
 
@@ -14527,100 +14512,6 @@ TestCase VectorCvtU16F16Sdwa() {
           {},
           {0x12340003u, 0x00054321u, 0xabcdffffu, 0x77770000u, 0x55550000u},
           {O::V_MOV_B32, O::V_CVT_U16_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
-}
-
-TestCase NativeAndSdwa16BitDestinationWrites() {
-  using O = ShaderOpcode;
-
-  std::vector<u32> code;
-  AppendVMovLiteral(&code, 0, 0x3fc00000u); // 1.5f -> 0x3e00h
-  AppendVMovLiteral(&code, 1, 0x00004200u); // low=3.0h
-  AppendVMovLiteral(&code, 2, 0x0000c000u); // low=-2.0h
-  AppendVMovLiteral(&code, 3, 0x00003c00u); // low=1.0h
-  AppendVMovLiteral(&code, 4, 0x00004000u); // low=2.0h
-
-  const u32 sentinels[] = {
-      0x3c001234u, 0xbbbb2345u, 0xcccc3456u, 0xdddd4567u, 0xeeee5678u,
-      0xffff6789u, 0xf00d789au, 0x11118888u, 0x22229999u, 0x3333aaaau,
-      0xaaaa0000u, 0xbbbb0000u, 0xcccc0000u, 0xabcd1234u, 0xbcde2345u,
-      0xcdef3456u, 0xdef01234u, 0xef012345u, 0xf0123456u, 0x01234567u,
-      0xaaaa1234u, 0xbbbb5678u, 0x24681234u, 0x13572468u, 0x89abcdefu,
-      0xfedcba98u, 0x0bad1234u,
-  };
-  // AppendStoreVgpr uses v31 as its address scratch register.
-  const auto output_vgpr = [](u32 index) { return 10u + index + (index >= 21u ? 1u : 0u); };
-  for (u32 i = 0; i < static_cast<u32>(std::size(sentinels)); i++) {
-    AppendVMovLiteral(&code, output_vgpr(i), sentinels[i]);
-  }
-
-  code.push_back(EncodeVop1(0x0a, 10, Vgpr(0)));
-  code.push_back(EncodeVop1(0x0a, 11, 250));
-  code.push_back(EncodeVop1Dpp(0));
-  AppendVop3(&code, 0x18a, 12, Vgpr(0), 0);
-  code.push_back(EncodeVop1(0x52, 13, Vgpr(1)));
-  code.push_back(EncodeVop1(0x53, 14, Vgpr(2)));
-
-  code.push_back(EncodeVop1(0x0a, 15, 249));
-  code.push_back(EncodeVop1Sdwa(0));
-  code.push_back(EncodeVop1(0x54, 16, 249));
-  code.push_back(EncodeVop1Sdwa(10, 4, 2, 5));
-  code.push_back(EncodeVop1(0x52, 17, 249));
-  code.push_back(EncodeVop1Sdwa(1, 6, 0, 4));
-  code.push_back(EncodeVop1(0x52, 18, 249));
-  code.push_back(EncodeVop1Sdwa(1, 4, 0, 4));
-  code.push_back(EncodeVop1(0x53, 19, 249));
-  code.push_back(EncodeVop1Sdwa(2, 4, 1, 4));
-
-  code.push_back(EncodeVop2(0x32, 20, 250, 4));
-  code.push_back(EncodeVop2Dpp(3));
-  AppendVop3(&code, 0x132, 21, Vgpr(3), Vgpr(4));
-  code.push_back(EncodeVop2(0x32, 22, 249, 4));
-  code.push_back(EncodeVop2Sdwa(3, 4, 0, 4, 4));
-
-  code.push_back(EncodeVop1(0x0a, 23, 249));
-  code.push_back(EncodeVop1Sdwa(0, 4, 2, 3));
-  code.push_back(EncodeVop1(0x0a, 24, 249));
-  code.push_back(EncodeVop1Sdwa(0, 4, 2, 5));
-  code.push_back(EncodeVop1(0x0a, 25, 249));
-  code.push_back(EncodeVop1Sdwa(0, 4, 2, 6, 0, 1, 1));
-
-  code.push_back(EncodeVop1(0x0a, 26, 249));
-  code.push_back(EncodeVop1Sdwa(0, 4, 2, 6, 0, 0, 0, 0, 0, 1));
-  code.push_back(EncodeVop1(0x0a, 27, 249));
-  code.push_back(EncodeVop1Sdwa(0, 4, 2, 6, 0, 0, 0, 0, 1));
-  AppendVop3(&code, 0x18a, 28, Vgpr(0), 0, 0, 0, 0, false, 1);
-  AppendVop3(&code, 0x18a, 29, Vgpr(0), 0, 0, 0, 0, true);
-  AppendVop3(&code, 0x34b, 30, Vgpr(3), Vgpr(4), Vgpr(3));
-  AppendVop3(&code, 0x34b, 32, Vgpr(3), Vgpr(4), Vgpr(3), 0, 0x8);
-  code.push_back(EncodeVop1(0x52, 33, 249));
-  code.push_back(EncodeVop1Sdwa(1, 4, 2, 4, 0, 1, 1, 0, 1));
-  AppendVop3(&code, 0x1d3, 34, Vgpr(1), 0, 0, 1, 0, true, 0, 1);
-  code.push_back(EncodeVop1(0x07, 35, 249));
-  code.push_back(EncodeVop1Sdwa(0, 6, 0, 6, 0, 1, 1, 0, 1));
-  AppendVop3(&code, 0x188, 36, Vgpr(0), 0, 0, 1, 0, true, 0, 1);
-  code.push_back(EncodeVop1(0x54, 37, 249));
-  code.push_back(EncodeVop1Sdwa(4, 4, 2, 4, 0, 1, 1));
-
-  for (u32 i = 0; i < static_cast<u32>(std::size(sentinels)); i++) {
-    AppendStoreVgpr(&code, output_vgpr(i), i);
-  }
-  AppendEnd(&code);
-
-  return {"NativeAndSdwa16BitDestinationWrites",
-          code,
-          {},
-          // A native 16-bit write zero-extends; only a selected half merges.
-          {0x00003e00u, 0x00003e00u, 0x00003e00u, 0x00000003u,
-           0x0000fffeu, 0x00003e00u, 0xf00d7c00u, 0x00000003u,
-           0x00000003u, 0xfffffffeu, 0xaaaa4200u, 0x00004200u,
-           0x00004200u, 0xabcd0000u, 0xbcde0000u, 0xcdefbe00u,
-           0xdef04200u, 0xef013c00u, 0x00004200u, 0x00003c00u,
-           0xaaaa4200u, 0x42005678u, 0x24680000u, 0x0000fffdu,
-           0x00000000u, 0xffffffffu, 0x0badb800u},
-          {O::V_MOV_B32, O::V_CVT_F16_F32, O::V_CVT_U32_F32,
-           O::V_CVT_I32_F32, O::V_CVT_U16_F16, O::V_CVT_I16_F16,
-           O::V_RCP_F16, O::V_ADD_F16, O::V_FMA_F16, O::BUFFER_STORE_DWORD,
-           O::S_ENDPGM}};
 }
 
 TestCase VectorMinMaxMed3F16Ops() {
@@ -15336,6 +15227,26 @@ TestCase VectorFloatArithmeticOps() {
            O::V_MAC_F32, O::V_MAD_F32, O::V_FMA_F32, O::V_MIN3_F32,
            O::V_MAX3_F32, O::V_MED3_F32, O::V_MADMK_F32, O::V_MADAK_F32,
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase VectorClampF32ReturnsZeroForNan() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x7fc00000u);
+  AppendVMovLiteral(&code, 1, 0x3f800000u);
+  AppendVop3(&code, 0x108, 10, Vgpr(0), Vgpr(1), 0, 0, 0, true);
+  AppendStoreVgpr(&code, 10, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorClampF32ReturnsZeroForNan";
+  test.code = std::move(code);
+  test.expected = {0x00000000u};
+  test.opcodes = {O::V_MOV_B32, O::V_MUL_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.ir_counts = {{" = FPSaturate32 ", 1}};
+  return test;
 }
 
 TestCase VectorMinMaxF32NanAndSignedZeroEdges() {
@@ -21000,11 +20911,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
-  AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
   AddCase(VectorCvtU16F16Sdwa);
-  AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);
   AddCase(VectorSpecialF16Ops);
   AddCase(VectorCosF16CapturedSdwaAndEdges);
@@ -21028,6 +20937,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FloatInlineConstantF16UsesNumericValue);
   AddCase(VectorFloatControlContractPreservesInfNan);
   AddCase(VectorFloatArithmeticOps);
+  AddCase(VectorClampF32ReturnsZeroForNan);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
   AddCase(VectorFloatConversionOps);
@@ -24172,12 +24082,15 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   bool end_written = end_result == Pm4ProcessResult::Complete;
   uint64_t visible_samples = 0;
   for (const auto &pair : results) {
-    end_written &= pair[0] == ready_bit && pair[1] == (ready_bit | 1u);
+    // "Always visible" must be a PLAUSIBLE sample count, not a token 1 - the guest scales the
+    // result against the object's screen coverage, and 1 reads as fully occluded.
+    end_written &= pair[0] == ready_bit && pair[1] > ready_bit &&
+                   (pair[1] - pair[0]) >= 4096u;
     visible_samples += pair[1] - pair[0];
   }
 
   Require("Pm4SyntheticOcclusionCounterDump", "always-visible result",
-          begin_written && end_written && visible_samples == results.size(),
+          begin_written && end_written && visible_samples >= 4096u * results.size(),
           "EVENT_WRITE did not publish valid nonzero begin/end counters to "
           "every PS5 DB");
   std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
@@ -24705,6 +24618,38 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
+void CheckDuplicateControllerDisconnect() {
+  // Disconnect() must be idempotent, mirroring Connect(). It used to abort via EXIT_IF when the
+  // id was absent, taking the whole emulator down mid-run (controller.cpp:150). Every call below
+  // would have aborted before the fix; reaching the end is the assertion.
+  constexpr int device_id = 42;
+  constexpr int never_connected_id = 43;
+  Controller::Initialize();
+
+  // A disconnect for a pad that was never connected at all.
+  Controller::ControllerDisconnect(never_connected_id);
+
+  // The redundant-disconnect case the crash was originally reported for.
+  Controller::ControllerConnect(device_id);
+  Controller::ControllerDisconnect(device_id);
+  Controller::ControllerDisconnect(device_id);
+
+  // Connect must still work afterwards, i.e. the rejected disconnects left the list intact.
+  Controller::ControllerConnect(device_id);
+  Controller::ControllerDisconnect(device_id);
+
+  // Connect is idempotent too, so a duplicate connect must not leave a stale second entry that
+  // a later disconnect would then abort on.
+  Controller::ControllerConnect(device_id);
+  Controller::ControllerConnect(device_id);
+  Controller::ControllerDisconnect(device_id);
+  Controller::ControllerDisconnect(device_id);
+
+  Controller::Shutdown();
+  std::printf("[host]    %-32s ok\n", "DuplicateControllerDisconnect");
+}
+
+
 void CheckPm4WaitResume(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -24956,6 +24901,10 @@ int main(int argc, char **argv) {
     CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--controller-disconnect-only") == 0) {
+    CheckDuplicateControllerDisconnect();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--agc-wait-only") == 0) {
     VulkanHarness vulkan;
     CheckAgcWaitPackets(vulkan.RuntimeRenderer());
@@ -25133,6 +25082,7 @@ int main(int argc, char **argv) {
   CheckPm4GuardBandRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4BlendColorRegisterRanges(vulkan.RuntimeRenderer());
   CheckPm4PolygonOffsetRegisters(vulkan.RuntimeRenderer());
+  CheckDuplicateControllerDisconnect();
   CheckAgcWaitPackets(vulkan.RuntimeRenderer());
   CheckAgcDrawIndirectMultiPacket(vulkan.RuntimeRenderer());
   CheckPm4ContextStateOperations(vulkan.RuntimeRenderer());

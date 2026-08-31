@@ -66,6 +66,29 @@ struct ConfigOptions {
 	bool                   gpu_assisted_validation_enabled = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   readback_linear_images      = false;
+	bool                   hdr_probe_enabled           = false;
+	uint32_t               hdr_probe_interval          = 60;
+	// 0 disables. ALWAYS launch with --hdr-clamp 1; defaulting it here breaks the graphics
+	// export tests, which assert exact unclamped values.
+	float                  hdr_export_clamp            = 0.0f;
+	uint32_t               hdr_probe_start             = 0;
+	bool                   mask_unwritten_mrt          = false;
+	bool                   force_depth_always          = false;
+	bool                   depth_clear_once            = true;
+	// Mirror a LESS-family depth compare on a read-only draw when the buffer's depth writers have
+	// established it as reversed-Z. Off by default: it changes visibility of real geometry.
+	bool                   fix_inverted_depth_compare  = false;
+	// Diagnostic: drop blended depth-read-only draws using a LESS-family compare, to identify
+	// whether those draws are the props that render on top.
+	bool                   skip_scene_soft_transparent = false;
+	bool                   depth_clear_per_frame       = true;
+	bool                   suppress_band_pass          = false;
+	bool                   fix_degenerate_viewport_z   = false;
+	bool                   fix_collapsed_depth_compare = false;
+	bool                   real_occlusion_queries      = false;
+	bool                   skip_backdrop_pass          = false;
+	bool                   skip_distant_layer          = false;
+	std::vector<uint64_t>  skip_ps;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -106,6 +129,23 @@ bool GpuAssistedValidationEnabled();
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
+bool HdrProbeEnabled();
+uint32_t HdrProbeInterval();
+float HdrExportClamp();
+uint32_t HdrProbeStart();
+bool MaskUnwrittenMrt();
+bool ForceDepthAlways();
+bool DepthClearOnce();
+bool FixInvertedDepthCompare();
+bool SkipSceneSoftTransparent();
+bool DepthClearPerFrame();
+bool SuppressBandPass();
+bool FixDegenerateViewportZ();
+bool FixCollapsedDepthCompare();
+bool RealOcclusionQueries();
+bool SkipBackdropPass();
+bool SkipDistantLayer();
+bool ShouldSkipPixelShader(uint64_t ps_addr);
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();

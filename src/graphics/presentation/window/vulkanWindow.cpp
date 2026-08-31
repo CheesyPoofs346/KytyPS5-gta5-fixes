@@ -275,6 +275,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			LOGF("depthBiasClamp is not supported\n");
 			skip_device = true;
 		}
+		if (device_features2.features.depthClamp != VK_TRUE) {
+			LOGF("depthClamp is not supported\n");
+			skip_device = true;
+		}
 		if (device_features2.features.shaderClipDistance != VK_TRUE) {
 			LOGF("shaderClipDistance is not supported\n");
 			skip_device = true;
@@ -617,6 +621,9 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.tessellationShader                   = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
+	// GCN treats PA_CL_CLIP_CNTL.ZCLIP_*_DISABLE as "clamp instead of clip", which Vulkan only
+	// reproduces with depthClampEnable.
+	device_features.depthClamp                           = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
