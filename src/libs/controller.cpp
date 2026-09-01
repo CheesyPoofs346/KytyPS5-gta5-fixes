@@ -179,7 +179,6 @@ void GameController::Connect(int id) {
 	m_connected_ids.push_back(id);
 
 	CheckActive();
-	::printf("ControllerConnect: id=%d active=%d\n", id, m_active_id);
 }
 
 void GameController::Disconnect(int id) {
@@ -370,7 +369,6 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 
 	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
 	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
-	::printf("Rumble: large=%u small=%u pad=%p\n", large, small, static_cast<void*>(pad));
 	if (SDL_GameControllerRumble(pad, large, small, RUMBLE_DURATION_MS) != 0) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
 	}
@@ -382,8 +380,6 @@ void GameController::Touch(int id, int finger, uint16_t x, uint16_t y, bool down
 	if ((m_active_id != id && id != HOST_INPUT_CONTROLLER_ID) || finger < 0 || finger > 1) {
 		return;
 	}
-	::printf("Touch accepted: id=%d finger=%d x=%u y=%u down=%d\n",
-	         id, finger, x, y, down ? 1 : 0);
 	auto state = GetLastState();
 	state.time = LibKernel::KernelGetProcessTime();
 	state.touches[finger].x    = x;
@@ -799,7 +795,6 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	// The light bar was accepted and dropped. Drive the real pad so titles that signal state
 	// through it (police lights, health, player colour) behave as intended.
 	EXIT_IF(g_controller == nullptr);
-	::printf("PadSetLightBar: r=%u g=%u b=%u\n", param->r, param->g, param->b);
 	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;

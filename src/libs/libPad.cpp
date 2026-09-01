@@ -122,7 +122,6 @@ static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
 		for (int k = 0; k < 32; k++) {
 			::snprintf(hex + k * 3, 4, "%02x ", raw[k]);
 		}
-		::printf("PadSetTriggerEffect: %s\n", hex);
 	}
 	// mask, then a mode per trigger, then a data block per trigger.
 	{
@@ -138,14 +137,6 @@ static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
 		}
 		if ((mask & 0x2u) != 0) {
 			trigger_effect_to_hid(modes[1], raw + 16, right);
-		}
-		// Report what was decoded next to the raw bytes, so a mode or offset that is read wrongly
-		// shows up as a mismatch rather than as a trigger that quietly does nothing.
-		static std::atomic<uint32_t> decode_log {0};
-		if (decode_log.fetch_add(1, std::memory_order_relaxed) < 60) {
-			::printf("TriggerDecode: mask=%02x | L2 mode=%u raw=%02x %02x hid=%02x %02x %02x | R2 mode=%u raw=%02x %02x hid=%02x %02x %02x\n",
-			         mask, modes[0], raw[12], raw[13], left[0], left[1], left[2],
-			         modes[1], raw[16], raw[17], right[0], right[1], right[2]);
 		}
 		if (Config::TriggerSwap()) {
 			Controller::ControllerTriggerEffect(right, left);

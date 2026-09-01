@@ -100,13 +100,13 @@ struct ConfigOptions {
 	// blocking HID writes currently run on the audio thread and stall the game.
 	bool                   pad_speaker_bluetooth       = false;
 	// DualSense speaker volume for the Bluetooth stream, 0-255.
-	uint32_t               pad_speaker_volume          = 0xc0;
+	uint32_t               pad_speaker_volume          = 0x90;
 	// Rate the DualSense consumes Bluetooth audio at. Sets both the resample ratio and the frame
 	// cadence, so it is effectively the pitch control - too low plays back deep and slow.
 	uint32_t               pad_speaker_rate            = 45000;
 	// Frames of audio buffered before playback starts. Deeper rides out bursty submissions at the
 	// cost of latency; each frame is about 10ms.
-	uint32_t               pad_speaker_preroll         = 6;
+	uint32_t               pad_speaker_preroll         = 15;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;

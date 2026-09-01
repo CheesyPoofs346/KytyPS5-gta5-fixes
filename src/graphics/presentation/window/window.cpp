@@ -360,10 +360,6 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_GameControllerOpen(f.id);
-		::printf("SDL pad opened: %s (LED=%d, touchpads=%d)\n",
-		         SDL_GameControllerName(pad) ? SDL_GameControllerName(pad) : "?",
-		         SDL_GameControllerHasLED(pad) ? 1 : 0,
-		         SDL_GameControllerGetNumTouchpads(pad));
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
 		Controller::ControllerConnect(id);
@@ -604,9 +600,6 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_CONTROLLERTOUCHPADMOTION:
 		case SDL_CONTROLLERTOUCHPADUP: {
 			const bool down = event->type != SDL_CONTROLLERTOUCHPADUP;
-			::printf("SDL touchpad: which=%d finger=%d x=%.3f y=%.3f down=%d\n",
-			         static_cast<int>(event->ctouchpad.which), event->ctouchpad.finger,
-			         event->ctouchpad.x, event->ctouchpad.y, down ? 1 : 0);
 			Libs::Controller::ControllerTouch(
 			    static_cast<int>(event->ctouchpad.which), event->ctouchpad.finger,
 			    static_cast<uint16_t>(event->ctouchpad.x * 1919.0f),

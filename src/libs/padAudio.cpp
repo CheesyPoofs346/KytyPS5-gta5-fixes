@@ -227,10 +227,6 @@ void PadAudioStream::Submit(const void* samples, uint32_t frames, bool is_float)
 		if (window_start == 0) {
 			window_start = now_ms;
 		} else if (now_ms - window_start >= 1000) {
-			::printf("PadAudio: source %llu samples/s (port says %u Hz), sent %llu frames/s\n",
-			         static_cast<unsigned long long>(src_frames * 1000u / (now_ms - window_start)),
-			         m_src_freq,
-			         static_cast<unsigned long long>(m_frames_sent * 1000u / (now_ms - window_start)));
 			window_start   = now_ms;
 			src_frames     = 0;
 			m_frames_sent  = 0;

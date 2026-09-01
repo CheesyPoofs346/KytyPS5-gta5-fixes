@@ -139,23 +139,6 @@ bool ResolveComputeConstantBufferFill(const ShaderComputeInputInfo& input, uint3
 	}
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
-	// Report near-miss candidates: a two-buffer compute dispatch with no images or samplers is the
-	// shape of a metadata fill. GTA5 never satisfies the exact fingerprint above, so print what its
-	// dispatches actually look like to see whether the check can be widened rather than guessed at.
-	{
-		static std::atomic<uint32_t> shape_log {0};
-		if (program.info.buffers.size() == 2 && resources.buffers.size() == 2 &&
-		    program.info.images.empty() && program.info.samplers.empty() &&
-		    shape_log.fetch_add(1, std::memory_order_relaxed) < 30) {
-			::printf("DccFillShape: thr=%dx%dx%d wave=%u gid=%d%d%d tids=%d tg=%d grp=%ux%ux%u mode=0x%x dispatch_dims=%d blocks=%zu fallback=%d dma=%d\n",
-			         input.threads_num[0], input.threads_num[1], input.threads_num[2], input.wave_size,
-			         static_cast<int>(input.group_id[0]), static_cast<int>(input.group_id[1]),
-			         static_cast<int>(input.group_id[2]), input.thread_ids_num,
-			         static_cast<int>(input.tg_size_en), group_x, group_y, group_z, mode,
-			         static_cast<int>(input.dispatch_thread_dimensions), program.block_info.size(),
-			         static_cast<int>(program.dispatcher_fallback), static_cast<int>(program.info.uses_dma));
-		}
-	}
 	if (program.dispatcher_fallback || program.block_info.empty() ||
 	    program.info.buffers.size() != 2 || resources.buffers.size() != 2 ||
 	    !program.info.images.empty() || !program.info.samplers.empty() || program.info.uses_dma ||
@@ -278,15 +261,6 @@ static void TrackComputeDccAttachmentFill(const ShaderComputeInputInfo& input,
 		return;
 	}
 	if (!std::ranges::all_of(value, [](uint32_t word) { return word == 0x40404040u; })) {
-		// The accepted code (0x40404040) is the opaque-black DCC clear for the layout this was
-		// developed against. Report the fills we reject so a title using a different clear code can
-		// be identified rather than silently falling through.
-		static std::atomic<uint32_t> reject_log {0};
-		if (reject_log.fetch_add(1, std::memory_order_relaxed) < 40) {
-			::printf("DccFillRejected: words=%08x %08x %08x %08x dst=0x%010" PRIx64 " size=0x%" PRIx64 "\n",
-			         value[0], value[1], value[2], value[3], destination.Base48(),
-			         BufferDescriptorSize(destination));
-		}
 		return;
 	}
 	(void)command.GetContext().GetTextureCache().TrackFullDccAttachmentFill(
