@@ -3,11 +3,16 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 
 namespace Config {
 
 static std::unique_ptr<ConfigOptions> g_config;
+
+// Toggled from the window thread and read on the audio thread, so it lives outside the config
+// struct: everything else in there is written once at startup and never changes.
+static std::atomic<bool> g_pad_speaker_muted {false};
 
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
@@ -25,6 +30,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 
 	*g_config = cfg;
+	g_pad_speaker_muted.store(cfg.pad_speaker_muted, std::memory_order_relaxed);
 }
 
 uint32_t GetScreenWidth() {
@@ -209,6 +215,14 @@ uint32_t PadSpeakerRate() {
 
 uint32_t PadSpeakerPreroll() {
 	return g_config->pad_speaker_preroll;
+}
+
+bool PadSpeakerMuted() {
+	return g_pad_speaker_muted.load(std::memory_order_relaxed);
+}
+
+void SetPadSpeakerMuted(bool muted) {
+	g_pad_speaker_muted.store(muted, std::memory_order_relaxed);
 }
 
 bool ForceDepthAlways() {

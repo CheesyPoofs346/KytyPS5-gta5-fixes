@@ -20,8 +20,13 @@ Branch `hdr-pr423-test`. Everything below was verified in game unless marked oth
 `--hdr-clamp 1` is **required** — without it the screen whites out (root cause still open, see below).
 
 `--keymap` REPLACES the defaults rather than merging, so the full list must be given.
-Emulator keys: **F7** mouse look (off by default), **F2** pause, **F11** fullscreen,
-**F12** RenderDoc capture, **Ctrl/Shift+Esc** quit.
+Emulator keys: **F7** mouse look (off by default), **F2** pause, **F3** mute/unmute the
+controller speaker, **F11** fullscreen, **F12** RenderDoc capture, **Ctrl/Shift+Esc** quit.
+
+**F3** routes pad-speaker audio (phone calls) to the normal output device instead of the
+DualSense, for playing late through a headset. It prints the new state to the console.
+`--pad-speaker-muted t` starts muted. Muting drops whatever is buffered, so unmuting does not
+replay a stale sentence.
 
 Driving is R2/L2 (left/right mouse) — W and S only steer, they do not accelerate.
 

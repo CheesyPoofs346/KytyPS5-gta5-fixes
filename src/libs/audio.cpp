@@ -417,7 +417,11 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	// A pad-speaker port on a Bluetooth DualSense has no audio endpoint to queue to - the pad takes
 	// encoded frames over HID instead. Send there and skip the normal output so the audio does not
 	// also come out of the speakers.
-	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK && g_pad_audio.Ready()) {
+	// Muted: fall through to SDL_QueueAudio instead. A pad-speaker port opens the default output
+	// device (there is no controller endpoint to open on Bluetooth), so the audio lands wherever
+	// normal game audio goes - the headset - rather than the pad.
+	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK && g_pad_audio.Ready() &&
+	    !Config::PadSpeakerMuted()) {
 		// Send the guest's own samples, not queue_data: by this point SDL_ConvertAudio has upmixed
 		// them to the output device's layout, so a mono port arrives as stereo and every frame gets
 		// counted twice - which resampled to half rate and played back an octave low.

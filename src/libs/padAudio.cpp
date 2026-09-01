@@ -264,6 +264,18 @@ void PadAudioStream::Pump() {
 		// The pad expects an unbroken 100 Hz stream: the control sub-packet that keeps its speaker
 		// enabled rides along with every frame, so going quiet closes the audio path. Send silence
 		// when the title has nothing queued rather than stopping.
+		if (Config::PadSpeakerMuted()) {
+			// Drop anything already buffered rather than replaying a stale sentence on unmute.
+			m_pending.clear();
+			m_playing = false;
+			{
+				std::lock_guard lock(m_queue_mutex);
+				m_queue.clear();
+			}
+			next = std::chrono::steady_clock::now();
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			continue;
+		}
 		if (!Active()) {
 			next = std::chrono::steady_clock::now();
 			std::this_thread::sleep_for(std::chrono::milliseconds(20));

@@ -40,6 +40,7 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <cstdio>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
@@ -254,6 +255,16 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				}
 				break;
 			case SDLK_F2: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			case SDLK_F3:
+				if (!key.repeat) {
+					const bool muted = !Config::PadSpeakerMuted();
+					Config::SetPadSpeakerMuted(muted);
+					// LOGF is silenced by default and this is user-facing feedback for a key press.
+					::printf("Pad speaker: %s\n", muted ? "muted (audio -> normal output)"
+					                                     : "unmuted (audio -> controller)");
+					std::fflush(stdout);
+				}
+				break;
 			case SDLK_F1:
 				if (!key.repeat) {
 					RenderDocRequestCapture();

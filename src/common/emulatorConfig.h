@@ -107,6 +107,9 @@ struct ConfigOptions {
 	// Frames of audio buffered before playback starts. Deeper rides out bursty submissions at the
 	// cost of latency; each frame is about 10ms.
 	uint32_t               pad_speaker_preroll         = 15;
+	// Start with the pad speaker muted, so title audio routed to it plays on the normal output
+	// device instead. Toggleable at runtime with F3.
+	bool                   pad_speaker_muted           = false;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;
@@ -173,6 +176,8 @@ bool  PadSpeakerBluetooth();
 uint32_t PadSpeakerVolume();
 uint32_t PadSpeakerRate();
 uint32_t PadSpeakerPreroll();
+bool     PadSpeakerMuted();
+void     SetPadSpeakerMuted(bool muted);
 bool DepthClearPerFrame();
 bool SuppressBandPass();
 bool FixDegenerateViewportZ();

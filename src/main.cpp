@@ -393,6 +393,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--pad-speaker-volume") {
 			options.config.pad_speaker_volume =
 			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0)) & 0xffu;
+		} else if (arg == "--pad-speaker-muted") {
+			if (!ParseBool(value, options.config.pad_speaker_muted)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--pad-speaker-bluetooth") {
 			if (!ParseBool(value, options.config.pad_speaker_bluetooth)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
