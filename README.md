@@ -74,6 +74,23 @@ graphical glitches, low compatibility, and poor performance.
   </tr>
 </table>
 
+<table align="center">
+  <tr>
+    <td align="center" colspan="3"><strong>Grand Theft Auto V</strong></td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/screenshots/gta5-01.png" width="300" alt="Grand Theft Auto V running in KytyPS5 — driving through downtown Los Santos">
+    </td>
+    <td align="center">
+      <img src="docs/screenshots/gta5-02.png" width="300" alt="Grand Theft Auto V running in KytyPS5 — first-person driving view in Davis">
+    </td>
+    <td align="center">
+      <img src="docs/screenshots/gta5-03.png" width="300" alt="Grand Theft Auto V running in KytyPS5 — sunlit street in Strawberry">
+    </td>
+  </tr>
+</table>
+
 <p align="center"><em>And many more...</em></p>
 
 ## Contributing
