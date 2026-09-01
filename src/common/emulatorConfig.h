@@ -95,7 +95,7 @@ struct ConfigOptions {
 	float                  trigger_position_scale      = 1.0f;
 	// Which trigger a title's first effect slot refers to. Sony's ordering is not documented here,
 	// so this makes it testable instead of assumed.
-	bool                   trigger_swap                = false;
+	bool                   trigger_swap                = true;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;
