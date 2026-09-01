@@ -77,6 +77,7 @@ public:
 	void Axis(int id, Axis axis, int value);
 	void Touch(int id, int finger, uint16_t x, uint16_t y, bool down);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
+	void SetTriggerEffect(const uint8_t* left, const uint8_t* right);
 	void RightStick(int id, int x, int y);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
@@ -95,6 +96,11 @@ private:
 	[[nodiscard]] ControllerState GetLastState() const;
 	void                          AddState(const ControllerState& state);
 
+	SDL_hid_device*  m_hid           = nullptr;
+	bool             m_hid_tried     = false;
+	bool             m_hid_bluetooth = false;
+	uint8_t          m_last_trigger[22] = {};
+	bool             m_trigger_sent     = false;
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
@@ -151,6 +157,12 @@ void Initialize() {
 }
 
 void Shutdown() {
+	// Release any held trigger effect: a DualSense keeps the last one until told otherwise,
+	// so a stale effect would survive the emulator exiting.
+	if (g_controller != nullptr) {
+		const uint8_t off[11] = {};
+		g_controller->SetTriggerEffect(off, off);
+	}
 	delete g_controller;
 	g_controller = nullptr;
 }
@@ -367,6 +379,77 @@ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	(void)SDL_GameControllerSetLED(pad, r, g, b);
 }
 
+// SDL owns its own output report and refuses ours ("device disconnected"), so trigger effects go
+// straight to the pad over HID - the same route the DualSense web testers use. The USB report is
+// 0x02 with the effect payload at offset 1; Bluetooth is 0x31, offset 2, with a CRC32 over an 0xA2
+// header byte plus the report. Right trigger sits at payload offset 10, left at 21.
+void GameController::SetTriggerEffect(const uint8_t* left, const uint8_t* right) {
+	Common::LockGuard lock(m_mutex);
+	if (left == nullptr || right == nullptr) {
+		return;
+	}
+	if (!m_hid_tried) {
+		m_hid_tried = true;
+		for (const auto product: {0x0ce6, 0x0df2}) {
+			m_hid = SDL_hid_open(0x054c, static_cast<unsigned short>(product), nullptr);
+			if (m_hid != nullptr) {
+				// A Bluetooth DualSense reports 78-byte input; USB reports 64. Probe once.
+				uint8_t probe[78] = {};
+				const int read = SDL_hid_read_timeout(m_hid, probe, sizeof(probe), 50);
+				m_hid_bluetooth = read > 64;
+				::printf("DualSense HID opened (product=0x%04x, bluetooth=%d)\n", product,
+				         m_hid_bluetooth ? 1 : 0);
+				break;
+			}
+		}
+		if (m_hid == nullptr) {
+			::printf("DualSense HID open failed: %s\n", SDL_GetError());
+		}
+	}
+	// The title re-sends the same effect every frame. A DualSense holds the last one, so writing it
+	// again is pure Bluetooth traffic - only send when it actually changes.
+	uint8_t combined[22] = {};
+	std::memcpy(combined, right, 11);
+	std::memcpy(combined + 11, left, 11);
+	if (m_trigger_sent && std::memcmp(combined, m_last_trigger, sizeof(combined)) == 0) {
+		return;
+	}
+	std::memcpy(m_last_trigger, combined, sizeof(combined));
+	m_trigger_sent = true;
+	if (m_hid == nullptr) {
+		return;
+	}
+	uint8_t report[79] = {};
+	int     size       = 0;
+	int     offset     = 0;
+	if (m_hid_bluetooth) {
+		report[0] = 0x31;
+		report[1] = 0x02;
+		size      = 78;
+		offset    = 2;
+	} else {
+		report[0] = 0x02;
+		size      = 48;
+		offset    = 1;
+	}
+	// Only the trigger-effect bits, so rumble and LED state the driver owns are left alone.
+	report[offset + 0] = 0x0c;
+	std::memcpy(report + offset + 10, right, 11);
+	std::memcpy(report + offset + 21, left, 11);
+	if (m_hid_bluetooth) {
+		const uint8_t header = 0xa2;
+		uint32_t      crc    = SDL_crc32(0, &header, 1);
+		crc                  = SDL_crc32(crc, report, static_cast<size_t>(size) - sizeof(crc));
+		std::memcpy(report + size - sizeof(crc), &crc, sizeof(crc));
+	}
+	if (SDL_hid_write(m_hid, report, static_cast<size_t>(size)) < 0) {
+		static std::atomic<uint32_t> fail_log {0};
+		if (fail_log.fetch_add(1, std::memory_order_relaxed) < 5) {
+			::printf("DualSense HID write failed: %s\n", SDL_GetError());
+		}
+	}
+}
+
 void GameController::GetConnectionInfo(bool* flag, int* count) {
 	EXIT_IF(flag == nullptr);
 	EXIT_IF(count == nullptr);
@@ -448,6 +531,11 @@ void ControllerAxis(int id, Axis axis, int value) {
 void ControllerTouch(int id, int finger, uint16_t x, uint16_t y, bool down) {
 	EXIT_IF(g_controller == nullptr);
 	g_controller->Touch(id, finger, x, y, down);
+}
+
+void ControllerTriggerEffect(const uint8_t* left, const uint8_t* right) {
+	EXIT_IF(g_controller == nullptr);
+	g_controller->SetTriggerEffect(left, right);
 }
 
 void ControllerRightStick(int id, int x, int y) {

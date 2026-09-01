@@ -380,6 +380,23 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--trigger-swap") {
+			if (!ParseBool(value, options.config.trigger_swap)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--trigger-position-scale") {
+			options.config.trigger_position_scale = std::strtof(value.c_str(), nullptr);
+			if (options.config.trigger_position_scale < 0.0f) {
+				::printf("invalid trigger position scale: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--trigger-strength") {
+			options.config.trigger_strength = std::strtof(value.c_str(), nullptr);
+			if (!(options.config.trigger_strength > 0.0f)) {
+				::printf("invalid trigger strength: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--retry-transient-map-faults") {
 			if (!ParseBool(value, options.config.retry_transient_map_faults)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

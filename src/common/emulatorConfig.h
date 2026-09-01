@@ -87,6 +87,15 @@ struct ConfigOptions {
 	// Retry a fault on memory our own map says is committed, instead of aborting. Covers the
 	// non-atomic window while guest direct memory is being remapped.
 	bool                   retry_transient_map_faults  = true;
+	// Multiplier on adaptive-trigger force. 1.0 passes the title's request through unchanged;
+	// higher makes a subtle effect easier to feel.
+	float                  trigger_strength            = 1.0f;
+	// Scales where an adaptive-trigger effect starts. 1.0 is the title's request; 0 makes every
+	// effect begin at the top of the pull, which reads as constant pressure.
+	float                  trigger_position_scale      = 1.0f;
+	// Which trigger a title's first effect slot refers to. Sony's ordering is not documented here,
+	// so this makes it testable instead of assumed.
+	bool                   trigger_swap                = false;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;
@@ -146,6 +155,9 @@ bool FixInvertedDepthCompare();
 bool SkipSceneSoftTransparent();
 bool WaitImageReadback();
 bool RetryTransientMapFaults();
+float TriggerStrength();
+float TriggerPositionScale();
+bool  TriggerSwap();
 bool DepthClearPerFrame();
 bool SuppressBandPass();
 bool FixDegenerateViewportZ();

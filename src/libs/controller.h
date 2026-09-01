@@ -59,6 +59,7 @@ void ControllerDisconnect(int id);
 void ControllerButton(int id, uint32_t button, bool down);
 void ControllerAxis(int id, Axis axis, int value);
 void ControllerTouch(int id, int finger, uint16_t x, uint16_t y, bool down);
+void ControllerTriggerEffect(const uint8_t* left, const uint8_t* right);
 void ControllerRightStick(int id, int x, int y);
 void ControllerResetInputState();
 

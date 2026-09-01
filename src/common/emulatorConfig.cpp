@@ -183,6 +183,18 @@ bool RetryTransientMapFaults() {
 	return g_config->retry_transient_map_faults;
 }
 
+float TriggerStrength() {
+	return g_config->trigger_strength;
+}
+
+float TriggerPositionScale() {
+	return g_config->trigger_position_scale;
+}
+
+bool TriggerSwap() {
+	return g_config->trigger_swap;
+}
+
 bool ForceDepthAlways() {
 	return g_config->force_depth_always;
 }
