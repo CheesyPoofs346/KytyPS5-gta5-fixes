@@ -380,6 +380,24 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--pad-speaker-preroll") {
+			options.config.pad_speaker_preroll =
+			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
+		} else if (arg == "--pad-speaker-rate") {
+			options.config.pad_speaker_rate =
+			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
+			if (options.config.pad_speaker_rate < 8000) {
+				::printf("invalid pad speaker rate: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--pad-speaker-volume") {
+			options.config.pad_speaker_volume =
+			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0)) & 0xffu;
+		} else if (arg == "--pad-speaker-bluetooth") {
+			if (!ParseBool(value, options.config.pad_speaker_bluetooth)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--trigger-swap") {
 			if (!ParseBool(value, options.config.trigger_swap)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

@@ -78,6 +78,7 @@ public:
 	void Touch(int id, int finger, uint16_t x, uint16_t y, bool down);
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	void SetTriggerEffect(const uint8_t* left, const uint8_t* right);
+	void ExpireTriggerEffect();
 	void RightStick(int id, int x, int y);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
@@ -101,6 +102,7 @@ private:
 	bool             m_hid_bluetooth = false;
 	uint8_t          m_last_trigger[22] = {};
 	bool             m_trigger_sent     = false;
+	uint64_t         m_trigger_time     = 0;
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
@@ -330,6 +332,30 @@ void GameController::ResetInputState() {
 	AddState(state);
 }
 
+// A title re-sends its trigger effect every frame for as long as it wants it. When it stops - the
+// player left the vehicle, holstered the weapon - it does not always send an explicit "off", and a
+// DualSense holds the last effect forever. Release it once the requests stop.
+void GameController::ExpireTriggerEffect() {
+	uint64_t last = 0;
+	{
+		Common::LockGuard lock(m_mutex);
+		if (!m_trigger_sent || m_trigger_time == 0) {
+			return;
+		}
+		last = m_trigger_time;
+	}
+	constexpr uint64_t ExpiryUs = 400000; // 0.4s of silence
+	if (LibKernel::KernelGetProcessTime() - last < ExpiryUs) {
+		return;
+	}
+	const uint8_t off[11] = {};
+	SetTriggerEffect(off, off);
+	{
+		Common::LockGuard lock(m_mutex);
+		m_trigger_time = 0;
+	}
+}
+
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
 
@@ -408,6 +434,7 @@ void GameController::SetTriggerEffect(const uint8_t* left, const uint8_t* right)
 	}
 	// The title re-sends the same effect every frame. A DualSense holds the last one, so writing it
 	// again is pure Bluetooth traffic - only send when it actually changes.
+	m_trigger_time = LibKernel::KernelGetProcessTime();
 	uint8_t combined[22] = {};
 	std::memcpy(combined, right, 11);
 	std::memcpy(combined + 11, left, 11);
@@ -680,6 +707,8 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	}
 
 	EXIT_IF(g_controller == nullptr);
+	// Titles poll the pad every frame; use that to release a trigger effect nothing is asking for.
+	g_controller->ExpireTriggerEffect();
 
 	int             connected_count = 0;
 	bool            connected       = false;

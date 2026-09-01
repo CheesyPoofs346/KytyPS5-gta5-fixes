@@ -26,7 +26,24 @@ FetchContent_Declare(
 	GIT_SHALLOW FALSE
 )
 
-FetchContent_MakeAvailable(xbyak zydis)
+# Opus is needed to stream audio to a DualSense over Bluetooth: the pad takes 10ms Opus frames in
+# HID report 0x36 rather than appearing as an audio device. The bundled FFmpeg has no Opus encoder.
+set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+# Opus ships x86 intrinsic paths that assume the compiler was told about SSSE3; clang-cl is not,
+# and the SSE4.1 sources fail to build. Encoding one 10ms frame per 10ms does not need them.
+set(OPUS_DISABLE_INTRINSICS ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+	opus
+	GIT_REPOSITORY https://github.com/xiph/opus.git
+	GIT_TAG        v1.5.2
+	GIT_SHALLOW    TRUE
+)
+
+FetchContent_MakeAvailable(xbyak zydis opus)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
 add_subdirectory(SDL2)

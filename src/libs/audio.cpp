@@ -1,4 +1,6 @@
+#include "common/emulatorConfig.h"
 #include "libs/audio.h"
+#include "libs/padAudio.h"
 
 #include "SDL.h"
 #include "common/assert.h"
@@ -221,6 +223,8 @@ SDL_AudioFormat Audio::SdlFormat(Format format) {
 	return FormatIsFloat(format) ? AUDIO_F32SYS : AUDIO_S16SYS;
 }
 
+static Kyty::Libs::Controller::PadAudioStream g_pad_audio;
+
 bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
@@ -238,8 +242,33 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 
 	SDL_AudioSpec obtained {};
 
+	// A pad-speaker port is meant to come out of the controller, not the TV. Every port was opened
+	// on the default device, so that audio played through the main output instead. Windows exposes a
+	// connected DualSense as its own audio endpoint; find it by name and open that for these ports.
+	const char* device_name = nullptr;
+	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+		const int count = SDL_GetNumAudioDevices(0);
+		for (int i = 0; i < count; i++) {
+			const char* candidate = SDL_GetAudioDeviceName(i, 0);
+			if (candidate != nullptr && (std::strstr(candidate, "Wireless Controller") != nullptr ||
+			                             std::strstr(candidate, "DualSense") != nullptr)) {
+				device_name = candidate;
+				::printf("AudioOut: pad speaker -> %s%s", candidate, "\n");
+				break;
+			}
+		}
+		if (device_name == nullptr) {
+			// No endpoint: on Bluetooth the pad only takes audio over HID.
+			if (Config::PadSpeakerBluetooth() &&
+			    g_pad_audio.Open(port->freq, static_cast<uint32_t>(port->channels_num))) {
+				::printf("AudioOut: pad speaker streaming over Bluetooth HID\n");
+			} else
+			::printf("AudioOut: no controller audio device found; pad speaker uses the default\n");
+		}
+	}
+
 	port->audio_device =
-	    SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+	    SDL_OpenAudioDevice(device_name, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
 	if (port->audio_device == 0) {
 		LOGF("AudioOut: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
 		return false;
@@ -383,6 +412,20 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 			}
 			Common::Thread::SleepMicro(1000);
 		}
+	}
+
+	// A pad-speaker port on a Bluetooth DualSense has no audio endpoint to queue to - the pad takes
+	// encoded frames over HID instead. Send there and skip the normal output so the audio does not
+	// also come out of the speakers.
+	if (port->type == AUDIO_OUT_PORT_TYPE_PADSPK && g_pad_audio.Ready()) {
+		// Send the guest's own samples, not queue_data: by this point SDL_ConvertAudio has upmixed
+		// them to the output device's layout, so a mono port arrives as stereo and every frame gets
+		// counted twice - which resampled to half rate and played back an octave low.
+		g_pad_audio.Submit(prepared_data,
+		                   prepared_size / (BytesPerSample(port->format) *
+		                                    static_cast<uint32_t>(port->channels_num)),
+		                   FormatIsFloat(port->format));
+		return true;
 	}
 
 	if (SDL_QueueAudio(port->audio_device, queue_data, queue_size) < 0) {

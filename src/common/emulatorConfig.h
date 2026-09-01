@@ -89,13 +89,24 @@ struct ConfigOptions {
 	bool                   retry_transient_map_faults  = true;
 	// Multiplier on adaptive-trigger force. 1.0 passes the title's request through unchanged;
 	// higher makes a subtle effect easier to feel.
-	float                  trigger_strength            = 1.0f;
+	float                  trigger_strength            = 4.0f;
 	// Scales where an adaptive-trigger effect starts. 1.0 is the title's request; 0 makes every
 	// effect begin at the top of the pull, which reads as constant pressure.
-	float                  trigger_position_scale      = 1.0f;
+	float                  trigger_position_scale      = 0.35f;
 	// Which trigger a title's first effect slot refers to. Sony's ordering is not documented here,
 	// so this makes it testable instead of assumed.
 	bool                   trigger_swap                = true;
+	// Stream pad-speaker audio to a Bluetooth DualSense over HID. Off by default: encoding and the
+	// blocking HID writes currently run on the audio thread and stall the game.
+	bool                   pad_speaker_bluetooth       = false;
+	// DualSense speaker volume for the Bluetooth stream, 0-255.
+	uint32_t               pad_speaker_volume          = 0xc0;
+	// Rate the DualSense consumes Bluetooth audio at. Sets both the resample ratio and the frame
+	// cadence, so it is effectively the pitch control - too low plays back deep and slow.
+	uint32_t               pad_speaker_rate            = 45000;
+	// Frames of audio buffered before playback starts. Deeper rides out bursty submissions at the
+	// cost of latency; each frame is about 10ms.
+	uint32_t               pad_speaker_preroll         = 6;
 	bool                   depth_clear_per_frame       = true;
 	bool                   suppress_band_pass          = false;
 	bool                   fix_degenerate_viewport_z   = false;
@@ -158,6 +169,10 @@ bool RetryTransientMapFaults();
 float TriggerStrength();
 float TriggerPositionScale();
 bool  TriggerSwap();
+bool  PadSpeakerBluetooth();
+uint32_t PadSpeakerVolume();
+uint32_t PadSpeakerRate();
+uint32_t PadSpeakerPreroll();
 bool DepthClearPerFrame();
 bool SuppressBandPass();
 bool FixDegenerateViewportZ();

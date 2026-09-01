@@ -195,6 +195,22 @@ bool TriggerSwap() {
 	return g_config->trigger_swap;
 }
 
+bool PadSpeakerBluetooth() {
+	return g_config->pad_speaker_bluetooth;
+}
+
+uint32_t PadSpeakerVolume() {
+	return g_config->pad_speaker_volume;
+}
+
+uint32_t PadSpeakerRate() {
+	return g_config->pad_speaker_rate;
+}
+
+uint32_t PadSpeakerPreroll() {
+	return g_config->pad_speaker_preroll;
+}
+
 bool ForceDepthAlways() {
 	return g_config->force_depth_always;
 }
