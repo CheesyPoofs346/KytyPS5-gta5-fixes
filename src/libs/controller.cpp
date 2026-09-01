@@ -344,6 +344,8 @@ void GameController::Touch(int id, int finger, uint16_t x, uint16_t y, bool down
 	if ((m_active_id != id && id != HOST_INPUT_CONTROLLER_ID) || finger < 0 || finger > 1) {
 		return;
 	}
+	::printf("Touch accepted: id=%d finger=%d x=%u y=%u down=%d\n",
+	         id, finger, x, y, down ? 1 : 0);
 	auto state = GetLastState();
 	state.time = LibKernel::KernelGetProcessTime();
 	state.touches[finger].x    = x;

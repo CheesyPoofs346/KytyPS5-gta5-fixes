@@ -76,6 +76,9 @@ static uint32_t ControllerButtonToPadButton(int button) {
 		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
 		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
 		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
+		// With the PS5 HIDAPI driver a DualSense reports its touchpad click as TOUCHPAD; the
+		// generic gamepad path reported it as BACK. Accept both so the click works either way.
+		case SDL_CONTROLLER_BUTTON_TOUCHPAD:
 		case SDL_CONTROLLER_BUTTON_BACK: return Controller::PAD_BUTTON_TOUCH_PAD;
 		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
 		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
@@ -601,6 +604,9 @@ void WindowContext::ProcessEvent(double time_s) {
 		case SDL_CONTROLLERTOUCHPADMOTION:
 		case SDL_CONTROLLERTOUCHPADUP: {
 			const bool down = event->type != SDL_CONTROLLERTOUCHPADUP;
+			::printf("SDL touchpad: which=%d finger=%d x=%.3f y=%.3f down=%d\n",
+			         static_cast<int>(event->ctouchpad.which), event->ctouchpad.finger,
+			         event->ctouchpad.x, event->ctouchpad.y, down ? 1 : 0);
 			Libs::Controller::ControllerTouch(
 			    static_cast<int>(event->ctouchpad.which), event->ctouchpad.finger,
 			    static_cast<uint16_t>(event->ctouchpad.x * 1919.0f),

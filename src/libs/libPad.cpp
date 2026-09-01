@@ -1,3 +1,4 @@
+#include <atomic>
 #include "common/abi.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
@@ -56,6 +57,17 @@ static int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const void* param) {
 		return -2137915391; /* 0x80920001 */
 	}
 
+	// Log what the title actually asks for: the effect mode and parameter bytes per trigger are
+	// what a DualSense HID output report has to carry, and nothing is known about them yet.
+	static std::atomic<uint32_t> trig_log {0};
+	if (trig_log.fetch_add(1, std::memory_order_relaxed) < 40) {
+		const auto* raw = static_cast<const uint8_t*>(param);
+		char        hex[3 * 32 + 1] = {};
+		for (int k = 0; k < 32; k++) {
+			::snprintf(hex + k * 3, 4, "%02x ", raw[k]);
+		}
+		::printf("PadSetTriggerEffect: %s\n", hex);
+	}
 	return OK;
 }
 
