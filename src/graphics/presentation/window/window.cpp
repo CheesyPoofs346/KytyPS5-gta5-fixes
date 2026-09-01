@@ -357,6 +357,10 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_GameControllerOpen(f.id);
+		::printf("SDL pad opened: %s (LED=%d, touchpads=%d)\n",
+		         SDL_GameControllerName(pad) ? SDL_GameControllerName(pad) : "?",
+		         SDL_GameControllerHasLED(pad) ? 1 : 0,
+		         SDL_GameControllerGetNumTouchpads(pad));
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
 		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
 		Controller::ControllerConnect(id);
@@ -591,6 +595,19 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
+		// DualSense touchpad. The pad reports normalized coordinates; the guest expects pixels
+		// in the touch resolution advertised by PadGetControllerInformation (1920x943).
+		case SDL_CONTROLLERTOUCHPADDOWN:
+		case SDL_CONTROLLERTOUCHPADMOTION:
+		case SDL_CONTROLLERTOUCHPADUP: {
+			const bool down = event->type != SDL_CONTROLLERTOUCHPADUP;
+			Libs::Controller::ControllerTouch(
+			    static_cast<int>(event->ctouchpad.which), event->ctouchpad.finger,
+			    static_cast<uint16_t>(event->ctouchpad.x * 1919.0f),
+			    static_cast<uint16_t>(event->ctouchpad.y * 942.0f), down);
+			break;
+		}
+
 		case SDL_MOUSEWHEEL: {
 			EventMouse mb {};
 
@@ -815,6 +832,13 @@ static void WindowCreate(WindowContext& context) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
 #endif
+
+	// Without the PS5 HIDAPI driver SDL opens a DualSense through the generic gamepad path, which
+	// exposes neither the light bar nor the touchpad (SDL reports LED=0, touchpads=0). Enabling it
+	// is what makes SDL_GameControllerSetLED and the touchpad events available at all.
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5, "1");
+	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
 
 	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
 		EXIT("%s\n", SDL_GetError());

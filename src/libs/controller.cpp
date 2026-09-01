@@ -39,15 +39,29 @@ struct PadControllerInformation {
 	uint8_t  reserve[8];
 };
 
+struct PadLightBarParam {
+	uint8_t r        = 0;
+	uint8_t g        = 0;
+	uint8_t b        = 0;
+	uint8_t reserve  = 0;
+};
+
 struct PadVibrationParam {
 	uint8_t large_motor;
 	uint8_t small_motor;
+};
+
+struct TouchPoint {
+	uint16_t x    = 0;
+	uint16_t y    = 0;
+	bool     down = false;
 };
 
 struct ControllerState {
 	uint64_t time                                  = 0;
 	uint32_t buttons                               = 0;
 	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	TouchPoint touches[2]                            = {};
 };
 
 class GameController {
@@ -61,6 +75,8 @@ public:
 	void Disconnect(int id);
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
+	void Touch(int id, int finger, uint16_t x, uint16_t y, bool down);
+	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	void RightStick(int id, int x, int y);
 	void ResetInputState();
 	void GetConnectionInfo(bool* flag, int* count);
@@ -111,8 +127,16 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->analog_buttons_l2      = state.axes[static_cast<int>(Axis::TriggerLeft)];
 	data->analog_buttons_r2      = state.axes[static_cast<int>(Axis::TriggerRight)];
 	data->orientation_w          = 1.0f;
+	// touch_data_touch_num was never set, so titles saw zero touch points and the touchpad
+	// registered only as a button. Report the live points.
 	data->touch_data_touch0_id   = 1;
 	data->touch_data_touch1_id   = 2;
+	data->touch_data_touch_num   = static_cast<uint8_t>((state.touches[0].down ? 1 : 0) +
+	                                                    (state.touches[1].down ? 1 : 0));
+	data->touch_data_touch0_x    = state.touches[0].x;
+	data->touch_data_touch0_y    = state.touches[0].y;
+	data->touch_data_touch1_x    = state.touches[1].x;
+	data->touch_data_touch1_y    = state.touches[1].y;
 	data->connected              = connected;
 	data->timestamp              = state.time;
 	data->connected_count        = pad_connected_count_to_u8(connected_count);
@@ -141,6 +165,7 @@ void GameController::Connect(int id) {
 	m_connected_ids.push_back(id);
 
 	CheckActive();
+	::printf("ControllerConnect: id=%d active=%d\n", id, m_active_id);
 }
 
 void GameController::Disconnect(int id) {
@@ -307,9 +332,37 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 
 	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
 	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
+	::printf("Rumble: large=%u small=%u pad=%p\n", large, small, static_cast<void*>(pad));
 	if (SDL_GameControllerRumble(pad, large, small, RUMBLE_DURATION_MS) != 0) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
 	}
+}
+
+void GameController::Touch(int id, int finger, uint16_t x, uint16_t y, bool down) {
+	Common::LockGuard lock(m_mutex);
+
+	if ((m_active_id != id && id != HOST_INPUT_CONTROLLER_ID) || finger < 0 || finger > 1) {
+		return;
+	}
+	auto state = GetLastState();
+	state.time = LibKernel::KernelGetProcessTime();
+	state.touches[finger].x    = x;
+	state.touches[finger].y    = y;
+	state.touches[finger].down = down;
+	AddState(state);
+}
+
+void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
+	Common::LockGuard lock(m_mutex);
+	if (m_active_id < 0) {
+		return;
+	}
+	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad == nullptr) {
+		return;
+	}
+	// A pad without an LED just reports failure; there is nothing to recover from.
+	(void)SDL_GameControllerSetLED(pad, r, g, b);
 }
 
 void GameController::GetConnectionInfo(bool* flag, int* count) {
@@ -388,6 +441,11 @@ void ControllerAxis(int id, Axis axis, int value) {
 	EXIT_IF(g_controller == nullptr);
 
 	g_controller->Axis(id, axis, value);
+}
+
+void ControllerTouch(int id, int finger, uint16_t x, uint16_t y, bool down) {
+	EXIT_IF(g_controller == nullptr);
+	g_controller->Touch(id, finger, x, y, down);
 }
 
 void ControllerRightStick(int id, int x, int y) {
@@ -618,6 +676,12 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	if (param == nullptr) {
 		return PAD_ERROR_INVALID_ARG;
 	}
+
+	// The light bar was accepted and dropped. Drive the real pad so titles that signal state
+	// through it (police lights, health, player colour) behave as intended.
+	EXIT_IF(g_controller == nullptr);
+	::printf("PadSetLightBar: r=%u g=%u b=%u\n", param->r, param->g, param->b);
+	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;
 }
