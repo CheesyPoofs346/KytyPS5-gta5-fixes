@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -46,21 +47,39 @@ public:
 	[[nodiscard]] bool Dump(uint64_t event_address);
 
 private:
-	static constexpr uint32_t QueryCount  = 512;
+	// 512 exhausted during boot: indices were consumed continuously and never recycled, so
+	// occlusion silently stopped working and the sun punched through geometry.
+	static constexpr uint32_t QueryCount  = 4096;
 	static constexpr uint32_t MaxSegments = 32;
 
 	// A query cannot span a command buffer, but the guest's begin/end dumps routinely do, so the
 	// count is accumulated across per-buffer segments.
+	// A Vulkan query must begin and end in the same command buffer. The scheduler flushes
+	// mid-frame, so an open query has to be closed before a submit and re-opened on the next
+	// buffer, otherwise getQueryPoolResults returns zero for it.
+	void CloseForSubmit();
+	void ReopenAfterSubmit();
+
 	void OpenSegment();
 	void CloseSegment();
+
+	// Indices are owned until their result has actually been read. The previous allocator was a
+	// plain `m_next = (m_next + 1) % QueryCount` with no in-flight tracking, so once it wrapped it
+	// called resetQueryPool on slots whose deferred read had not run yet - that is what made
+	// successful queries return zero, which in turn made the guest cull wrongly.
+	[[nodiscard]] bool AcquireIndex(uint32_t& out);
+	void               ReleaseIndices(const std::vector<uint32_t>& indices);
 
 	GraphicContext*       m_graphics  = nullptr;
 	CommandScheduler*     m_scheduler = nullptr;
 	vk::QueryPool         m_pool      = nullptr;
-	uint32_t              m_next      = 0;
+	// Guarded by m_free_mutex: filled by the deferred-read thread, drained by the GPU thread.
+	std::vector<uint32_t> m_free;
+	std::mutex            m_free_mutex;
 	bool                  m_counting  = false;
 	bool                  m_overflowed = false;
 	uint32_t              m_open_index = UINT32_MAX;
+	bool                  m_reopen_after_submit = false;
 	std::vector<uint32_t> m_segments;
 };
 
