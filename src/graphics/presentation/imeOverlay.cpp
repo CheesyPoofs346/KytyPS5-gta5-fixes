@@ -1,5 +1,7 @@
 #include "graphics/presentation/imeOverlay.h"
 
+#include "common/emulatorConfig.h"
+
 #include "SDL.h"
 #include "common/assert.h"
 #include "common/stringUtils.h"
@@ -851,14 +853,43 @@ struct ImeOverlay::Impl {
 		ImGui::End();
 	}
 
+	static void DrawFpsCounter(vk::Extent2D extent) {
+		const double fps   = Config::CurrentFps();
+		const double avg   = Config::AverageFps();
+		const float  scale = std::max(static_cast<float>(extent.height) / 1080.0f, 1.0f);
+		const float  pad   = 16.0f * scale;
+		// Top RIGHT. Pivot on the window's own right edge so it stays put as the text width
+		// changes between "9" and "60".
+		ImGui::SetNextWindowPos({static_cast<float>(extent.width) - pad, pad}, ImGuiCond_Always,
+		                        {1.0f, 0.0f});
+		ImGui::SetNextWindowBgAlpha(0.55f);
+		constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+		                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+		                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+		if (ImGui::Begin("##fps", nullptr, flags)) {
+			const ImVec4 colour = fps >= 50.0 ? ImVec4 {0.45f, 1.0f, 0.45f, 1.0f}
+			                      : fps >= 28.0 ? ImVec4 {1.0f, 0.85f, 0.35f, 1.0f}
+			                                    : ImVec4 {1.0f, 0.4f, 0.4f, 1.0f};
+			ImGui::SetWindowFontScale(scale * 2.6f);
+			ImGui::TextColored(colour, "%.0f FPS", fps);
+			ImGui::SetWindowFontScale(scale * 1.5f);
+			ImGui::TextColored({0.80f, 0.85f, 0.95f, 1.0f}, "avg %.1f", avg);
+		}
+		ImGui::End();
+	}
+
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
-		Ime::HostSnapshot snapshot;
-		if (!Ime::GetHostSnapshot(&snapshot)) {
+		// The overlay also carries the FPS counter, so a missing IME session is no longer a reason
+		// to skip the frame - only skip when there is nothing at all to draw.
+		Ime::HostSnapshot snapshot {};
+		const bool        has_ime  = Ime::GetHostSnapshot(&snapshot);
+		const bool        want_fps = Config::ShowFpsOverlay();
+		if (!has_ime && !want_fps) {
 			return false;
 		}
 		const uint64_t prepared_generation = snapshot.generation;
 		EnsureVulkan(format, image_count);
-		if (generation != snapshot.generation) {
+		if (has_ime && generation != snapshot.generation) {
 			generation    = snapshot.generation;
 			focus_pending = true;
 			shift         = (snapshot.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
@@ -870,7 +901,9 @@ struct ImeOverlay::Impl {
 			io.ClearInputKeys();
 			io.ClearInputMouse();
 		}
-		DrainInput(snapshot.generation);
+		if (has_ime) {
+			DrainInput(snapshot.generation);
+		}
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -883,11 +916,19 @@ struct ImeOverlay::Impl {
 		last_frame     = now;
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!Ime::GetHostSnapshot(&snapshot) || snapshot.generation != prepared_generation) {
+		const bool ime_ready =
+		    has_ime && Ime::GetHostSnapshot(&snapshot) && snapshot.generation == prepared_generation;
+		const bool show_fps = want_fps;
+		if (!ime_ready && !show_fps) {
 			ImGui::EndFrame();
 			return false;
 		}
-		DrawDialog(snapshot, frame_extent);
+		if (ime_ready) {
+			DrawDialog(snapshot, frame_extent);
+		}
+		if (show_fps) {
+			DrawFpsCounter(frame_extent);
+		}
 		ImGui::Render();
 		extent = frame_extent;
 		return true;

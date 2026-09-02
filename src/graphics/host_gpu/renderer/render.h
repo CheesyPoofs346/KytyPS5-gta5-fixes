@@ -74,6 +74,11 @@ struct SubmitInfo {
 	}
 };
 
+// Increments each time a command buffer begins recording. Pool-recycled handles make handle
+// comparison unsafe for per-command-buffer state caches (dynamic state, bind filtering) - a
+// fresh recording can reuse the previous handle. Compare this instead.
+uint64_t CurrentCommandGeneration();
+
 class CommandBuffer {
 public:
 	~CommandBuffer() = default;

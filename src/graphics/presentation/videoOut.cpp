@@ -1238,6 +1238,14 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	}
 
 	Common::LockGuard lock(ctx->mutex);
+	// A non-zero rate divides the flip cadence: IsFlipDueLocked only presents when
+	// vblank_count %% (rate + 1) == 0, which quantises the achievable framerate to 60/(rate+1)
+	// and its submultiples. Worth knowing what the guest actually asks for.
+	if (ctx->flip_rate != rate) {
+		std::printf("VideoOutSetFlipRate: %d (flip allowed every %d vblanks -> max %.1f fps)\n",
+		            rate, rate + 1, 60.0 / static_cast<double>(rate + 1));
+		std::fflush(stdout);
+	}
 	ctx->flip_rate = rate;
 
 	return OK;

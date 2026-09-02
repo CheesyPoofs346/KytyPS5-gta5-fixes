@@ -29,7 +29,19 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 	return m_buffer;
 }
 
+namespace {
+// Monotonic id for "a command buffer began recording". Handles come from a pool and are
+// RECYCLED, so comparing handles cannot tell a fresh recording from a continuing one - anything
+// caching per-command-buffer Vulkan state (dynamic state, bind filtering) must key on this.
+std::atomic<uint64_t> g_command_generation {0};
+} // namespace
+
+uint64_t CurrentCommandGeneration() {
+	return g_command_generation.load(std::memory_order_relaxed);
+}
+
 void CommandBuffer::Begin() {
+	g_command_generation.fetch_add(1, std::memory_order_relaxed);
 	EXIT_IF(m_rendering || IsInvalid());
 	auto buffer = Handle();
 

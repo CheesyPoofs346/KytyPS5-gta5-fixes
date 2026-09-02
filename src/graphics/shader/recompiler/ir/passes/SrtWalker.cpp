@@ -3,7 +3,11 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
 
+#include "common/emulatorConfig.h"
+
 #include <algorithm>
+#include <span>
+#include <array>
 #include <bit>
 #include <cstring>
 #include <fmt/format.h>
@@ -421,6 +425,29 @@ public:
 
 	void SetUsePc(uint32_t pc) { m_use_pc = pc; }
 
+	// --- Dependency recording for cheap re-validation ---
+	//
+	// Resolving a descriptor costs ~370ns, almost all of it walking the expression tree; the
+	// memory it reads is only a handful of dwords (~20ns). So record exactly what an evaluation
+	// depended on - which user-data slots, and which (address, value) pairs it read - and the
+	// next draw can re-read just those and compare. If they match, the result is provably
+	// identical and the whole walk is skipped.
+	static constexpr size_t kMaxRecordedReads = 12;
+	static constexpr size_t kMaxRecordedSlots = 16;
+
+	struct Dependencies {
+		uint64_t user_data_mask = 0;
+		uint32_t slot_values[kMaxRecordedSlots] {};
+		uint32_t slot_count = 0;
+		uint64_t addresses[kMaxRecordedReads] {};
+		uint32_t values[kMaxRecordedReads] {};
+		uint32_t read_count = 0;
+		bool     overflowed = false;   // too many reads to track: never cacheable
+	};
+
+	void          BeginRecording() { m_deps = {}; }
+	const Dependencies& RecordedDependencies() const { return m_deps; }
+
 	bool Evaluate(Value value, uint32_t& result, std::string* error) {
 		uint64_t wide = 0;
 		if (!EvaluateWide(value, wide, error)) {
@@ -451,20 +478,21 @@ private:
 		if (inst == nullptr) {
 			return Fail(error, "invalid typed runtime value");
 		}
-		if (const auto found = m_cache.find(inst); found != m_cache.end()) {
-			result = found->second;
+		uint64_t   memo   = 0;
+		const auto status = MemoLookup(inst, memo);
+		if (status == 1) {
+			result = memo;
 			return true;
 		}
-		if (std::ranges::find(m_visiting, inst) != m_visiting.end()) {
+		if (status == -1) {
 			return Fail(error, "cyclic typed runtime value");
 		}
-		m_visiting.push_back(inst);
+		MemoMarkVisiting(inst);
 		uint64_t out = 0;
 		if (!EvaluateInst(*inst, out, error)) {
 			return false;
 		}
-		m_visiting.pop_back();
-		m_cache.emplace(inst, out);
+		MemoInsert(inst, out);
 		result = out;
 		return true;
 	}
@@ -577,6 +605,13 @@ private:
 			}
 		} else {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+			if (m_deps.read_count < kMaxRecordedReads) {
+				m_deps.addresses[m_deps.read_count] = address;
+				m_deps.values[m_deps.read_count]    = word;
+				m_deps.read_count++;
+			} else {
+				m_deps.overflowed = true;
+			}
 		}
 		result = word;
 		return true;
@@ -596,6 +631,18 @@ private:
 				if (reg < m_program.user_data_base ||
 				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 					return Fail(error, fmt::format("user SGPR {} is unavailable", reg));
+				}
+				if (const auto slot = reg - m_program.user_data_base; slot < 64) {
+					if ((m_deps.user_data_mask & (uint64_t {1} << slot)) == 0) {
+						if (m_deps.slot_count < kMaxRecordedSlots) {
+							m_deps.user_data_mask |= uint64_t {1} << slot;
+							m_deps.slot_values[m_deps.slot_count++] = m_runtime.user_data[slot];
+						} else {
+							m_deps.overflowed = true;
+						}
+					}
+				} else {
+					m_deps.overflowed = true;
 				}
 				result = m_runtime.user_data[reg - m_program.user_data_base];
 				return true;
@@ -860,12 +907,79 @@ private:
 		                               ValueOpcodeName(inst.GetOpcode())));
 	}
 
+	Dependencies                              m_deps;
 	const Program&                            m_program;
 	const SrtRuntime&                         m_runtime;
 	std::span<const uint8_t>                  m_clean_flat_slots;
 	Evaluator*                                m_clean_evaluator = nullptr;
 	uint32_t                                  m_use_pc          = 0;
-	std::unordered_map<const Inst*, uint64_t> m_cache;
+	// Open-addressed memo, 256 slots x 16 bytes = 4KB, stays in L1. The previous
+	// unordered_map cost two hash operations per node (find + emplace) and an expression has
+	// tens of nodes, so this was a large share of the ~370ns spent per descriptor.
+	//
+	// Scoped to a single evaluation: cleared per Evaluator, never reused across draws. An
+	// earlier attempt at cross-draw reuse resolved stale descriptors and rendered light coronas
+	// as red blobs - do not reintroduce that without per-input validation.
+	static constexpr size_t kMemoBits = 8;
+	static constexpr size_t kMemoSize = size_t {1} << kMemoBits;
+
+	struct MemoSlot {
+		const Inst* key   = nullptr;
+		uint64_t    value = 0;
+		// "Currently being evaluated" lives here rather than in a separate vector: the old cycle
+		// check was a linear scan of m_visiting on EVERY node, and expressions are 10-20 deep.
+		bool        done  = false;
+	};
+	std::array<MemoSlot, kMemoSize> m_memo {};
+
+	static size_t MemoIndex(const Inst* inst) {
+		auto h = reinterpret_cast<uintptr_t>(inst);
+		h ^= h >> 29;
+		h *= 0xbf58476d1ce4e5b9ull;
+		return static_cast<size_t>(h >> 33) & (kMemoSize - 1);
+	}
+
+	// Returns: 1 = resolved (out set), 0 = not present, -1 = currently being evaluated (cycle).
+	int MemoLookup(const Inst* inst, uint64_t& out) const {
+		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
+			if (m_memo[i].key == inst) {
+				if (!m_memo[i].done) {
+					return -1;
+				}
+				out = m_memo[i].value;
+				return 1;
+			}
+			if (m_memo[i].key == nullptr) {
+				return 0;
+			}
+		}
+		return 0;
+	}
+
+	void MemoMarkVisiting(const Inst* inst) {
+		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
+			if (m_memo[i].key == nullptr) {
+				m_memo[i].key  = inst;
+				m_memo[i].done = false;
+				return;
+			}
+			if (m_memo[i].key == inst) {
+				return;
+			}
+		}
+	}
+
+	void MemoInsert(const Inst* inst, uint64_t value) {
+		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
+			if (m_memo[i].key == nullptr || m_memo[i].key == inst) {
+				m_memo[i].key   = inst;
+				m_memo[i].value = value;
+				m_memo[i].done  = true;
+				return;
+			}
+		}
+		// Full after 8 probes: skip memoising. The value is simply recomputed; never wrong.
+	}
 	std::vector<const Inst*>                  m_visiting;
 };
 
@@ -875,6 +989,74 @@ const DescriptorSource* Source(const Program& program, uint32_t source) {
 	}
 	return &program.descriptor_sources[source];
 }
+
+namespace {
+
+// Descriptor result cache with cheap re-validation.
+//
+// A cached entry stores exactly what its evaluation depended on. Validating it costs a handful
+// of dword reads and compares (~30-80ns) instead of re-walking the expression tree (~370ns).
+// Unlike a plain user-data key, this also covers descriptors that dereference guest memory -
+// which is the majority - because the recorded (address, value) pairs prove the memory it
+// actually read has not changed.
+//
+// Correctness: if every recorded user-data slot and every recorded memory location still holds
+// the value it held when the result was computed, the expression is a pure function of those
+// inputs and must produce the same result. Anything that read more locations than we track is
+// marked overflowed and never cached.
+struct DescriptorEntry {
+	const void*              program      = nullptr;
+	uint64_t                 program_hash = 0;   // raw pointers get recycled; hash does not
+	uint32_t                 source       = 0;
+	uint32_t                 dword_count  = 0;   // guards against a mismatched entry
+	Evaluator::Dependencies  deps;
+	DescriptorValue          value;
+	bool                     valid = false;
+};
+
+constexpr size_t kDescCacheBits = 11;
+constexpr size_t kDescCacheSize = size_t {1} << kDescCacheBits;
+
+std::array<DescriptorEntry, kDescCacheSize>& DescriptorCache() {
+	static thread_local std::array<DescriptorEntry, kDescCacheSize> cache;
+	return cache;
+}
+
+size_t DescriptorSlot(const void* program, uint32_t source) {
+	uint64_t h = reinterpret_cast<uintptr_t>(program) ^ (uint64_t {source} * 0x9e3779b97f4a7c15ull);
+	h ^= h >> 29;
+	h *= 0xbf58476d1ce4e5b9ull;
+	return static_cast<size_t>(h >> 33) & (kDescCacheSize - 1);
+}
+
+// Re-read the recorded inputs and compare. Cheap: a few dwords.
+bool DependenciesStillHold(const Evaluator::Dependencies& deps,
+                           std::span<const uint32_t> user_data) {
+	if (deps.overflowed) {
+		return false;
+	}
+	uint32_t i = 0;
+	uint64_t m = deps.user_data_mask;
+	while (m != 0) {
+		const auto slot = static_cast<size_t>(std::countr_zero(m));
+		m &= m - 1;
+		if (slot >= user_data.size() || i >= deps.slot_count ||
+		    user_data[slot] != deps.slot_values[i]) {
+			return false;
+		}
+		i++;
+	}
+	for (uint32_t r = 0; r < deps.read_count; r++) {
+		uint32_t current = 0;
+		std::memcpy(&current, reinterpret_cast<const void*>(deps.addresses[r]), sizeof(current));
+		if (current != deps.values[r]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+} // namespace
 
 bool EvaluateRuntimeSourcesImpl(const Program&                           program,
                                 std::span<const DescriptorSourceRequest> requests,
@@ -912,9 +1094,35 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 		evaluator.SetUsePc(request.use_pc);
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
+
+		const bool use_cache = Config::CacheDescriptors();
+		auto&      slot      = DescriptorCache()[DescriptorSlot(&program, request.source)];
+		if (use_cache && slot.valid && slot.program == &program &&
+		    slot.program_hash == program.shader_hash && slot.source == request.source &&
+		    slot.dword_count == source->dword_count &&
+		    DependenciesStillHold(slot.deps, runtime.user_data)) {
+			evaluated.push_back(slot.value);
+			continue;
+		}
+
+		evaluator.BeginRecording();
 		for (uint32_t index = 0; index < source->dword_count; index++) {
 			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index], error)) {
 				return false;
+			}
+		}
+		if (use_cache) {
+			const auto& deps = evaluator.RecordedDependencies();
+			if (!deps.overflowed) {
+				slot.program      = &program;
+				slot.program_hash = program.shader_hash;
+				slot.source       = request.source;
+				slot.dword_count  = source->dword_count;
+				slot.deps         = deps;
+				slot.value        = value;
+				slot.valid        = true;
+			} else if (slot.program == &program && slot.source == request.source) {
+				slot.valid = false;
 			}
 		}
 		evaluated.push_back(value);

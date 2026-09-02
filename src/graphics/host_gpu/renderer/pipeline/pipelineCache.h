@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h" // ShaderParams
 
 #include <cstddef>
 #include <filesystem>
@@ -139,6 +140,45 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters& sh,
 	                                ShaderComputeInputInfo& input_info);
+
+	// --- Split of the two getters above into their serial and parallelisable halves ---
+	//
+	// Phase A (Prepare*): reads live register state, fills input_info. Must stay on the parsing
+	// thread and stays cheap (~0.33us).
+	// Phase B (Materialize*): re-resolves every shader resource descriptor. Measured at ~21% of
+	// the frame and verified pure - no shared cache, no command buffer, no texture state - so it
+	// is the part that can move off the critical path.
+	//
+	// WARNING: ShaderParams::user_data is a span into the LIVE register state, which mutates as
+	// parsing continues. Anything that defers Materialize* past the next register write must copy
+	// user_data first, or it will materialise against the wrong values.
+	[[nodiscard]] ShaderParams PrepareVertexParams(const HW::VertexShaderInfo& regs,
+	                                               const HW::ShaderRegisters&  sh,
+	                                               ShaderVertexInputInfo&      input_info);
+	[[nodiscard]] ShaderParams
+	PreparePixelParams(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+	                   const ShaderVertexInputInfo&                        vertex_info,
+	                   std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                   ShaderPixelInputInfo&                               input_info);
+	ShaderProgram MaterializeVertexProgram(const ShaderParams& params,
+	                                       ShaderVertexInputInfo& input_info);
+	ShaderProgram MaterializePixelProgram(const ShaderParams&   params,
+	                                      ShaderPixelInputInfo& input_info);
+
+	using ProgramRef = std::shared_ptr<const ShaderRecompiler::IR::Program>;
+
+	// Split of Materialize* into lookup (locked, cheap) and resource resolution (unlocked, pure,
+	// ~21% of frame). Lookup publishes stage.program so a dependent stage can be prepared before
+	// resources are resolved; the two resolutions are then independent and can overlap.
+	// Both return false when the shader needs compiling - callers fall back to Materialize*.
+	bool LookupVertexProgram(const ShaderParams& params, ShaderVertexInputInfo& input_info,
+	                         ShaderProgram& handle, ProgramRef& program);
+	bool LookupPixelProgram(const ShaderParams& params, ShaderPixelInputInfo& input_info,
+	                        ShaderProgram& handle, ProgramRef& program);
+	bool ResolveVertexResources(const ProgramRef& program, const ShaderParams& params,
+	                            ShaderVertexInputInfo& input_info);
+	bool ResolvePixelResources(const ProgramRef& program, const ShaderParams& params,
+	                           ShaderPixelInputInfo& input_info);
 
 	GraphicsPipeline& CreateGraphicsPipeline(
 	    std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,

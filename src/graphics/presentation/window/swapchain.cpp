@@ -794,7 +794,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
-			const bool        draw_ime_overlay = ime_visual.active && swapchain.PrepareImeOverlay();
+			// The overlay also carries the FPS counter, so it must run when no IME is up.
+			const bool        draw_ime_overlay =
+			    (ime_visual.active || Config::ShowFpsOverlay()) && swapchain.PrepareImeOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_ime_overlay);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
