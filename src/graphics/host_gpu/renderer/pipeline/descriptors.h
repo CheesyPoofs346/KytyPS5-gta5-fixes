@@ -53,6 +53,14 @@ struct PreparedBindings {
 	bool                                          committed = false;
 };
 
+// Recycles a PreparedBindings' heap buffers for reuse by the next draw. Safe because only the
+// buffers move; the object keeps value semantics.
+void ReturnPooledBindingStorage(PreparedBindings& prepared);
+
+// Clears the per-draw buffer resolution cache. MUST be called at the start of every draw: the
+// guest can write buffer memory between draws, so a resolution is only valid within one.
+void BeginDrawBufferScope();
+
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] uint32_t

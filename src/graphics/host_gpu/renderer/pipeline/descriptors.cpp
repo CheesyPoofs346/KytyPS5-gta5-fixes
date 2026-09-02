@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -167,6 +168,50 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+namespace {
+
+// Cache of buffer resolutions valid for the duration of ONE draw. See the comment at its use
+// site for why the scope is exactly one draw and no longer.
+// The key must contain EVERY input ObtainBuffer uses, or the cache hands one resource another
+// resource's view. An earlier version keyed on address+size alone and ignored `formatted` and
+// the BufferId; that is the same omitted-input mistake that made light coronas render as red
+// blobs twice before. `written` is not a key field because written buffers are never cached.
+struct DrawBufferCacheEntry {
+	uint64_t   address       = 0;
+	uint64_t   size          = 0;
+	bool       formatted     = false;
+	BufferId   id {};
+	uint32_t   alignment     = 0;
+	uint32_t   buffer_offset = 0;
+	BufferView view;
+};
+
+const DrawBufferCacheEntry* FindDrawBufferCache(uint64_t address, uint64_t size, bool formatted,
+                                                BufferId id, uint32_t alignment);
+
+std::vector<DrawBufferCacheEntry>& DrawBufferCache() {
+	static thread_local std::vector<DrawBufferCacheEntry> cache;
+	return cache;
+}
+
+const DrawBufferCacheEntry* FindDrawBufferCache(uint64_t address, uint64_t size, bool formatted,
+                                                BufferId id, uint32_t alignment) {
+	for (const auto& e: DrawBufferCache()) {
+		// alignment participates because buffer_offset is derived from it.
+		if (e.address == address && e.size == size && e.formatted == formatted && e.id == id &&
+		    e.alignment == alignment) {
+			return &e;
+		}
+	}
+	return nullptr;
+}
+
+} // namespace
+
+void BeginDrawBufferScope() {
+	DrawBufferCache().clear();
+}
+
 static BufferView NativeStorageBuffer(RenderContext&                              context,
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
@@ -193,6 +238,21 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	    size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range or device alignment is unsupported\n");
 	}
+	// Per-draw dedup. ObtainBuffer is not cheap - two locked memory-tracker queries, and for
+	// small read-only buffers a memcpy of the guest data into the stream buffer. Vertex and pixel
+	// stages frequently bind the SAME buffer, and RebindBuffers runs once per stage, so the
+	// identical request is served twice per draw.
+	//
+	// Scoped to one draw (cleared by BeginDrawBufferScope), because between draws the guest may
+	// have written the memory and the answer can legitimately change. Written buffers are never
+	// cached - they mutate GPU-side state.
+	if (!resource.written && Config::BufferDedupEnabled()) {
+		if (const auto* hit = FindDrawBufferCache(address, size, resource.formatted, id,
+		                                          static_cast<uint32_t>(alignment))) {
+			buffer_offset = hit->buffer_offset;
+			return hit->view;
+		}
+	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                              resource.formatted, id);
 	const auto aligned_offset = offset - offset % alignment;
@@ -213,6 +273,10 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
 	    ShaderStageResourceName(stage), slot, address, size,
 	    resource.written ? (resource.read ? "ReadWrite" : "Write") : "Read", resource.formatted);
+	if (!resource.written && Config::BufferDedupEnabled() && DrawBufferCache().size() < 32) {
+		DrawBufferCache().push_back({address, size, resource.formatted, id,
+		                             static_cast<uint32_t>(alignment), buffer_offset, result});
+	}
 	return result;
 }
 
@@ -890,6 +954,67 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+namespace {
+
+// Vector-buffer recycling for PreparedBindings.
+//
+// PrepareBindings runs twice per draw and each call allocates ~9 vectors, so ~18 heap
+// allocations per draw. The objects themselves keep value semantics (an earlier attempt at
+// pooling the whole object let pointers escape and broke tests) - only the heap buffers are
+// recycled, by swapping them out before destruction and back in on the next call.
+struct BindingStorage {
+	std::vector<BufferView>     buffers;
+	std::vector<TextureBinding> images;
+	std::vector<vk::Sampler>    samplers;
+	std::vector<BufferId>       buffer_ids;
+	std::vector<uint32_t>       flattened_srt;
+	std::vector<uint32_t>       user_data;
+};
+
+std::vector<BindingStorage>& StoragePool() {
+	static thread_local std::vector<BindingStorage> pool;
+	return pool;
+}
+
+// Seed a fresh PreparedBindings with recycled buffers (empty, but with capacity).
+void TakePooledStorage(PreparedBindings& prepared) {
+	auto& pool = StoragePool();
+	if (pool.empty()) {
+		return;
+	}
+	auto slot = std::move(pool.back());
+	pool.pop_back();
+	slot.buffers.clear();
+	slot.images.clear();
+	slot.samplers.clear();
+	slot.buffer_ids.clear();
+	slot.flattened_srt.clear();
+	slot.user_data.clear();
+	prepared.resources.buffers  = std::move(slot.buffers);
+	prepared.resources.images   = std::move(slot.images);
+	prepared.resources.samplers = std::move(slot.samplers);
+	prepared.buffer_ids         = std::move(slot.buffer_ids);
+	prepared.flattened_srt      = std::move(slot.flattened_srt);
+	prepared.user_data          = std::move(slot.user_data);
+}
+
+} // namespace
+
+void ReturnPooledBindingStorage(PreparedBindings& prepared) {
+	auto& pool = StoragePool();
+	if (pool.size() >= 8) {
+		return;
+	}
+	BindingStorage slot;
+	slot.buffers       = std::move(prepared.resources.buffers);
+	slot.images        = std::move(prepared.resources.images);
+	slot.samplers      = std::move(prepared.resources.samplers);
+	slot.buffer_ids    = std::move(prepared.buffer_ids);
+	slot.flattened_srt = std::move(prepared.flattened_srt);
+	slot.user_data     = std::move(prepared.user_data);
+	pool.push_back(std::move(slot));
+}
+
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
@@ -901,6 +1026,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	}
 
 	PreparedBindings prepared;
+	TakePooledStorage(prepared);
 	prepared.program  = runtime.program.get();
 	prepared.snapshot = runtime.resources.get();
 	auto& descriptors = prepared.resources;
@@ -1048,6 +1174,8 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 RenderExecutor::GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
+	// One draw's worth of buffer resolutions; see BeginDrawBufferScope.
+	BeginDrawBufferScope();
 	GraphicsBindings bindings {
 	    .vertex = PrepareBindings(vertex),
 	};
