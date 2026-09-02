@@ -142,6 +142,47 @@ struct PipelineCache::ProgramCache {
 	static constexpr std::size_t MaxStaticKeyWords =
 	    5 + ShaderVertexInputInfo::RES_MAX * 17;
 
+	// Lookup only: matches a permutation by static key and publishes its IR program into
+	// input_info WITHOUT resolving resources. That matters because pixel preparation only needs
+	// vs_info.stage.program - so once this has run for the vertex stage, pixel prep can proceed
+	// while the expensive resource resolution for both stages still has to happen.
+	// Returns false when no permutation matches (a compile is required, which stays serial).
+	template <typename InputInfo>
+	bool FindPermutation(const ShaderParams& params, InputInfo& input_info, ShaderProgram& handle,
+	                     std::shared_ptr<const ShaderRecompiler::IR::Program>& program) {
+		constexpr ShaderType stage = StageOf<InputInfo>();
+		static thread_local std::vector<uint32_t> local_key;
+		BuildStageStaticKey(input_info, local_key);
+		const auto found = programs.find({stage, params.hash});
+		if (found == programs.end()) {
+			return false;
+		}
+		for (const auto& permutation: found->second) {
+			if (permutation.static_key == local_key) {
+				handle  = permutation.handle;
+				program = permutation.program;
+				// Publish the program so a dependent stage can be prepared before resources are
+				// resolved. stage.resources stays null until MaterialiseInto runs.
+				input_info.stage.program = permutation.program;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	template <typename InputInfo>
+	static constexpr ShaderType StageOf() {
+		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+			return ShaderType::Vertex;
+		} else if constexpr (std::is_same_v<InputInfo, ShaderPixelInputInfo>) {
+			return ShaderType::Pixel;
+		} else {
+			static_assert(std::is_same_v<InputInfo, ShaderComputeInputInfo>);
+			return ShaderType::Compute;
+		}
+	}
+
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info) {
 		constexpr ShaderType stage = [] {
@@ -175,6 +216,15 @@ struct PipelineCache::ProgramCache {
 
 		std::printf("Num compiled %u shaders\n", ++num_compiled);
 		return handle;
+	}
+
+	// Resource resolution for an already-located permutation. This is the ~21% of frame that is
+	// pure - it reads guest memory and writes only input_info.stage - so two stages can run it
+	// concurrently on separate input_info objects.
+	template <typename InputInfo>
+	static bool MaterialiseInto(const std::shared_ptr<const ShaderRecompiler::IR::Program>& program,
+	                            const ShaderParams& params, InputInfo& input_info) {
+		return MaterializeProgram(program, params, input_info);
 	}
 
 	explicit ProgramCache(vk::Device device): device(device) {
@@ -362,10 +412,60 @@ void PipelineCache::Save() {
 	m_driver_cache = nullptr;
 }
 
+ShaderParams PipelineCache::PrepareVertexParams(const HW::VertexShaderInfo& regs,
+                                                const HW::ShaderRegisters&  sh,
+                                                ShaderVertexInputInfo&      input_info) {
+	return PrepareProgram(regs, sh, input_info);
+}
+
+ShaderProgram PipelineCache::MaterializeVertexProgram(const ShaderParams&    params,
+                                                      ShaderVertexInputInfo& input_info) {
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->Get(params, input_info);
+}
+
+bool PipelineCache::LookupVertexProgram(const ShaderParams& params,
+                                        ShaderVertexInputInfo& input_info, ShaderProgram& handle,
+                                        ProgramRef& program) {
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->FindPermutation(params, input_info, handle, program);
+}
+
+bool PipelineCache::LookupPixelProgram(const ShaderParams& params,
+                                       ShaderPixelInputInfo& input_info, ShaderProgram& handle,
+                                       ProgramRef& program) {
+	Common::LockGuard lock(m_mutex);
+	return m_program_cache->FindPermutation(params, input_info, handle, program);
+}
+
+bool PipelineCache::ResolveVertexResources(const ProgramRef& program, const ShaderParams& params,
+                                           ShaderVertexInputInfo& input_info) {
+	// Deliberately unlocked: resolution touches no cache state.
+	return ProgramCache::MaterialiseInto(program, params, input_info);
+}
+
+bool PipelineCache::ResolvePixelResources(const ProgramRef& program, const ShaderParams& params,
+                                          ShaderPixelInputInfo& input_info) {
+	return ProgramCache::MaterialiseInto(program, params, input_info);
+}
+
 ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
                                               const HW::ShaderRegisters&  sh,
                                               ShaderVertexInputInfo&      input_info) {
-	const auto params = PrepareProgram(regs, sh, input_info);
+	const auto params = PrepareVertexParams(regs, sh, input_info);
+	return MaterializeVertexProgram(params, input_info);
+}
+
+ShaderParams PipelineCache::PreparePixelParams(
+    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+    const ShaderVertexInputInfo&                        vertex_info,
+    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+    ShaderPixelInputInfo&                               input_info) {
+	return PrepareProgram(regs, sh, vertex_info, target_export_mapping, input_info);
+}
+
+ShaderProgram PipelineCache::MaterializePixelProgram(const ShaderParams&   params,
+                                                     ShaderPixelInputInfo& input_info) {
 	Common::LockGuard lock(m_mutex);
 	return m_program_cache->Get(params, input_info);
 }
@@ -375,9 +475,8 @@ ShaderProgram PipelineCache::GetPixelProgram(
     const ShaderVertexInputInfo&                        vertex_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               input_info) {
-	const auto params = PrepareProgram(regs, sh, vertex_info, target_export_mapping, input_info);
-	Common::LockGuard lock(m_mutex);
-	return m_program_cache->Get(params, input_info);
+	const auto params = PreparePixelParams(regs, sh, vertex_info, target_export_mapping, input_info);
+	return MaterializePixelProgram(params, input_info);
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
@@ -557,8 +656,29 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 	key.ps_shader_id  = p.ps_shader_id;
 	key.static_params = static_params;
 
-	if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
-		return *iter->second;
+	// Single-entry memo in front of the hash map. The key is ~200 bytes and hashing it walks
+	// every byte; consecutive draws very often produce an identical key, so a memcmp against the
+	// last one beats re-hashing. Exact comparison, so it can never return a different pipeline.
+	{
+		// Pipelines are only destroyed in ~PipelineCache, so the pointer is stable while playing.
+		// The owner is part of the key anyway: this memo is thread_local and would otherwise
+		// outlive a destroyed cache and hand back a dangling pointer - the same mistake that made
+		// the descriptor cache return a foreign shader's descriptor.
+		static thread_local const PipelineCache* s_owner = nullptr;
+		static thread_local GraphicsPipelineKey  s_last_key {};
+		static thread_local GraphicsPipeline*    s_last_pipeline = nullptr;
+		const bool memo_enabled = Config::PipelineMemoEnabled();
+		if (memo_enabled && s_owner == this && s_last_pipeline != nullptr && s_last_key == key) {
+			return *s_last_pipeline;
+		}
+		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
+			if (memo_enabled) {
+				s_owner         = this;
+				s_last_key      = key;
+				s_last_pipeline = iter->second.get();
+			}
+			return *iter->second;
+		}
 	}
 
 	if (graphics_debug_dump_enabled()) {

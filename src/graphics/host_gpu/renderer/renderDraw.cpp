@@ -32,6 +32,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <functional>
+#include <thread>
+#include <chrono>
 #include <bit>
 #include <cmath>
 #include <cstdio>
@@ -310,6 +313,73 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	}
 }
 
+namespace {
+
+// Redundant dynamic-state filtering.
+//
+// Every draw issues 11 vkCmdSet* calls (viewport, scissor, line width, depth bias, six stencil),
+// but viewport/scissor/stencil rarely differ between consecutive draws. Each call is driver
+// overhead, so skipping the unchanged ones is worth roughly 0.5-1us/draw.
+//
+// Vulkan dynamic state is per COMMAND BUFFER, so the cache is invalidated whenever the handle
+// changes - otherwise a new buffer would inherit state it was never given.
+struct DynamicStateCache {
+	// Generation, not handle: command buffers come from a pool and handles are RECYCLED, so an
+	// unchanged handle does not mean the recording is the same one.
+	uint64_t            generation = UINT64_MAX;
+	vk::Viewport        viewport {};
+	vk::Rect2D          scissor {};
+	float               line_width        = -1.0f;
+	int                 depth_bias_enable = -1;
+	float               bias_constant     = 0.0f;
+	float               bias_clamp        = 0.0f;
+	float               bias_slope        = 0.0f;
+	bool                bias_valid        = false;
+	uint32_t            stencil[6] {};
+	bool                stencil_valid = false;
+	// Bind calls are per-command-buffer state too, so they share this cache's lifetime rules.
+	VkPipeline          pipeline      = VK_NULL_HANDLE;
+	VkBuffer            index_buffer  = VK_NULL_HANDLE;
+	uint64_t            index_offset  = UINT64_MAX;
+	uint32_t            index_type    = UINT32_MAX;
+
+	// Returns true when a new command buffer recording started, meaning everything must be
+	// re-issued because Vulkan dynamic state does not survive across command buffers.
+	bool Retarget() {
+		const auto current = CurrentCommandGeneration();
+		if (current == generation && Config::DynStateCacheEnabled()) {
+			return false;
+		}
+		*this = {};
+		if (!Config::DynStateCacheEnabled()) {
+			// Bypassed for A/B: every later comparison must miss. A zeroed viewport would
+			// compare equal to a genuinely zero one, so use values that cannot match -
+			// NaN never compares equal, and no real scissor is UINT32_MAX wide.
+			viewport.width       = std::numeric_limits<float>::quiet_NaN();
+			scissor.extent.width = UINT32_MAX;
+		}
+		generation = current;
+		return true;
+	}
+};
+
+DynamicStateCache& DynState() {
+	static thread_local DynamicStateCache cache;
+	return cache;
+}
+
+bool SameViewport(const vk::Viewport& a, const vk::Viewport& b) {
+	return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height &&
+	       a.minDepth == b.minDepth && a.maxDepth == b.maxDepth;
+}
+
+bool SameScissor(const vk::Rect2D& a, const vk::Rect2D& b) {
+	return a.offset.x == b.offset.x && a.offset.y == b.offset.y &&
+	       a.extent.width == b.extent.width && a.extent.height == b.extent.height;
+}
+
+} // namespace
+
 static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuffer vk_buffer,
                                      const RenderColorInfo* colors, uint32_t color_count,
                                      const RenderDepthInfo& depth,
@@ -392,7 +462,12 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			     framebuffer_extent.width, framebuffer_extent.height, index_count);
 		}
 	}
-	vk_buffer.setViewport(0, 1, &viewport);
+	auto&      dyn     = DynState();
+	const bool retarget = dyn.Retarget();
+	if (retarget || !SameViewport(dyn.viewport, viewport)) {
+		vk_buffer.setViewport(0, 1, &viewport);
+		dyn.viewport = viewport;
+	}
 
 	vk::Rect2D scissor {};
 	scissor.offset = {final_scissor.left, final_scissor.top};
@@ -417,7 +492,10 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			scissor.extent = {0, 0};
 		}
 	}
-	vk_buffer.setScissor(0, 1, &scissor);
+	if (retarget || !SameScissor(dyn.scissor, scissor)) {
+		vk_buffer.setScissor(0, 1, &scissor);
+		dyn.scissor = scissor;
+	}
 
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
@@ -430,14 +508,20 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		}
 		line_width = 1.0f;
 	}
-	vk_buffer.setLineWidth(line_width);
+	if (retarget || dyn.line_width != line_width) {
+		vk_buffer.setLineWidth(line_width);
+		dyn.line_width = line_width;
+	}
 
 	const auto& mode              = ctx.GetModeControl();
 	const auto& poly_offset       = ctx.GetPolyOffset();
 	const bool  use_front         = mode.poly_offset_front_enable && !mode.cull_front;
 	const bool  use_back          = mode.poly_offset_back_enable && !mode.cull_back;
 	const bool  depth_bias_enable = use_front || use_back;
-	vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+	if (retarget || dyn.depth_bias_enable != (depth_bias_enable ? 1 : 0)) {
+		vk_buffer.setDepthBiasEnable(depth_bias_enable ? VK_TRUE : VK_FALSE);
+		dyn.depth_bias_enable = depth_bias_enable ? 1 : 0;
+	}
 	if (depth_bias_enable) {
 		// Vulkan has one bias for both faces. Prefer a visible front face when both are enabled.
 		const float guest_constant_factor =
@@ -446,22 +530,32 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		    ConvertPolygonOffsetConstantFactor(guest_constant_factor, poly_offset, depth.format);
 		const float slope_factor =
 		    (use_front ? poly_offset.front_scale : poly_offset.back_scale) / 16.0f;
-		vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+		if (retarget || !dyn.bias_valid || dyn.bias_constant != constant_factor ||
+		    dyn.bias_clamp != poly_offset.clamp || dyn.bias_slope != slope_factor) {
+			vk_buffer.setDepthBias(constant_factor, poly_offset.clamp, slope_factor);
+			dyn.bias_constant = constant_factor;
+			dyn.bias_clamp    = poly_offset.clamp;
+			dyn.bias_slope    = slope_factor;
+			dyn.bias_valid    = true;
+		}
 	}
 
 	if (depth.stencil_test_enable) {
-		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront,
-		                                depth.stencil_dynamic_front.compareMask);
-		vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack,
-		                                depth.stencil_dynamic_back.compareMask);
-		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.writeMask);
-		vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.writeMask);
-		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront,
-		                              depth.stencil_dynamic_front.reference);
-		vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack,
-		                              depth.stencil_dynamic_back.reference);
+		const uint32_t stencil[6] {
+		    depth.stencil_dynamic_front.compareMask, depth.stencil_dynamic_back.compareMask,
+		    depth.stencil_dynamic_front.writeMask,   depth.stencil_dynamic_back.writeMask,
+		    depth.stencil_dynamic_front.reference,   depth.stencil_dynamic_back.reference};
+		if (retarget || !dyn.stencil_valid ||
+		    std::memcmp(dyn.stencil, stencil, sizeof(stencil)) != 0) {
+			vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eFront, stencil[0]);
+			vk_buffer.setStencilCompareMask(vk::StencilFaceFlagBits::eBack, stencil[1]);
+			vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eFront, stencil[2]);
+			vk_buffer.setStencilWriteMask(vk::StencilFaceFlagBits::eBack, stencil[3]);
+			vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eFront, stencil[4]);
+			vk_buffer.setStencilReference(vk::StencilFaceFlagBits::eBack, stencil[5]);
+			std::memcpy(dyn.stencil, stencil, sizeof(stencil));
+			dyn.stencil_valid = true;
+		}
 	}
 
 #if defined(__APPLE__)
@@ -508,6 +602,73 @@ static std::atomic<uint64_t> g_draw_census_total {0};
 
 // Runs for every draw, so keep the common path to one relaxed increment and a modulo; only
 // gather the individual counters on the rare reporting tick.
+// Per-shader draw census.
+//
+// Frame time = draws x ~19us, so the question worth asking is WHICH shaders produce the draws.
+// Keyed on the shader checksum, not its address: addresses are guest pointers that change every
+// launch, so an address captured in one run silently matches nothing in the next.
+namespace {
+
+constexpr size_t kCensusSize = 512;
+
+struct CensusSlot {
+	std::atomic<uint64_t> addr {0};
+	std::atomic<uint64_t> count {0};
+};
+std::array<CensusSlot, kCensusSize> g_census;
+std::atomic<uint64_t>               g_census_frames {0};
+
+void NoteShaderDraw(uint64_t ps_addr) {
+	size_t i = static_cast<size_t>((ps_addr * 0x9e3779b97f4a7c15ull) >> 55u) % kCensusSize;
+	for (size_t probe = 0; probe < 8; probe++, i = (i + 1) % kCensusSize) {
+		auto&      slot = g_census[i];
+		const auto cur  = slot.addr.load(std::memory_order_relaxed);
+		if (cur == ps_addr) {
+			slot.count.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		if (cur == 0) {
+			uint64_t expected = 0;
+			if (slot.addr.compare_exchange_strong(expected, ps_addr, std::memory_order_relaxed) ||
+			    slot.addr.load(std::memory_order_relaxed) == ps_addr) {
+				slot.count.fetch_add(1, std::memory_order_relaxed);
+				return;
+			}
+		}
+	}
+}
+
+void ReportCensus() {
+	const auto frames = g_census_frames.exchange(0, std::memory_order_relaxed);
+	if (frames == 0) {
+		return;
+	}
+	std::array<std::pair<uint64_t, uint64_t>, kCensusSize> rows {};
+	uint64_t                                              total = 0;
+	for (size_t i = 0; i < kCensusSize; i++) {
+		rows[i] = {g_census[i].count.exchange(0, std::memory_order_relaxed),
+		           g_census[i].addr.load(std::memory_order_relaxed)};
+		total += rows[i].first;
+	}
+	if (total == 0) {
+		return;
+	}
+	std::sort(rows.begin(), rows.end(),
+	          [](const auto& a, const auto& b) { return a.first > b.first; });
+	std::printf("ShaderCensus: %.0f draws/frame over %llu frames - top pixel shaders:\n",
+	            static_cast<double>(total) / static_cast<double>(frames),
+	            static_cast<unsigned long long>(frames));
+	for (size_t i = 0; i < 12 && rows[i].first != 0; i++) {
+		std::printf("  --skip-ps 0x%010llx   %6.0f draws/frame  %5.1f%%\n",
+		            static_cast<unsigned long long>(rows[i].second),
+		            static_cast<double>(rows[i].first) / static_cast<double>(frames),
+		            static_cast<double>(rows[i].first) / static_cast<double>(total) * 100.0);
+	}
+	std::fflush(stdout);
+}
+
+} // namespace
+
 static void DrawCensusTick() {
 	const auto total = g_draw_census_total.fetch_add(1, std::memory_order_relaxed) + 1;
 	if (total % 20000 != 0) {
@@ -572,6 +733,32 @@ static bool ShouldSkipGeShader(const CommandBuffer& buffer) {
 	    sh_regs.m_geMaxOutputPerSubgroup > 0x00000040;
 
 	if (unsupported_stage_mask || unsupported_gs_stage || ge_shader_regs) {
+		// Which pipelines are actually being dropped, and how many draws does that cost? Thin
+		// geometry (palm fronds, power cables) is missing in-game and tessellated draws are the
+		// prime suspect.
+		{
+			static std::atomic<uint64_t> s_drops {0};
+			static std::atomic<uint64_t> s_mask_tess {0};
+			static std::atomic<uint64_t> s_mask_gs {0};
+			static std::atomic<uint64_t> s_mask_ge {0};
+			s_mask_tess.fetch_add(unsupported_stage_mask ? 1 : 0, std::memory_order_relaxed);
+			s_mask_gs.fetch_add(unsupported_gs_stage ? 1 : 0, std::memory_order_relaxed);
+			s_mask_ge.fetch_add(ge_shader_regs ? 1 : 0, std::memory_order_relaxed);
+			const auto n = s_drops.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (n % 20000 == 0) {
+				std::printf("DroppedDraws: 20000 | stage_mask=%llu gs=%llu ge_regs=%llu | "
+				            "last stages=0x%08x prim=%u\n",
+				            static_cast<unsigned long long>(
+				                s_mask_tess.exchange(0, std::memory_order_relaxed)),
+				            static_cast<unsigned long long>(
+				                s_mask_gs.exchange(0, std::memory_order_relaxed)),
+				            static_cast<unsigned long long>(
+				                s_mask_ge.exchange(0, std::memory_order_relaxed)),
+				            stages,
+				            static_cast<uint32_t>(buffer.GetUserConfig().GetPrimType()));
+				std::fflush(stdout);
+			}
+		}
 		static std::once_flag warning_once;
 		std::call_once(warning_once, [] {
 			std::printf("Warning: game uses unsupported graphics pipelines; some draw calls were "
@@ -1100,6 +1287,78 @@ bool RenderExecutor::PrepareDrawRenderState(uint64_t submit_id, CommandBuffer& b
 	return true;
 }
 
+namespace {
+
+// One persistent worker for shader resource resolution.
+//
+// Resolution is ~21% of the frame and is pure - it reads guest memory and writes only its own
+// input_info. Vertex and pixel resolution are independent once both permutations are located,
+// so one runs here while the other runs on the render thread.
+//
+// Spin-then-yield rather than a condition variable: the handoff happens thousands of times per
+// frame and a futex wake costs more than the work saved. The cores are idle anyway.
+class ResolveWorker {
+public:
+	static ResolveWorker& Instance() {
+		static ResolveWorker worker;
+		return worker;
+	}
+
+	// Returns false if the worker is busy; caller then does the work inline.
+	bool Dispatch(std::function<void()> job) {
+		if (m_state.load(std::memory_order_acquire) != State::Idle) {
+			return false;
+		}
+		m_job = std::move(job);
+		m_state.store(State::Pending, std::memory_order_release);
+		return true;
+	}
+
+	void Wait() {
+		for (uint32_t spins = 0; m_state.load(std::memory_order_acquire) != State::Done; spins++) {
+			if (spins > 2000) {
+				std::this_thread::yield();
+			}
+		}
+		m_state.store(State::Idle, std::memory_order_release);
+	}
+
+private:
+	enum class State : uint32_t { Idle, Pending, Done };
+
+	ResolveWorker() {
+		m_thread = std::thread([this] {
+			for (;;) {
+				uint32_t spins = 0;
+				while (m_state.load(std::memory_order_acquire) != State::Pending) {
+					if (m_stop.load(std::memory_order_acquire)) {
+						return;
+					}
+					if (++spins > 2000) {
+						std::this_thread::yield();
+					}
+				}
+				m_job();
+				m_state.store(State::Done, std::memory_order_release);
+			}
+		});
+	}
+
+	~ResolveWorker() {
+		m_stop.store(true, std::memory_order_release);
+		if (m_thread.joinable()) {
+			m_thread.join();
+		}
+	}
+
+	std::atomic<State>    m_state {State::Idle};
+	std::atomic<bool>     m_stop {false};
+	std::function<void()> m_job;
+	std::thread           m_thread;
+};
+
+} // namespace
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
                            DrawRenderState& state) {
 	EXIT_IF(draw.name == nullptr);
@@ -1122,6 +1381,63 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 		LogDrawPhase(draw.name, "GetVertexProgram");
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
+
+	if (Config::ParallelResolveEnabled() && state.ps_active) {
+		// Locate both permutations first (cheap, locked). Vertex lookup publishes
+		// vs_input_info.stage.program, which is all pixel preparation needs - so pixel params can
+		// be built before either stage's resources are resolved. The two resolutions are then
+		// independent and overlap.
+		const auto vs_params = pipeline_cache.PrepareVertexParams(vertex_shader_info, shader_regs,
+		                                                          state.vs_input_info);
+		PipelineCache::ProgramRef vs_program;
+		ShaderProgram             vs_handle {};
+		if (pipeline_cache.LookupVertexProgram(vs_params, state.vs_input_info, vs_handle,
+		                                       vs_program)) {
+			const auto ps_params =
+			    pipeline_cache.PreparePixelParams(pixel_shader_info, shader_regs,
+			                                      state.vs_input_info, target_export_mapping,
+			                                      state.ps_input_info);
+			PipelineCache::ProgramRef ps_program;
+			ShaderProgram             ps_handle {};
+			if (pipeline_cache.LookupPixelProgram(ps_params, state.ps_input_info, ps_handle,
+			                                      ps_program)) {
+				// The cross-core handoff costs a fixed ~1us (atomic store, spin, cache-line
+				// transfer). Resolution cost scales with descriptor count, so handing off a
+				// two-descriptor shader loses money. Only dispatch when there is enough work.
+				const auto vs_resources = vs_program != nullptr
+				                              ? vs_program->info.buffers.size() +
+				                                    vs_program->info.images.size() +
+				                                    vs_program->info.samplers.size()
+				                              : 0u;
+				constexpr size_t kWorthDispatching = 6;
+
+				bool       vs_ok      = false;
+				const bool dispatched = vs_resources >= kWorthDispatching &&
+				                        ResolveWorker::Instance().Dispatch([&] {
+					vs_ok = pipeline_cache.ResolveVertexResources(vs_program, vs_params,
+					                                              state.vs_input_info);
+				});
+				const bool ps_ok =
+				    pipeline_cache.ResolvePixelResources(ps_program, ps_params, state.ps_input_info);
+				if (dispatched) {
+					ResolveWorker::Instance().Wait();
+				} else {
+					vs_ok = pipeline_cache.ResolveVertexResources(vs_program, vs_params,
+					                                              state.vs_input_info);
+				}
+				if (vs_ok && ps_ok) {
+					state.vertex_program = vs_handle;
+					state.pixel_program  = ps_handle;
+					return;
+				}
+			}
+		}
+		// Anything unresolved (needs compiling, or a permutation mismatch) falls through to the
+		// serial path, which handles compilation and re-materialisation correctly.
+		state.vs_input_info = {};
+		state.ps_input_info = {};
+	}
+
 	state.vertex_program =
 	    pipeline_cache.GetVertexProgram(vertex_shader_info, shader_regs, state.vs_input_info);
 
@@ -1193,7 +1509,18 @@ static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBu
 		return;
 	}
 	EXIT_IF(prepared.buffer == nullptr);
-	vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+	{
+		auto&      dyn = DynState();
+		const bool retarget_idx = dyn.Retarget();
+		auto*      raw = static_cast<VkBuffer>(prepared.buffer);
+		if (retarget_idx || dyn.index_buffer != raw || dyn.index_offset != prepared.offset ||
+		    dyn.index_type != static_cast<uint32_t>(prepared.type)) {
+			vk_buffer.bindIndexBuffer(prepared.buffer, prepared.offset, prepared.type);
+			dyn.index_buffer = raw;
+			dyn.index_offset = prepared.offset;
+			dyn.index_type   = static_cast<uint32_t>(prepared.type);
+		}
+	}
 }
 
 static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -1411,6 +1738,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
 	               std::span {descriptor_stages.data(), descriptor_stage_count});
+	// Bindings are fully consumed by CommitBindings; hand their heap buffers back so the next
+	// draw reuses them instead of allocating ~18 fresh vectors.
+	ReturnPooledBindingStorage(bindings.vertex);
+	if (bindings.pixel) {
+		ReturnPooledBindingStorage(*bindings.pixel);
+	}
 	CommitIndexBuffer(vk_buffer, index_binding);
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
@@ -1422,10 +1755,31 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(state.rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	{
+		// Consecutive draws frequently reuse a pipeline even when their bindings differ, so this
+		// skips a driver call without changing what gets bound.
+		auto&      dyn = DynState();
+		const bool retarget_pipe = dyn.Retarget();
+		auto*      raw = static_cast<VkPipeline>(pipeline.pipeline);
+		if (retarget_pipe || dyn.pipeline != raw) {
+			vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+			dyn.pipeline = raw;
+		}
+	}
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
+	if (Config::ShouldSkipPixelShaderChksum(buffer.GetShaders().GetPs().ps_regs.chksum)) {
+		static std::atomic<uint64_t> s_skipped {0};
+		if ((s_skipped.fetch_add(1, std::memory_order_relaxed) + 1) % 20000 == 0) {
+			std::printf("SkipPsChksum: 20000 draws skipped\n");
+			std::fflush(stdout);
+		}
+		return;
+	}
+	// Counted AFTER the skip: counting before made skipped draws indistinguishable from executed
+	// ones, so every A/B measured scene variation instead of the skip.
+	NoteShaderDraw(buffer.GetShaders().GetPs().ps_regs.chksum);
 	if (Config::ShouldSkipPixelShader(buffer.GetShaders().GetPs().ps_regs.data_addr)) {
 		// Diagnostic: drop every draw that uses this guest pixel shader.
 		LogDrawPhase(draw.name, "DrawSkippedByShaderFilter");
@@ -1450,7 +1804,42 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			frame_draws.fetch_add(1, std::memory_order_relaxed);
 		}
-		DrawCensusTick();
+		// Minimal frame accounting: draws per frame and wall time, so a settings change (e.g.
+	// Performance RT vs Performance) can be measured rather than guessed at.
+	{
+		static std::atomic<uint32_t> s_last_frame {UINT32_MAX};
+		static std::atomic<uint64_t> s_draws {0};
+		s_draws.fetch_add(1, std::memory_order_relaxed);
+		const auto frame_now = m_context.HasGpu()
+		                           ? static_cast<uint32_t>(m_context.GetGpu().GetFrameNum())
+		                           : 0u;
+		const auto prev = s_last_frame.exchange(frame_now, std::memory_order_relaxed);
+		if (prev != frame_now && prev != UINT32_MAX) {
+			static std::chrono::steady_clock::time_point s_t0 {};
+			static uint32_t                              s_frames = 0;
+			g_census_frames.fetch_add(1, std::memory_order_relaxed);
+			if (s_frames % 300 == 299) {
+				ReportCensus();
+			}
+			if (++s_frames % 60 == 0) {
+				const auto now = std::chrono::steady_clock::now();
+				if (s_t0.time_since_epoch().count() != 0) {
+					const auto ms =
+					    std::chrono::duration_cast<std::chrono::nanoseconds>(now - s_t0).count() /
+					    60.0 / 1e6;
+					const auto d = s_draws.exchange(0, std::memory_order_relaxed) / 60;
+					std::printf("Frame: %llu draws/frame, %.1f ms (%.1f fps), %.2f us/draw\n",
+					            static_cast<unsigned long long>(d), ms, ms > 0 ? 1000.0 / ms : 0.0,
+					            d != 0 ? ms * 1000.0 / static_cast<double>(d) : 0.0);
+					std::fflush(stdout);
+				} else {
+					s_draws.exchange(0, std::memory_order_relaxed);
+				}
+				s_t0 = now;
+			}
+		}
+	}
+	DrawCensusTick();
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 	}
 

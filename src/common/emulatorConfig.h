@@ -48,6 +48,20 @@ struct ConfigOptions {
 	std::string            user_name                   = "Kyty";
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	PresentMode            present_mode                = PresentMode::Fifo;
+	// Required by textureCache.cpp (committed) but the field itself was never committed.
+	bool                   dcc_clear_on_sample         = true;
+	// Resolve vertex and pixel shader resources concurrently. Resolution is ~21% of the frame and
+	// is pure, so the two stages can overlap once both permutations are located.
+	bool                   parallel_resolve            = false;
+	// Cache descriptor resolution results, validated by re-reading only the inputs each result
+	// actually depended on. Cheap enough to beat re-walking the expression tree.
+	bool                   cache_descriptors           = false;
+	// Per-draw redundancy filters. Default on; each can be turned off individually so a
+	// rendering regression can be attributed without a rebuild.
+	bool                   dyn_state_cache             = true;
+	bool                   pipeline_memo               = true;
+	bool                   buffer_dedup                = true;
+	bool                   show_fps_overlay            = true;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -118,6 +132,8 @@ struct ConfigOptions {
 	bool                   skip_backdrop_pass          = false;
 	bool                   skip_distant_layer          = false;
 	std::vector<uint64_t>  skip_ps;
+	// Skip by shader checksum: stable across launches, unlike skip_ps which holds guest addresses.
+	std::vector<uint64_t>  skip_ps_chksum;
 	bool                   playgo_hack_enabled         = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
@@ -132,6 +148,20 @@ uint32_t GetScreenHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 PresentMode GetPresentMode();
+bool     DccClearOnSample();
+bool     ParallelResolveEnabled();
+bool     CacheDescriptors();
+bool     DynStateCacheEnabled();
+bool     PipelineMemoEnabled();
+bool     BufferDedupEnabled();
+void     SetPerDrawFilters(bool dyn_state, bool pipeline, bool dedup);
+uint64_t FpsSampleCount();
+void     ResetFpsAverage();
+bool     ShowFpsOverlay();
+void     SetShowFpsOverlay(bool show);
+double   CurrentFps();
+double   AverageFps();
+void     SetCurrentFps(double fps);
 bool     FullscreenEnabled();
 uint32_t GetVblankFrequency();
 uint32_t GetConsoleLanguage();
@@ -185,6 +215,7 @@ bool FixCollapsedDepthCompare();
 bool RealOcclusionQueries();
 bool SkipBackdropPass();
 bool SkipDistantLayer();
+bool ShouldSkipPixelShaderChksum(uint64_t chksum);
 bool ShouldSkipPixelShader(uint64_t ps_addr);
 bool PlayGoHackEnabled();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

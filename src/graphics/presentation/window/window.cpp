@@ -255,6 +255,49 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 				}
 				break;
 			case SDLK_F2: SetPause(game, !game.paused.load(std::memory_order_acquire)); break;
+			case SDLK_F5:
+				// Runtime occlusion toggle is not in this commit; F5 resets the fps average so a
+				// measurement can be started cleanly without relaunching.
+				if (!key.repeat) {
+					Config::ResetFpsAverage();
+					::printf("FPS average reset\n");
+					std::fflush(stdout);
+				}
+				break;
+			case SDLK_F6:
+				// A/B the per-draw redundancy filters without relaunching. Each step disables one
+				// filter (or all of them) and resets the fps average, so a single drive through
+				// the same street measures every configuration under the same workload.
+				if (!key.repeat) {
+					static int step = 0;
+					// Report the segment being LEFT before resetting, so each step's result is
+					// visible live instead of having to be reconstructed from the frame log.
+					static const char* const names[5] = {
+					    "ALL ON (baseline)", "dyn-state OFF", "pipeline-memo OFF",
+					    "buffer-dedup OFF", "ALL OFF"};
+					::printf("[F6 result] %s: %.2f fps average over %llu frames\n",
+					         names[step], Config::AverageFps(),
+					         static_cast<unsigned long long>(Config::FpsSampleCount()));
+					step = (step + 1) % 5;
+					const bool dyn   = (step != 1 && step != 4);
+					const bool pipe  = (step != 2 && step != 4);
+					const bool dedup = (step != 3 && step != 4);
+					Config::SetPerDrawFilters(dyn, pipe, dedup);
+					Config::ResetFpsAverage();
+					::printf("[F6 step %d] %s  (dyn=%d pipe=%d dedup=%d) - fps average reset\n",
+					         step, names[step], static_cast<int>(dyn), static_cast<int>(pipe),
+					         static_cast<int>(dedup));
+					std::fflush(stdout);
+				}
+				break;
+			case SDLK_F4:
+				if (!key.repeat) {
+					const bool show = !Config::ShowFpsOverlay();
+					Config::SetShowFpsOverlay(show);
+					::printf("FPS overlay: %s\n", show ? "on" : "off");
+					std::fflush(stdout);
+				}
+				break;
 			case SDLK_F3:
 				if (!key.repeat) {
 					const bool muted = !Config::PadSpeakerMuted();
@@ -1042,6 +1085,7 @@ void WindowContext::UpdateTitle() {
 		              static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+		Config::SetCurrentFps(current_fps);
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();

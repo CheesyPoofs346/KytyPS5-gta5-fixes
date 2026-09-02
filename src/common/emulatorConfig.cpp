@@ -14,6 +14,12 @@ static std::unique_ptr<ConfigOptions> g_config;
 // struct: everything else in there is written once at startup and never changes.
 static std::atomic<bool> g_pad_speaker_muted {false};
 
+// Per-draw redundancy filters. Toggled from the window thread (F6) and read on the render
+// thread every draw, so they are atomics rather than plain config fields.
+static std::atomic<bool> g_dyn_state_cache {true};
+static std::atomic<bool> g_pipeline_memo {true};
+static std::atomic<bool> g_buffer_dedup {true};
+
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
 
@@ -31,6 +37,9 @@ void Load(const ConfigOptions& cfg) {
 
 	*g_config = cfg;
 	g_pad_speaker_muted.store(cfg.pad_speaker_muted, std::memory_order_relaxed);
+	g_dyn_state_cache.store(cfg.dyn_state_cache, std::memory_order_relaxed);
+	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
+	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
 }
 
 uint32_t GetScreenWidth() {
@@ -51,6 +60,81 @@ int32_t GetUserId() {
 
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
+}
+
+static std::atomic<bool>   g_show_fps_overlay {true};
+static std::atomic<double> g_current_fps {0.0};
+static std::atomic<bool>   g_real_occlusion {false};
+static std::atomic<double> g_fps_sum {0.0};
+static std::atomic<uint64_t> g_fps_samples {0};
+
+void ResetFpsAverage() {
+	g_fps_sum.store(0.0, std::memory_order_relaxed);
+	g_fps_samples.store(0, std::memory_order_relaxed);
+}
+
+bool ShowFpsOverlay() {
+	return g_show_fps_overlay.load(std::memory_order_relaxed);
+}
+
+void SetShowFpsOverlay(bool show) {
+	g_show_fps_overlay.store(show, std::memory_order_relaxed);
+}
+
+double CurrentFps() {
+	return g_current_fps.load(std::memory_order_relaxed);
+}
+
+uint64_t FpsSampleCount() {
+	return g_fps_samples.load(std::memory_order_relaxed);
+}
+
+double AverageFps() {
+	const auto n = g_fps_samples.load(std::memory_order_relaxed);
+	if (n == 0) {
+		return 0.0;
+	}
+	return g_fps_sum.load(std::memory_order_relaxed) / static_cast<double>(n);
+}
+
+void SetCurrentFps(double fps) {
+	g_current_fps.store(fps, std::memory_order_relaxed);
+	// Running mean over the whole session. The first sample lands while the title is still
+	// loading, so skip anything implausible rather than dragging the average down forever.
+	if (fps > 0.0) {
+		g_fps_sum.store(g_fps_sum.load(std::memory_order_relaxed) + fps, std::memory_order_relaxed);
+		g_fps_samples.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+bool CacheDescriptors() {
+	return g_config->cache_descriptors;
+}
+
+bool ParallelResolveEnabled() {
+	return g_config->parallel_resolve;
+}
+
+bool DynStateCacheEnabled() {
+	return g_dyn_state_cache.load(std::memory_order_relaxed);
+}
+
+bool PipelineMemoEnabled() {
+	return g_pipeline_memo.load(std::memory_order_relaxed);
+}
+
+bool BufferDedupEnabled() {
+	return g_buffer_dedup.load(std::memory_order_relaxed);
+}
+
+void SetPerDrawFilters(bool dyn_state, bool pipeline, bool dedup) {
+	g_dyn_state_cache.store(dyn_state, std::memory_order_relaxed);
+	g_pipeline_memo.store(pipeline, std::memory_order_relaxed);
+	g_buffer_dedup.store(dedup, std::memory_order_relaxed);
+}
+
+bool DccClearOnSample() {
+	return g_config->dcc_clear_on_sample;
 }
 
 bool FullscreenEnabled() {
@@ -139,6 +223,14 @@ bool ShouldSkipPixelShader(uint64_t ps_addr) {
 	}
 	return std::find(g_config->skip_ps.begin(), g_config->skip_ps.end(), ps_addr) !=
 	       g_config->skip_ps.end();
+}
+
+bool ShouldSkipPixelShaderChksum(uint64_t chksum) {
+	const auto& list = g_config->skip_ps_chksum;
+	if (list.empty() || chksum == 0) {
+		return false;
+	}
+	return std::find(list.begin(), list.end(), chksum) != list.end();
 }
 
 bool SkipDistantLayer() {

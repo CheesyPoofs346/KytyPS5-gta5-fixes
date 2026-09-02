@@ -725,6 +725,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+		// How much is predication actually culling? If eligible packets are many but skips
+		// are ~0, the guest is trying to cull and the emulator draws anyway - which shows up
+		// directly as inflated draws/frame.
+		if ((packet_header & 1u) != 0) {
+			static std::atomic<uint64_t> pred_eligible {0};
+			static std::atomic<uint64_t> pred_skipped {0};
+			const auto seen = pred_eligible.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (ShouldSkipPredicatedPackets()) {
+				pred_skipped.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (seen % 20000 == 0) {
+				const auto sk = pred_skipped.load(std::memory_order_relaxed);
+				std::printf("PredicationHealth: eligible=%llu skipped=%llu (%.2f%%)\n",
+					            static_cast<unsigned long long>(seen),
+					            static_cast<unsigned long long>(sk),
+					            100.0 * static_cast<double>(sk) / static_cast<double>(seen));
+			}
+		}
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw == 0 || packet_dw > remaining_dw);
@@ -835,6 +853,23 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				case 0x00: m_predicate_skip = (value != 0); break;
 				case 0x01: m_predicate_skip = (value == 0); break;
 				default: EXIT("unknown predication condition: 0x%08" PRIx32 "\n", condition);
+			}
+			static std::atomic<uint64_t> pred_calls {0};
+			static std::atomic<uint64_t> pred_skip_true {0};
+			const auto calls = pred_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (m_predicate_skip) {
+				pred_skip_true.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (calls % 2000 == 0) {
+				// The occlusion path always sets bit 63 as a "ready" flag. If every value here has
+				// bit 63 set, this comparison is decided by that flag and not by the sample count.
+				const auto st = pred_skip_true.load(std::memory_order_relaxed);
+				std::printf("PredicationSet: calls=%llu skip_true=%llu (%.1f%%) value=0x%016llx"
+					            " condition=%u\n",
+					            static_cast<unsigned long long>(calls),
+					            static_cast<unsigned long long>(st),
+					            100.0 * static_cast<double>(st) / static_cast<double>(calls),
+					            static_cast<unsigned long long>(value), condition);
 			}
 			static std::atomic<uint32_t> log_count {0};
 			if (log_count.fetch_add(1) < 128) {

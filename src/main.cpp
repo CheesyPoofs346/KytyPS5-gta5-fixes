@@ -343,6 +343,33 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--hdr-probe-start") {
 			const int32_t hdr_start = Common::ToInt32(value);
 			options.config.hdr_probe_start = static_cast<uint32_t>(hdr_start < 0 ? 0 : hdr_start);
+		} else if (arg == "--skip-ps-chksum") {
+			options.config.skip_ps_chksum.push_back(std::strtoull(value.c_str(), nullptr, 0));
+		} else if (arg == "--cache-descriptors") {
+			if (!ParseBool(value, options.config.cache_descriptors)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--dyn-state-cache") {
+			if (!ParseBool(value, options.config.dyn_state_cache)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--pipeline-memo") {
+			if (!ParseBool(value, options.config.pipeline_memo)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--buffer-dedup") {
+			if (!ParseBool(value, options.config.buffer_dedup)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--parallel-resolve") {
+			if (!ParseBool(value, options.config.parallel_resolve)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--skip-ps") {
 			options.config.skip_ps.push_back(std::strtoull(value.c_str(), nullptr, 0));
 		} else if (arg == "--skip-distant-layer") {
