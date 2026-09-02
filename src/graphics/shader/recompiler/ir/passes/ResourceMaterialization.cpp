@@ -522,8 +522,14 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 		return false;
 	}
 
-	std::vector<DescriptorSourceRequest> requests;
-	std::vector<uint8_t>                 clean_flat_slots(program.srt_reads.size());
+	// Reused across calls rather than reallocated. MaterializeResources runs twice per draw
+	// and is not reentrant - nothing it calls re-enters it - so the capacity can persist.
+	// Neither escapes this function; flattened_srt, which IS moved into the snapshot, is
+	// deliberately left a real local.
+	static thread_local std::vector<DescriptorSourceRequest> requests;
+	static thread_local std::vector<uint8_t>                 clean_flat_slots;
+	requests.clear();
+	clean_flat_slots.assign(program.srt_reads.size(), 0);
 	requests.reserve(program.info.buffers.size() + program.info.images.size() * 2u +
 	                 program.info.samplers.size());
 	for (const auto& buffer: program.info.buffers) {
@@ -571,7 +577,8 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	next.flattened_srt = std::move(flattened_srt);
 	next.flattened_srt.resize(FlattenedRuntimeDwords(program));
 	next.images.resize(program.info.images.size());
-	std::vector<uint8_t> image_written(program.info.images.size());
+	static thread_local std::vector<uint8_t> image_written;
+	image_written.assign(program.info.images.size(), 0);
 	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
 		const auto& image  = program.info.images[image_index];
 		const auto* source = Source(program, image.source);

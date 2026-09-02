@@ -24351,6 +24351,84 @@ void CheckDepthAttachmentWrites() {
   std::printf("[host]    %-32s ok\n", "DepthAttachmentWrites");
 }
 
+// The tile-size memo is keyed on every argument TileGetTextureSize takes, so a hit must be
+// indistinguishable from a recomputation. The cache holds 16 entries; this drives far more
+// distinct keys than that, in an interleaved order, so eviction and slot collisions are both
+// exercised. A collision that returned another key's layout would show up here immediately.
+void CheckTileSizeMemo() {
+  constexpr const char *name = "TileSizeMemo";
+  struct Key {
+    Prospero::BufferFormat format;
+    uint32_t width;
+    uint32_t height;
+    uint32_t levels;
+    Prospero::TileMode tile;
+  };
+  const Prospero::BufferFormat formats[] = {
+      Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::BufferFormat::k8_8_8_8Srgb,
+      Prospero::BufferFormat::k32Float, Prospero::BufferFormat::k16UNorm};
+  std::vector<Key> keys;
+  for (const auto format : formats) {
+    for (const uint32_t w : {16u, 64u, 256u, 512u}) {
+      for (const uint32_t levels : {1u, 4u}) {
+        keys.push_back({format, w, w / 2u, levels, Prospero::TileMode::kLinear});
+      }
+    }
+  }
+  Require(name, "key count", keys.size() > 16,
+          "test must drive more distinct keys than the cache has slots");
+
+  struct Result {
+    Libs::Graphics::TileSizeAlign total{};
+    Libs::Graphics::TileSizeOffset levels[16]{};
+    Libs::Graphics::TilePaddedSize padded[16]{};
+  };
+  // First touch of each key is a guaranteed miss, so these are the uncached reference values.
+  std::vector<Result> reference(keys.size());
+  for (size_t k = 0; k < keys.size(); k++) {
+    Libs::Graphics::TileGetTextureSize(keys[k].format, keys[k].width, keys[k].height,
+                                       keys[k].levels, keys[k].tile, &reference[k].total,
+                                       reference[k].levels, reference[k].padded);
+  }
+
+  // Re-query in an interleaved order that guarantees evictions between repeats.
+  for (int pass = 0; pass < 3; pass++) {
+    for (size_t step = 0; step < keys.size(); step++) {
+      const size_t k = (step * 7u + static_cast<size_t>(pass)) % keys.size();
+      Result got{};
+      Libs::Graphics::TileGetTextureSize(keys[k].format, keys[k].width, keys[k].height,
+                                         keys[k].levels, keys[k].tile, &got.total, got.levels,
+                                         got.padded);
+      bool same = got.total.size == reference[k].total.size &&
+                  got.total.align == reference[k].total.align;
+      for (uint32_t l = 0; same && l < keys[k].levels; l++) {
+        same = got.levels[l].size == reference[k].levels[l].size &&
+               got.levels[l].offset == reference[k].levels[l].offset &&
+               got.levels[l].src_size == reference[k].levels[l].src_size &&
+               got.levels[l].src_offset == reference[k].levels[l].src_offset &&
+               got.padded[l].width == reference[k].padded[l].width &&
+               got.padded[l].height == reference[k].padded[l].height;
+      }
+      Require(name, "memoised layout matches recomputation", same,
+              "tile size memo returned a different layout than the uncached computation");
+    }
+  }
+
+  // A caller asking for only part of the result must get the same values as one asking for all
+  // of it - the cache stores the full layout and copies out subsets.
+  for (size_t k = 0; k < keys.size(); k++) {
+    Libs::Graphics::TileSizeAlign total_only{};
+    Libs::Graphics::TileGetTextureSize(keys[k].format, keys[k].width, keys[k].height,
+                                       keys[k].levels, keys[k].tile, &total_only, nullptr,
+                                       nullptr);
+    Require(name, "partial request matches full request",
+            total_only.size == reference[k].total.size &&
+                total_only.align == reference[k].total.align,
+            "requesting only the total size returned a different value");
+  }
+}
+
+
 void CheckDynamicRenderingState() {
   RenderState first{};
   first.width = 64;
@@ -25657,6 +25735,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
     CheckDynamicRenderingState();
+  CheckTileSizeMemo();
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
@@ -25801,6 +25880,7 @@ int main(int argc, char **argv) {
   CheckStencilAttachmentAccess();
   CheckDepthAttachmentWrites();
   CheckDynamicRenderingState();
+  CheckTileSizeMemo();
   CheckDepthTargetFootprints();
   CheckSlotVectorLifetime();
 #else
