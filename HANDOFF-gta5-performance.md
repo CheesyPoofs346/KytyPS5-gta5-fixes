@@ -413,7 +413,7 @@ yet** - they all need the run in section 12.
 | commit | what | default |
 |---|---|---|
 | `24dcfdb` | descriptor cache made safe to enable | still OFF |
-| `322afff` | `--hw-check` toggle + F7 A/B cycle | hw-check ON (unchanged) |
+| `322afff` | `--hw-check` toggle + F8 A/B cycle | hw-check ON (unchanged) |
 | `171f38f` | duplicate validation + duplicate buffer decode removed | active |
 | `7e980c3` | SRT memo no longer cleared per draw | active |
 
@@ -442,9 +442,11 @@ arenas retired by a generation stamp. No entry survives into another evaluation,
 the cross-draw memo reuse that caused red blobs. Breaking the stamp deliberately makes the suite
 segfault, which is how the guard was verified rather than assumed.
 
-### How to measure all of it in one drive - F7
+### How to measure all of it in one drive - F8
 
-F6 and its five documented steps are untouched. F7 is new and cycles four steps:
+F6 and its five documented steps are untouched. **F8** is new and cycles four steps
+(not F7 - `ProcessEvent` swallows F7 for the mouse-to-joystick toggle before the key handler
+runs, so a binding there is dead code):
 
 ```
 step 0 baseline (cache off, hw-check on) | 1 descriptor cache ON
