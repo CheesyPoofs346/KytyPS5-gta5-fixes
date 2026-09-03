@@ -552,8 +552,9 @@ private:
 		if (inst == nullptr) {
 			return Fail(error, "invalid typed runtime value");
 		}
-		uint64_t   memo   = 0;
-		const auto status = MemoLookup(inst, memo);
+		uint64_t   memo       = 0;
+		size_t     slot_index = kNoSlot2;
+		const auto status     = MemoLookup(inst, memo, slot_index);
 		if (status == 1) {
 			result = memo;
 			return true;
@@ -562,14 +563,14 @@ private:
 			return Fail(error, "cyclic typed runtime value");
 		}
 		t_srt_nodes++;
-		MemoMarkVisiting(inst);
+		MemoMarkVisiting(inst, slot_index);
 		const auto log_start      = static_cast<uint32_t>(m_log.size());
 		const auto overflow_start = m_overflow_count;
 		uint64_t   out            = 0;
 		if (!EvaluateInst(*inst, out, error)) {
 			return false;
 		}
-		MemoInsert(inst, out, log_start, overflow_start);
+		MemoInsert(inst, out, log_start, overflow_start, slot_index);
 		result = out;
 		return true;
 	}
@@ -684,9 +685,9 @@ private:
 			// Anything reaching this path must never be cached.
 			MarkOverflow();
 		} else {
-			const auto read_start = __builtin_ia32_rdtsc();
+			// The rdtsc pair that used to bracket this read answered its question - reads are
+			// ~4% of the walk - and cost ~500 cycles a call to keep asking it.
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-			t_srt_read_cycles += __builtin_ia32_rdtsc() - read_start;
 			t_srt_reads++;
 			LogInput(address, word, kNoSlot);
 		}
@@ -1069,14 +1070,22 @@ private:
 	}
 
 	// Returns: 1 = resolved (out set), 0 = not present, -1 = currently being evaluated (cycle).
-	int MemoLookup(const Inst* inst, uint64_t& out) {
+	static constexpr size_t kNoSlot2 = ~size_t {0};
+
+	// Returns where the key belongs as well as what was found: every node used to hash and probe
+	// three times - once to look up, once to mark visiting, once to insert - and the second two
+	// were re-deriving a slot the first had already found.
+	int MemoLookup(const Inst* inst, uint64_t& out, size_t& slot_index) {
 		auto& slots = m_arena->slots;
+		slot_index  = kNoSlot2;
 		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
 			auto& slot = slots[i];
 			if (slot.generation != m_generation) {
+				slot_index = i;   // first free slot: this is where an insert would go
 				return 0;
 			}
 			if (slot.key == inst) {
+				slot_index = i;
 				if (!slot.done) {
 					return -1;
 				}
@@ -1085,23 +1094,20 @@ private:
 				return 1;
 			}
 		}
-		return 0;
+		return 0;   // table full after 8 probes: evaluate without memoising, as before
 	}
 
-	void MemoMarkVisiting(const Inst* inst) {
-		auto& slots = m_arena->slots;
-		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
-			auto& slot = slots[i];
-			if (slot.generation != m_generation) {
-				slot            = MemoSlot {};
-				slot.generation = m_generation;
-				slot.key        = inst;
-				return;
-			}
-			if (slot.key == inst) {
-				return;
-			}
+	// The slot was already located by MemoLookup. Claiming it with our key means nested
+	// evaluation cannot take it: an insert only writes a slot whose generation is stale or whose
+	// key already matches, and ours is neither.
+	void MemoMarkVisiting(const Inst* inst, size_t slot_index) {
+		if (slot_index == kNoSlot2) {
+			return;
 		}
+		auto& slot      = m_arena->slots[slot_index];
+		slot            = MemoSlot {};
+		slot.generation = m_generation;
+		slot.key        = inst;
 	}
 
 	// A memo hit performs no reads, so without this the enclosing expression would record
@@ -1134,21 +1140,19 @@ private:
 		m_log.insert(m_log.end(), m_replay_scratch.begin(), m_replay_scratch.end());
 	}
 
-	void MemoInsert(const Inst* inst, uint64_t value, uint32_t log_start, uint32_t overflow_start) {
-		auto& slots = m_arena->slots;
-		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
-			auto& slot = slots[i];
-			if (slot.generation != m_generation || slot.key == inst) {
-				const auto span  = m_log.size() - log_start;
-				slot.generation  = m_generation;
-				slot.key         = inst;
-				slot.value       = value;
-				slot.done        = true;
-				slot.log_start   = log_start;
-				slot.log_count   = static_cast<uint16_t>(span);
-				slot.overflowed  = m_overflow_count != overflow_start || span > kMaxLogEntries;
-				return;
-			}
+	void MemoInsert(const Inst* inst, uint64_t value, uint32_t log_start, uint32_t overflow_start,
+	                size_t slot_index) {
+		if (slot_index != kNoSlot2) {
+			auto&      slot = m_arena->slots[slot_index];
+			const auto span = m_log.size() - log_start;
+			slot.generation = m_generation;
+			slot.key        = inst;
+			slot.value      = value;
+			slot.done       = true;
+			slot.log_start  = log_start;
+			slot.log_count  = static_cast<uint16_t>(span);
+			slot.overflowed = m_overflow_count != overflow_start || span > kMaxLogEntries;
+			return;
 		}
 		// Full after 8 probes: skip memoising. The value is simply recomputed; never wrong.
 	}
