@@ -63,8 +63,12 @@ struct OpenSecondaryBatch {
 	SecondaryRenderingFormats formats {};
 	uint32_t                  worker   = 0;
 	uint32_t                  draws    = 0;
-	bool                      open     = false;
-	bool                      flushing = false;
+	bool                      open      = false;
+	bool                      flushing  = false;
+	// True while a draw is actively recording into the secondary. A flush during that window ends
+	// the buffer mid-draw and every later command in the draw is dropped - which is exactly what
+	// VUID-vkCmdPushConstants-commandBuffer-recording reported.
+	bool                      recording = false;
 };
 
 thread_local OpenSecondaryBatch g_secondary_batch;
@@ -1834,7 +1838,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			DynState() = {};
 		}
 		batch.draws++;
-		record = batch.buffer;
+		batch.recording = true;
+		record          = batch.buffer;
 	}
 
 	DrawPhaseTimer commit_timer(DrawPhase::Commit);
@@ -1963,6 +1968,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		begin_rendering_timer.Stop();
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
+		g_secondary_batch.recording = false;
 	}
 
 	if (set_auto_debug) {
@@ -2378,6 +2384,13 @@ void FlushSecondaryBatch(RenderContext& context) {
 	auto& batch = g_secondary_batch;
 	// flushing guards re-entry: the EndRendering below is itself a flush hook.
 	if (!batch.open || batch.flushing) {
+		return;
+	}
+	// Resolve calls EndRendering to record uploads and barriers, and that now routes here. It does
+	// not need the batch replayed: no render pass is open while a batch is being built - one is
+	// only opened at flush - so the transfer is legal as it stands, and it lands on the primary
+	// ahead of the batch that replays after it, which is the order the draw needs anyway.
+	if (batch.recording) {
 		return;
 	}
 	batch.flushing = true;
