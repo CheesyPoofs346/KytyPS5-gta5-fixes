@@ -29,6 +29,12 @@ thread_local uint64_t t_srt_read_cycles = 0;
 thread_local uint64_t t_srt_nodes       = 0;
 thread_local uint64_t t_srt_calls       = 0;
 thread_local uint64_t t_srt_resolutions = 0;
+// nodes counts unique nodes (memo misses). If the DAG is heavily shared, the interpreter is
+// entered far more often than that, and a compiled form - which evaluates each node exactly once
+// - wins by removing revisits, not just by being a cheaper per-node loop. These separate the two.
+thread_local uint64_t t_srt_entries    = 0;   // every EvaluateWide entry
+thread_local uint64_t t_srt_immediates = 0;   // entries that were literals
+thread_local uint64_t t_srt_hits       = 0;   // entries served by the memo
 
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
@@ -537,8 +543,10 @@ private:
 	}
 
 	bool EvaluateWide(Value value, uint64_t& result, std::string* error) {
+		t_srt_entries++;
 		value = value.Resolve();
 		if (value.IsImmediate()) {
+			t_srt_immediates++;
 			switch (value.GetType()) {
 				case Type::U1: result = value.U1(); return true;
 				case Type::U8: result = value.U8(); return true;
@@ -556,6 +564,7 @@ private:
 		size_t     slot_index = kNoSlot2;
 		const auto status     = MemoLookup(inst, memo, slot_index);
 		if (status == 1) {
+			t_srt_hits++;
 			result = memo;
 			return true;
 		}
@@ -1352,17 +1361,19 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 		}
 	}
 	if (++t_srt_calls % 100000 == 0) {
-		std::printf("SrtWork: per call - resolutions=%.1f nodes=%.1f reads=%.1f read=%.0f cyc "
-		            "(%.1f cyc/read), walk cycles are the rest\n",
+		std::printf("SrtWork: per call - resolutions=%.1f nodes=%.1f entries=%.1f (imm=%.1f "
+		            "memo_hit=%.1f) reads=%.1f\n",
 		            static_cast<double>(t_srt_resolutions) / 100000.0,
 		            static_cast<double>(t_srt_nodes) / 100000.0,
-		            static_cast<double>(t_srt_reads) / 100000.0,
-		            static_cast<double>(t_srt_read_cycles) / 100000.0,
-		            t_srt_reads != 0 ? static_cast<double>(t_srt_read_cycles) /
-		                                   static_cast<double>(t_srt_reads)
-		                             : 0.0);
+		            static_cast<double>(t_srt_entries) / 100000.0,
+		            static_cast<double>(t_srt_immediates) / 100000.0,
+		            static_cast<double>(t_srt_hits) / 100000.0,
+		            static_cast<double>(t_srt_reads) / 100000.0);
 		std::fflush(stdout);
 		t_srt_nodes       = 0;
+		t_srt_entries     = 0;
+		t_srt_immediates  = 0;
+		t_srt_hits        = 0;
 		t_srt_reads       = 0;
 		t_srt_read_cycles = 0;
 		t_srt_resolutions = 0;
