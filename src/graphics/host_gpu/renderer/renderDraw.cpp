@@ -69,6 +69,33 @@ struct OpenSecondaryBatch {
 
 thread_local OpenSecondaryBatch g_secondary_batch;
 
+// The state the last flush opened a pass with, and whether there was one.
+//
+// A pass clears when the guest asked it to, and CommandBuffer::BeginRendering only honours that
+// once because it early-outs while the same state is already rendering. Batching ends the pass at
+// every flush, so a batch split purely by capacity would re-open with loadOp Clear and wipe what
+// the previous batch drew - at 4450 draws against a 256 cap that is ~17 clears a frame, and only
+// the last batch survives.
+thread_local RenderState g_last_flushed_state {};
+thread_local bool        g_have_last_flushed = false;
+
+// Strips the clear requests from a state that is resuming a pass the previous flush already
+// cleared. A genuine state change is not affected: it compares unequal and clears as the guest
+// asked.
+RenderState ResumeStateFor(const RenderState& state) {
+	if (!g_have_last_flushed || !(g_last_flushed_state == state)) {
+		return state;
+	}
+	RenderState resumed = state;
+	for (auto& attachment: resumed.color_attachments) {
+		attachment.is_clear = false;
+	}
+	resumed.depth_stencil_attachment.is_clear      = false;
+	resumed.depth_stencil_attachment.depth_clear   = false;
+	resumed.depth_stencil_attachment.stencil_clear = false;
+	return resumed;
+}
+
 } // namespace
 
 
@@ -2365,7 +2392,9 @@ void FlushSecondaryBatch(RenderContext& context) {
 	auto& scheduler = context.GetCommandScheduler();
 	// The render pass opens only now, so every barrier the batch's draws needed was emitted on the
 	// primary while no pass was active - which is where Vulkan requires them.
-	scheduler.BeginRendering(batch.rendering, true);
+	scheduler.BeginRendering(ResumeStateFor(batch.rendering), true);
+	g_last_flushed_state = batch.rendering;
+	g_have_last_flushed  = true;
 	auto primary = scheduler.Current().Handle();
 	primary.executeCommands(1, &batch.buffer);
 	scheduler.EndRendering();
