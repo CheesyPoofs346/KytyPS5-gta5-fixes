@@ -20,6 +20,17 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
+// Whether compiling SRT expression graphs into flat fetch lists is worth building turns on this
+// split. If the ~27 ns per resolution is mostly guest memory reads, a compiled list still
+// performs those reads and saves almost nothing; if it is mostly graph walking, it is the single
+// biggest item left. The comment above claims the walk dominates - measure it rather than trust it.
+thread_local uint64_t t_srt_reads       = 0;
+thread_local uint64_t t_srt_read_cycles = 0;
+thread_local uint64_t t_srt_nodes       = 0;
+thread_local uint64_t t_srt_calls       = 0;
+thread_local uint64_t t_srt_resolutions = 0;
+
+
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 const char* StageName(ShaderType stage) {
@@ -550,6 +561,7 @@ private:
 		if (status == -1) {
 			return Fail(error, "cyclic typed runtime value");
 		}
+		t_srt_nodes++;
 		MemoMarkVisiting(inst);
 		const auto log_start      = static_cast<uint32_t>(m_log.size());
 		const auto overflow_start = m_overflow_count;
@@ -672,7 +684,10 @@ private:
 			// Anything reaching this path must never be cached.
 			MarkOverflow();
 		} else {
+			const auto read_start = __builtin_ia32_rdtsc();
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+			t_srt_read_cycles += __builtin_ia32_rdtsc() - read_start;
+			t_srt_reads++;
 			LogInput(address, word, kNoSlot);
 		}
 		result = word;
@@ -1293,6 +1308,7 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 			continue;
 		}
 
+		t_srt_resolutions++;
 		evaluator.BeginRecording();
 		for (uint32_t index = 0; index < source->dword_count; index++) {
 			if (!evaluator.Evaluate(source->dwords[index], value.dwords[index], error)) {
@@ -1330,6 +1346,22 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 				return false;
 			}
 		}
+	}
+	if (++t_srt_calls % 100000 == 0) {
+		std::printf("SrtWork: per call - resolutions=%.1f nodes=%.1f reads=%.1f read=%.0f cyc "
+		            "(%.1f cyc/read), walk cycles are the rest\n",
+		            static_cast<double>(t_srt_resolutions) / 100000.0,
+		            static_cast<double>(t_srt_nodes) / 100000.0,
+		            static_cast<double>(t_srt_reads) / 100000.0,
+		            static_cast<double>(t_srt_read_cycles) / 100000.0,
+		            t_srt_reads != 0 ? static_cast<double>(t_srt_read_cycles) /
+		                                   static_cast<double>(t_srt_reads)
+		                             : 0.0);
+		std::fflush(stdout);
+		t_srt_nodes       = 0;
+		t_srt_reads       = 0;
+		t_srt_read_cycles = 0;
+		t_srt_resolutions = 0;
 	}
 	// assign, not move: moving would hand the pool's buffer away and allocate a fresh one next
 	// draw, and it would also throw away the destination's capacity. Both sides stay warm.
