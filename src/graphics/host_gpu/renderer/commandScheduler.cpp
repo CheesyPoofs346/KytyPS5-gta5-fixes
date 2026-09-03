@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "graphics/host_gpu/renderer/secondaryBatch.h"
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -169,17 +171,23 @@ void CommandScheduler::BeginRendering(const RenderState& state, bool secondary_c
 }
 
 void CommandScheduler::EndRendering() {
+	// Re-entrant by design: FlushSecondaryBatch ends the pass it just opened, and its own guard
+	// stops the recursion.
+	FlushSecondaryBatch(m_context);
 	if (Active() && !m_command.IsInvalid()) {
 		Current().EndRendering();
 	}
 }
 
 void CommandScheduler::Flush() {
+	// A batch must not outlive the command buffer that will execute it.
+	FlushSecondaryBatch(m_context);
 	SubmitInfo submit;
 	Flush(submit);
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
+	FlushSecondaryBatch(m_context);
 	Submit(submit);
 	BeginNext();
 }

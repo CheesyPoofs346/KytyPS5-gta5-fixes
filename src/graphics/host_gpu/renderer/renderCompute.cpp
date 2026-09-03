@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -319,6 +320,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
 	Common::LockGuard lock(m_context.GetMutex());
+	// A dispatch records onto the primary and may read what the batch has not replayed yet.
+	FlushSecondaryBatch(m_context);
 	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
 		LOGF("GraphicsRenderDispatchDirect: temporary: ignoring dispatch with null CS shader, "
 		     "groups=%ux%ux%u mode=%u\n",

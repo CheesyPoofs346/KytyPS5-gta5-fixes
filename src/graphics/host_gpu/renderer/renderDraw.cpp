@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/drawProfile.h"
+#include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -49,6 +50,26 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace {
+
+// One secondary per draw was correct but pathological: an executeCommands per draw is pure
+// overhead, and the ring could only rewind once every buffer retired, so it grew until host
+// memory ran out. A batch holds draws until the render state or attachment formats change, which
+// is the only thing a secondary's inheritance is tied to.
+struct OpenSecondaryBatch {
+	vk::CommandBuffer         buffer = nullptr;
+	RenderState               rendering {};
+	SecondaryRenderingFormats formats {};
+	uint32_t                  worker   = 0;
+	uint32_t                  draws    = 0;
+	bool                      open     = false;
+	bool                      flushing = false;
+};
+
+thread_local OpenSecondaryBatch g_secondary_batch;
+
+} // namespace
 
 
 int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& vs_input_info) {
@@ -1748,10 +1769,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// must be recorded into it. Only the barriers stay on the primary, which is why they are
 	// emitted by CommitBindings before BeginRendering rather than moved here.
 	const bool        secondary = Config::SecondaryRecordEnabled();
-	DrawWorkerPool*   pool      = nullptr;
 	vk::CommandBuffer record    = vk_buffer;
 	if (secondary) {
-		pool = &m_context.GetDrawWorkerPool(1);
+		auto&                     pool = m_context.GetDrawWorkerPool(1);
 		SecondaryRenderingFormats formats {};
 		formats.color_count = state.color_count;
 		for (uint32_t i = 0; i < state.color_count; i++) {
@@ -1765,10 +1785,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                             : vk::Format::eUndefined;
 		formats.samples = vulkan_sample_count(state.color_count > 0 ? state.color_info[0].samples
 		                                                            : state.depth_info.samples);
-		record = pool->BeginSecondary(CurrentDrawWorker(), formats);
-		// The dynamic-state cache keys on the primary's recording generation, so without this it
-		// would think the secondary already has state the secondary has never been given.
-		DynState() = {};
+		// A secondary's inheritance fixes its attachments, so a change in either ends the batch.
+		auto& batch = g_secondary_batch;
+		if (batch.open && (!(batch.rendering == state.rendering) || !(batch.formats == formats))) {
+			FlushSecondaryBatch(m_context);
+		}
+		if (!batch.open) {
+			batch.worker    = CurrentDrawWorker();
+			batch.buffer    = pool.BeginSecondary(batch.worker, formats);
+			batch.rendering = state.rendering;
+			batch.formats   = formats;
+			batch.open      = true;
+			// The dynamic-state cache keys on the primary's recording generation, which does not
+			// change when a secondary does. Reset per batch - within one, state does persist, so
+			// the cache is still worth having.
+			DynState() = {};
+		}
+		batch.draws++;
+		record = batch.buffer;
 	}
 
 	DrawPhaseTimer commit_timer(DrawPhase::Commit);
@@ -1805,14 +1839,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	DrawPhaseTimer begin_rendering_timer(DrawPhase::BeginRendering);
-	m_context.GetCommandScheduler().BeginRendering(state.rendering, secondary);
+	// Batched draws do not open the pass here; FlushSecondaryBatch opens it once for the batch.
+	if (!secondary) {
+		m_context.GetCommandScheduler().BeginRendering(state.rendering);
+	}
 	{
 		// Consecutive draws frequently reuse a pipeline even when their bindings differ, so this
 		// skips a driver call without changing what gets bound.
 		auto&      dyn = DynState();
 		const bool retarget_pipe = dyn.Retarget();
 		auto*      raw = static_cast<VkPipeline>(pipeline.pipeline);
-		if (secondary || retarget_pipe || dyn.pipeline != raw) {
+		if (retarget_pipe || dyn.pipeline != raw) {
 			record.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 			dyn.pipeline = raw;
 		}
@@ -1894,10 +1931,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		begin_rendering_timer.Stop();
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
-		if (secondary) {
-			pool->EndSecondary(CurrentDrawWorker());
-			vk_buffer.executeCommands(1, &record);
-		}
 	}
 
 	if (set_auto_debug) {
@@ -2273,6 +2306,34 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	destination.Resolve(source, {src.base_mip_level, 1, src.base_array_layer, 1},
 	                    {dst.base_mip_level, 1, dst.base_array_layer, 1});
 	return true;
+}
+
+bool SecondaryBatchOpen() noexcept {
+	return g_secondary_batch.open;
+}
+
+void FlushSecondaryBatch(RenderContext& context) {
+	auto& batch = g_secondary_batch;
+	// flushing guards re-entry: the EndRendering below is itself a flush hook.
+	if (!batch.open || batch.flushing) {
+		return;
+	}
+	batch.flushing = true;
+	auto& pool = context.GetDrawWorkerPool(1);
+	pool.EndSecondary(batch.worker);
+
+	auto& scheduler = context.GetCommandScheduler();
+	// The render pass opens only now, so every barrier the batch's draws needed was emitted on the
+	// primary while no pass was active - which is where Vulkan requires them.
+	scheduler.BeginRendering(batch.rendering, true);
+	auto primary = scheduler.Current().Handle();
+	primary.executeCommands(1, &batch.buffer);
+	scheduler.EndRendering();
+
+	batch.open     = false;
+	batch.draws    = 0;
+	batch.buffer   = nullptr;
+	batch.flushing = false;
 }
 
 } // namespace Libs::Graphics
