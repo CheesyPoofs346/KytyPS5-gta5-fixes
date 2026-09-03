@@ -155,6 +155,11 @@ vk::CommandBuffer DrawWorkerPool::BeginSecondary(uint32_t                       
 	EXIT_IF(worker.m_recording != nullptr);
 
 	if (worker.m_next_free >= worker.m_buffers.size()) {
+		// Reclaim before growing. Without this the ring only ever grows: one secondary per draw at
+		// ~4450 draws a frame exhausts host memory in seconds, which is exactly what it did.
+		RecycleRetired();
+	}
+	if (worker.m_next_free >= worker.m_buffers.size()) {
 		const auto first = worker.m_buffers.size();
 		worker.m_buffers.resize(first + kSecondaryGrowStep);
 		worker.m_ticks.resize(first + kSecondaryGrowStep, 0);
@@ -209,7 +214,9 @@ void DrawWorkerPool::EndSecondary(uint32_t worker_index) {
 
 void DrawWorkerPool::RecycleRetired() {
 	for (auto& worker: m_workers) {
-		EXIT_IF(worker->m_recording != nullptr);
+		if (worker->m_recording != nullptr) {
+			continue;   // mid-record: its buffers are by definition still in use
+		}
 		// Conservative on purpose: the ring is only rewound when every buffer handed out has
 		// retired. Recycling a prefix would need the ring to be a real ring, and reusing a buffer
 		// the GPU is still reading is undefined behaviour rather than a slow frame.
