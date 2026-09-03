@@ -177,6 +177,81 @@ exist.
 
 ---
 
+## 4b. Second research pass — things hiding in plain sight
+
+Found by reading the paths that no profiler zone covers. Sizes are bounded by the phase each
+sits in; the exact split is instrumented and lands with the next run.
+
+### A driver round trip on every draw
+
+`DrawIndex` opens with `PopPendingOperations()`, whose first statement is
+`MasterSemaphore::Refresh()` → **`vkGetSemaphoreCounterValue`**, a driver call, followed by a
+`std::lock_guard` on `m_operation_mutex`. The queue it is polling is almost always empty, and the
+counter it reads only advances on queue submission — a few times per frame.
+
+At 4450 draws/frame that is **~62,000 driver calls per second** to learn nothing, plus per-draw
+traffic on a mutex shared with the priority-operations thread. Upper bound is the 0.31 us
+preamble phase; now timed separately.
+
+The fix is provably safe: an atomic pending count makes the empty case one relaxed load — no
+lock, no driver call. Deferred work is still picked up by the next call that finds a non-empty
+queue. (Careful: `Refresh()` also advances `m_gpu_tick`, which `DescriptorHeap` pool recycling
+reads. Skipping it entirely would make pools grow instead of recycle, so the refresh has to
+survive somewhere — on submission, or throttled per frame.)
+
+### ~14 heap allocations per draw in the materialization path
+
+`values`, `flattened_srt`, `tables` in `MaterializeResources`, and `evaluated`/`flattened` in the
+evaluator, were all per-call `std::vector`s — roughly seven allocations per stage, twice a draw,
+**tens of thousands of malloc/free pairs per frame**. The file already pooled three other vectors
+with `static thread_local`, so the pattern was established and these were simply missed. Pooled
+in `fdd4673`; the transactional hand-off is now `assign` rather than `move` so neither side gives
+its buffer away.
+
+Still outstanding: `ShaderMaterializeStageRuntime` does a **`make_shared<const ResourceSnapshot>`
+per stage per draw**, and the snapshot owns three more vectors. Fixing that means pooling
+snapshots behind a recycling deleter — contained, but it changes ownership, so it wants doing
+deliberately.
+
+### The draw census has never printed
+
+`DrawCensusTick` reports accepted vs skipped draws and uses `LOGF`, **silenced in this build**.
+So the skip rate is unknown — and skipped draws still increment the profiler's draw counter,
+which means every per-draw average in section 1 is diluted by an unknown amount. Switched to
+`std::printf` in `3315723`. If the skip rate is material, the real per-executed-draw costs are
+higher than section 1 states.
+
+### The SRT question that decides the biggest item
+
+`MaterializeResources` is ~3.8 us doing ~141 resolutions at ~27 ns. The headline proposal in
+section 3 — compile each program's fixed SRT graph into a flat fetch list — is only worth
+building if that 27 ns is **graph walking**. This file's own comment claims it is
+(`~370ns, almost all of it walking the expression tree; the memory it reads is only a handful of
+dwords (~20ns)`), but 370 ns does not square with a measured 27 ns average, so the comment is
+describing a different population of descriptors.
+
+`SrtWork` now reports resolutions, graph nodes visited, guest memory reads, and cycles spent
+inside those reads, per evaluation call. **Read it before building the compiler.** If reads
+dominate the 27 ns, a compiled list still performs them and the idea is worth little.
+
+### Ruled out while looking
+
+- `HdrProbe::NoteDrawShader` / `NoteDrawDepth`, called unconditionally per draw — early-out on a
+  disabled flag, cheap.
+- `LogDrawPhase`, 10 calls per draw — early-out, ~2 ns each.
+- Descriptor set allocation per draw — push descriptors are used whenever the descriptor count
+  fits (`shaders.cpp:408`), so the heap path is not the common case.
+
+### The stream buffer, quantified
+
+`ObtainBuffer`'s fast path memcpys guest data into the stream buffer for any buffer up to
+`CACHING_PAGESIZE`, which is **16 KB** (`CACHING_PAGEBITS = 14`), and never clears the CPU-dirty
+flag — so once the guest writes a uniform buffer, every subsequent draw re-uploads it forever.
+This is the known-unfixed bug in the handoff's section 6, now with its size attached: up to 16 KB
+per qualifying buffer per draw. It sits inside `RebindBuffers` (1.5 us).
+
+---
+
 ## 5. Ranked plan
 
 | # | change | expected | risk | prerequisite |
