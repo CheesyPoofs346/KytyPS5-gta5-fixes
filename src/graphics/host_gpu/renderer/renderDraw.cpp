@@ -1771,7 +1771,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const bool        secondary = Config::SecondaryRecordEnabled();
 	vk::CommandBuffer record    = vk_buffer;
 	if (secondary) {
-		auto&                     pool = m_context.GetDrawWorkerPool(1);
+		auto& pool = m_context.GetDrawWorkerPool(Config::DrawWorkerCount());
 		SecondaryRenderingFormats formats {};
 		formats.color_count = state.color_count;
 		for (uint32_t i = 0; i < state.color_count; i++) {
@@ -1791,6 +1791,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			FlushSecondaryBatch(m_context);
 		}
 		if (!batch.open) {
+			// Ownership scope is exactly the batch: while it is open no Buffer is destroyed and
+			// LRU touches are recorded per worker instead of hitting the shared cache.
+			auto& buffer_cache = m_context.GetBufferCache();
+			buffer_cache.SetConcurrent(pool.WorkerCount() > 1);
+			buffer_cache.BeginBatch();
 			batch.worker    = CurrentDrawWorker();
 			batch.buffer    = pool.BeginSecondary(batch.worker, formats);
 			batch.rendering = state.rendering;
@@ -2329,6 +2334,9 @@ void FlushSecondaryBatch(RenderContext& context) {
 	auto primary = scheduler.Current().Handle();
 	primary.executeCommands(1, &batch.buffer);
 	scheduler.EndRendering();
+
+	// Applies the batch's retired buffers and merges the workers' LRU touches, on this thread.
+	context.GetBufferCache().EndBatch();
 
 	batch.open     = false;
 	batch.draws    = 0;

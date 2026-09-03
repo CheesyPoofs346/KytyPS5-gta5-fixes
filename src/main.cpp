@@ -350,6 +350,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--draw-workers") {
+			options.config.draw_workers =
+			    static_cast<uint32_t>(std::max(1, std::atoi(value.c_str())));
 		} else if (arg == "--secondary-record") {
 			if (!ParseBool(value, options.config.secondary_record)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

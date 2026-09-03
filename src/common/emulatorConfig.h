@@ -62,6 +62,7 @@ struct ConfigOptions {
 	bool                   hw_check                    = true;
 	bool                   draw_profile                = false;
 	bool                   secondary_record            = false;
+	uint32_t               draw_workers                = 1;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -158,6 +159,7 @@ bool     DynStateCacheEnabled();
 bool     HwCheckEnabled();
 bool     DrawProfileEnabled();
 bool     SecondaryRecordEnabled();
+uint32_t DrawWorkerCount();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();
