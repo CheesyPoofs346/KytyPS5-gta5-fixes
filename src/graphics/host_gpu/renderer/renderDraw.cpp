@@ -1824,7 +1824,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	vk::CommandBuffer record    = vk_buffer;
 	std::optional<ScopedBatchRecording> batch_recording;
 	if (secondary) {
-		auto& pool = m_context.GetDrawWorkerPool(Config::DrawWorkerCount());
+		auto& pool = m_context.GetDrawWorkerPool();
 		SecondaryRenderingFormats formats {};
 		formats.color_count = state.color_count;
 		for (uint32_t i = 0; i < state.color_count; i++) {
@@ -2471,7 +2471,7 @@ void FlushSecondaryBatch(RenderContext& context) {
 		return;
 	}
 	batch.flushing = true;
-	auto& pool = context.GetDrawWorkerPool(1);
+	auto& pool = context.GetDrawWorkerPool();
 	pool.EndSecondary(batch.worker);
 
 	// Staged uploads are recorded here, before the render pass opens and therefore before any draw

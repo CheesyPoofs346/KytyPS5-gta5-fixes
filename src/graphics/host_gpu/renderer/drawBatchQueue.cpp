@@ -105,7 +105,7 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 		// already captured into prepared, not the live registers, so workers never race the view
 		// the serial phases swap.
 		const auto parallel_start = __builtin_ia32_rdtsc();
-		auto& pool = buffer.GetContext().GetDrawWorkerPool(workers);
+		auto& pool = buffer.GetContext().GetDrawWorkerPool();
 		pool.ParallelFor(static_cast<uint32_t>(draws.size()),
 		                 [&draws, &executor](uint32_t index, uint32_t worker) {
 			                 ScopedDrawWorker slot(worker);

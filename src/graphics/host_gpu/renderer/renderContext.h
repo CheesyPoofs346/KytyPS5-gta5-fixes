@@ -59,9 +59,14 @@ public:
 	// Called once the worker count is known; safe to call before any worker exists.
 	void CreateWorkerDescriptorHeaps(uint32_t worker_count);
 
-	// Created on first use. One worker means no threads are spawned: the pool runs everything on
-	// the caller, which is exactly the single-worker proof of the secondary-buffer path.
-	DrawWorkerPool& GetDrawWorkerPool(uint32_t worker_count);
+	// Created on first use, sized from --draw-workers.
+	//
+	// Takes no count on purpose. It used to, and the first caller won: FlushSecondaryBatch asked
+	// for 1 and always ran before the first queue drain, so the pool was built with a single
+	// worker and every later request for eight was ignored. ParallelFor then had two runners -
+	// the caller and one worker - which is exactly the 2x the walk measured against an expected
+	// 8x.
+	DrawWorkerPool& GetDrawWorkerPool();
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }

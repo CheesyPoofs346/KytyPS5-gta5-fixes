@@ -106,9 +106,9 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	}
 }
 
-DrawWorkerPool& RenderContext::GetDrawWorkerPool(uint32_t worker_count) {
+DrawWorkerPool& RenderContext::GetDrawWorkerPool() {
 	if (m_draw_worker_pool == nullptr) {
-		const auto slots = std::min(std::max(worker_count, 1u), kMaxDrawWorkers);
+		const auto slots = std::min(std::max(Config::DrawWorkerCount(), 1u), kMaxDrawWorkers);
 		m_draw_worker_pool = std::make_unique<DrawWorkerPool>(
 		    m_graphics, m_command_scheduler.GetMasterSemaphore(), slots);
 		CreateWorkerDescriptorHeaps(slots);
