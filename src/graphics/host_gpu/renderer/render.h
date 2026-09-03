@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_
 
+#include "graphics/host_gpu/renderer/drawBatchQueue.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -101,6 +102,24 @@ public:
 	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
 	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
 
+	// What the draw path reads its register state through. Swappable so a deferred draw can be
+	// translated against the snapshot taken when it was queued rather than against registers the
+	// packet loop has since overwritten.
+	struct RegisterView {
+		HW::Context*    context     = nullptr;
+		HW::UserConfig* user_config = nullptr;
+		HW::Shader*     shaders     = nullptr;
+	};
+
+	// Returns the view that was installed, for the caller to restore.
+	RegisterView SwapRegisterView(const RegisterView& view) noexcept {
+		const RegisterView previous {m_registers, m_user_config, m_shaders};
+		m_registers   = view.context;
+		m_user_config = view.user_config;
+		m_shaders     = view.shaders;
+		return previous;
+	}
+
 private:
 	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
@@ -152,6 +171,12 @@ public:
 	void                           RebindImages(PreparedBindings& bindings);
 	// record_target null means record binds into buffer itself; a non-null target sends them to a
 	// secondary while barriers still go to the primary.
+	// Queues a draw for later translation against the snapshot supplied, and reports whether the
+	// queue reached capacity and should be drained.
+	bool EnqueueDrawIndex(QueuedDraw&& draw);
+	void DrainDrawQueue(CommandBuffer& buffer);
+	[[nodiscard]] bool DrawQueueEmpty() const noexcept { return m_draw_queue.Empty(); }
+
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings,
@@ -218,6 +243,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	DrawBatchQueue      m_draw_queue;
+	bool                m_draining = false;
 	std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>
 	    m_push_constants {};
 

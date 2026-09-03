@@ -2313,11 +2313,31 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	return true;
 }
 
+bool RenderExecutor::EnqueueDrawIndex(QueuedDraw&& draw) {
+	m_draw_queue.Push(std::move(draw));
+	return m_draw_queue.Full();
+}
+
+void RenderExecutor::DrainDrawQueue(CommandBuffer& buffer) {
+	// A queued draw can itself hit a batch boundary and flush, and the flush drains the queue.
+	// Without this guard that re-enters while the drain is already walking the same draws.
+	if (m_draining) {
+		return;
+	}
+	m_draining = true;
+	m_draw_queue.Drain(*this, buffer);
+	m_draining = false;
+}
+
 bool SecondaryBatchOpen() noexcept {
 	return g_secondary_batch.open;
 }
 
 void FlushSecondaryBatch(RenderContext& context) {
+	// Queued draws have not been translated yet, so they must be turned into recorded commands
+	// before anything replays or submits. Ordered first for that reason.
+	context.GetRenderExecutor().DrainDrawQueue(context.GetCommandScheduler().Current());
+
 	auto& batch = g_secondary_batch;
 	// flushing guards re-entry: the EndRendering below is itself a flush hook.
 	if (!batch.open || batch.flushing) {

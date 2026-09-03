@@ -952,9 +952,35 @@ void CommandProcessor::DrawIndex(uint32_t index_count, const void* index_addr, u
 		     "\n",
 		     vertex_offset_add, first_instance);
 	}
-	m_renderer.GetRenderExecutor().DrawIndex(
-	    m_submit_id, CurrentBuffer(), m_index_type_and_size, index_count, index_addr, flags, type,
-	    instance_count, render_target_slice_offset, vertex_offset_add, first_instance);
+	auto& executor = m_renderer.GetRenderExecutor();
+	if (Config::DrawQueueEnabled()) {
+		// Queued against the register state as it stands now. The packet loop keeps writing those
+		// registers, so a draw translated later must carry its own copy or it would be translated
+		// against a later draw's state.
+		QueuedDraw queued {};
+		queued.snapshot = m_snapshot_cache.Acquire(CurrentBuffer().GetRegisters(),
+		                                           CurrentBuffer().GetUserConfig(),
+		                                           CurrentBuffer().GetShaders());
+		queued.submit_id                  = m_submit_id;
+		queued.index_type_and_size        = m_index_type_and_size;
+		queued.index_count                = index_count;
+		queued.index_addr                 = index_addr;
+		queued.flags                      = flags;
+		queued.type                       = type;
+		queued.instance_count             = instance_count;
+		queued.render_target_slice_offset = render_target_slice_offset;
+		queued.vertex_offset_add          = vertex_offset_add;
+		queued.first_instance             = first_instance;
+		if (executor.EnqueueDrawIndex(std::move(queued))) {
+			// Capacity is a boundary of its own: it bounds the queue and keeps the GPU fed rather
+			// than letting the CPU accumulate a whole frame before anything is recorded.
+			executor.DrainDrawQueue(CurrentBuffer());
+		}
+		return;
+	}
+	executor.DrawIndex(m_submit_id, CurrentBuffer(), m_index_type_and_size, index_count,
+	                   index_addr, flags, type, instance_count, render_target_slice_offset,
+	                   vertex_offset_add, first_instance);
 }
 
 void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count,
