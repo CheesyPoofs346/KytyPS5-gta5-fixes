@@ -934,12 +934,20 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
-		image.Transit(layout,
-		              vk::AccessFlagBits2::eColorAttachmentRead |
-		                  vk::AccessFlagBits2::eColorAttachmentWrite,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		// Audited as part of the parallel-resolution work: this is a primary-buffer recording on
+		// the per-draw resolve path, same as CommitBindings' transitions, so it stages the same
+		// way. The attachment layout written below is the one being requested, which is what
+		// BeginRendering must agree with either way.
+		const ImageSubresourceRange color_range {view.base_level, view.level_count, view.base_layer,
+		                                         view.layer_count};
+		constexpr auto color_access = vk::AccessFlagBits2::eColorAttachmentRead |
+		                              vk::AccessFlagBits2::eColorAttachmentWrite;
+		if (Config::DeferTransitionsEnabled() || MustStageForWorker()) {
+			m_pending_transitions.push_back(
+			    PendingTransition {target.image_id, layout, color_access, color_range});
+		} else {
+			image.Transit(layout, color_access, color_range, buffer.Handle());
+		}
 		state.width             = std::min(state.width, target.extent.width);
 		state.height            = std::min(state.height, target.extent.height);
 		state.num_layers        = std::min(state.num_layers, view.layer_count);
@@ -995,10 +1003,14 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			access |= vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 		}
 		const auto& view = depth.desc.view_info;
-		image.Transit(layout, access,
-		              ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
-		                                     view.layer_count},
-		              buffer.Handle());
+		const ImageSubresourceRange depth_range {view.base_level, view.level_count, view.base_layer,
+		                                         view.layer_count};
+		if (Config::DeferTransitionsEnabled() || MustStageForWorker()) {
+			m_pending_transitions.push_back(
+			    PendingTransition {depth.image_id, layout, access, depth_range});
+		} else {
+			image.Transit(layout, access, depth_range, buffer.Handle());
+		}
 		state.width               = std::min(state.width, depth.width);
 		state.height              = std::min(state.height, depth.height);
 		state.num_layers          = std::min(state.num_layers, view.layer_count);
@@ -2499,6 +2511,7 @@ void FlushSecondaryBatch(RenderContext& context) {
 	// Order matters: clears transition images to TransferDst and write them, so they run before
 	// the transitions that put those images into their sampled layout for the draws.
 	context.GetTextureCache().FlushPendingClears();
+	context.GetTextureCache().FlushDeferredTouches();
 	context.GetRenderExecutor().FlushPendingTransitions(context.GetCommandScheduler().Current());
 	context.GetBufferCache().FlushPendingUploads();
 

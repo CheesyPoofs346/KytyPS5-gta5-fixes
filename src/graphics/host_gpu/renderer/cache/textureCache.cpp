@@ -278,8 +278,28 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
-	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	if (!image.registered) {
+		return;
+	}
+	// Recorded per worker and merged on the main thread, exactly as TouchBuffer does for the
+	// buffer cache. FindTexture runs this on every call - it is the reason a reader-writer lock
+	// would buy nothing here, since there is no read-only path for a shared lock to take.
+	if (MustStageForWorker()) {
+		const auto worker = CurrentDrawWorker();
+		if (worker < m_deferred_touch.size()) {
+			m_deferred_touch[worker].push_back(image.lru_id);
+			return;
+		}
+	}
+	m_lru_cache.Touch(image.lru_id, m_gc_tick);
+}
+
+void TextureCache::FlushDeferredTouches() {
+	for (auto& touches: m_deferred_touch) {
+		for (const auto lru_id: touches) {
+			m_lru_cache.Touch(lru_id, m_gc_tick);
+		}
+		touches.clear();
 	}
 }
 

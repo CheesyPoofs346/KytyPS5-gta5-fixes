@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -107,6 +108,9 @@ public:
 
 	// Records every staged clear, in request order. Main thread only.
 	void               FlushPendingClears();
+
+	// Merges the workers' recorded LRU touches. Main thread only.
+	void               FlushDeferredTouches();
 	[[nodiscard]] bool HasPendingClears() const noexcept { return !m_pending_clears.empty(); }
 
 private:
@@ -205,6 +209,8 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	std::vector<PendingClear>                         m_pending_clears;
+	std::vector<std::vector<size_t>>                  m_deferred_touch =
+	    std::vector<std::vector<size_t>>(kMaxDrawWorkers);
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;

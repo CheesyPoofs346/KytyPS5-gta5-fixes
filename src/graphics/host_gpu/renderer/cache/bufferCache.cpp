@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
@@ -181,6 +182,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 
 void BufferCache::RecordUpload(vk::Buffer destination, uint64_t destination_size,
                                vk::Buffer source, std::span<const vk::BufferCopy> copies) {
+	// Recording, and it ends the render pass to do it. A worker reaching here would record into
+	// the primary and close a pass another thread is using, which corrupts silently rather than
+	// failing - so it is an assert, not a branch. Workers stage instead; see MustStageForWorker.
+	EXIT_IF(MustStageForWorker());
 	auto&      command = m_scheduler.Current();
 	// Transfers cannot sit inside a render pass.
 	command.EndRendering();
@@ -212,12 +217,7 @@ void BufferCache::FlushPendingUploads() {
 	if (m_pending_uploads.empty()) {
 		return;
 	}
-	auto& command = m_scheduler.Current();
-	// Uploads are transfers, so they cannot sit inside a render pass. The batch opens its pass
-	// after this runs, which is why this no longer has to tear one open.
-	command.EndRendering();
-	const auto native = command.Handle();
-
+	// Each RecordUpload closes the pass itself; the batch opens its own afterwards.
 	for (const auto& upload: m_pending_uploads) {
 		RecordUpload(upload.destination, upload.destination_size, upload.source, upload.copies);
 	}
