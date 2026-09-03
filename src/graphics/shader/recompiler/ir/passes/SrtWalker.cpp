@@ -11,6 +11,7 @@
 #include <bit>
 #include <atomic>
 #include <cstdio>
+#include <memory>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -423,7 +424,26 @@ public:
 	Evaluator(const Program& program, const SrtRuntime& runtime,
 	          std::span<const uint8_t> clean_flat_slots = {}, Evaluator* clean_evaluator = nullptr)
 	    : m_program(program), m_runtime(runtime),
-	      m_clean_flat_slots(clean_flat_slots), m_clean_evaluator(clean_evaluator) {}
+	      m_clean_flat_slots(clean_flat_slots), m_clean_evaluator(clean_evaluator) {
+		m_arena = AcquireArena();
+		if (m_arena == nullptr) {
+			m_owned_arena             = std::make_unique<MemoArena>();
+			m_owned_arena->generation = 1;
+			m_arena                   = m_owned_arena.get();
+		}
+		m_generation = m_arena->generation;
+	}
+
+	~Evaluator() {
+		if (m_owned_arena == nullptr && m_arena != nullptr) {
+			m_arena->in_use = false;
+		}
+	}
+
+	Evaluator(const Evaluator&)            = delete;
+	Evaluator& operator=(const Evaluator&) = delete;
+	Evaluator(Evaluator&&)                 = delete;
+	Evaluator& operator=(Evaluator&&)      = delete;
 
 	void SetUsePc(uint32_t pc) { m_use_pc = pc; }
 
@@ -963,8 +983,10 @@ private:
 	// Scoped to a single evaluation: cleared per Evaluator, never reused across draws. An
 	// earlier attempt at cross-draw reuse resolved stale descriptors and rendered light coronas
 	// as red blobs - do not reintroduce that without per-input validation.
-	static constexpr size_t kMemoBits = 8;
-	static constexpr size_t kMemoSize = size_t {1} << kMemoBits;
+	static constexpr size_t kMemoBits   = 8;
+	static constexpr size_t kMemoSize   = size_t {1} << kMemoBits;
+	// Two are live at once (the evaluator and its clean counterpart); the rest is headroom.
+	static constexpr size_t kMemoArenas = 4;
 
 	void MarkOverflow() { m_overflow_count++; }
 
@@ -980,17 +1002,49 @@ private:
 	}
 
 	struct MemoSlot {
-		const Inst* key   = nullptr;
+		const Inst* key = nullptr;
 		uint64_t    value = 0;
+		// Slots belong to one evaluation; any other stamp reads as an empty slot.
+		uint32_t    generation = 0;
 		// The slice of the log this subtree appended, replayed on a hit.
 		uint32_t    log_start  = 0;
-		uint32_t    log_count  = 0;
+		uint16_t    log_count  = 0;
 		bool        overflowed = false;
 		// "Currently being evaluated" lives here rather than in a separate vector: the old cycle
 		// check was a linear scan of m_visiting on EVERY node, and expressions are 10-20 deep.
-		bool        done  = false;
+		bool        done = false;
 	};
-	std::array<MemoSlot, kMemoSize> m_memo {};
+
+	// Clearing the table cost a memset of the whole array per Evaluator, twice per draw, on the
+	// hottest path in the renderer. The arenas live for the thread instead and a generation stamp
+	// retires the previous evaluation in O(1) - semantically identical to a cleared table, with
+	// no cross-evaluation reuse, which is the thing that previously rendered coronas as red blobs.
+	struct MemoArena {
+		std::array<MemoSlot, kMemoSize> slots {};
+		uint32_t                        generation = 0;
+		bool                            in_use     = false;
+	};
+
+	static MemoArena* AcquireArena() {
+		static thread_local std::array<MemoArena, kMemoArenas> arenas;
+		for (auto& arena: arenas) {
+			if (!arena.in_use) {
+				arena.in_use = true;
+				arena.generation++;
+				if (arena.generation == 0) {
+					// Wrapped: a surviving stamp of 0 would alias this evaluation. Clear once.
+					arena.slots.fill(MemoSlot {});
+					arena.generation = 1;
+				}
+				return &arena;
+			}
+		}
+		return nullptr;
+	}
+
+	std::unique_ptr<MemoArena> m_owned_arena;   // only if every arena was already taken
+	MemoArena*                 m_arena      = nullptr;
+	uint32_t                   m_generation = 0;
 
 	static size_t MemoIndex(const Inst* inst) {
 		auto h = reinterpret_cast<uintptr_t>(inst);
@@ -1001,30 +1055,35 @@ private:
 
 	// Returns: 1 = resolved (out set), 0 = not present, -1 = currently being evaluated (cycle).
 	int MemoLookup(const Inst* inst, uint64_t& out) {
+		auto& slots = m_arena->slots;
 		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
-			if (m_memo[i].key == inst) {
-				if (!m_memo[i].done) {
+			auto& slot = slots[i];
+			if (slot.generation != m_generation) {
+				return 0;
+			}
+			if (slot.key == inst) {
+				if (!slot.done) {
 					return -1;
 				}
-				out = m_memo[i].value;
-				ReplayMemo(m_memo[i]);
+				out = slot.value;
+				ReplayMemo(slot);
 				return 1;
-			}
-			if (m_memo[i].key == nullptr) {
-				return 0;
 			}
 		}
 		return 0;
 	}
 
 	void MemoMarkVisiting(const Inst* inst) {
+		auto& slots = m_arena->slots;
 		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
-			if (m_memo[i].key == nullptr) {
-				m_memo[i].key  = inst;
-				m_memo[i].done = false;
+			auto& slot = slots[i];
+			if (slot.generation != m_generation) {
+				slot            = MemoSlot {};
+				slot.generation = m_generation;
+				slot.key        = inst;
 				return;
 			}
-			if (m_memo[i].key == inst) {
+			if (slot.key == inst) {
 				return;
 			}
 		}
@@ -1044,6 +1103,13 @@ private:
 		if (slot.log_count == 0) {
 			return;
 		}
+		// The generation stamp is what guarantees this window belongs to the current evaluation
+		// and therefore indexes the current log. Check it anyway: getting that wrong reads other
+		// memory rather than merely missing the cache.
+		if (static_cast<size_t>(slot.log_start) + slot.log_count > m_log.size()) {
+			MarkOverflow();
+			return;
+		}
 		if (m_log.size() + slot.log_count > kMaxLogEntries) {
 			MarkOverflow();
 			return;
@@ -1054,14 +1120,18 @@ private:
 	}
 
 	void MemoInsert(const Inst* inst, uint64_t value, uint32_t log_start, uint32_t overflow_start) {
+		auto& slots = m_arena->slots;
 		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
-			if (m_memo[i].key == nullptr || m_memo[i].key == inst) {
-				m_memo[i].key        = inst;
-				m_memo[i].value      = value;
-				m_memo[i].done       = true;
-				m_memo[i].log_start  = log_start;
-				m_memo[i].log_count  = static_cast<uint32_t>(m_log.size()) - log_start;
-				m_memo[i].overflowed = m_overflow_count != overflow_start;
+			auto& slot = slots[i];
+			if (slot.generation != m_generation || slot.key == inst) {
+				const auto span  = m_log.size() - log_start;
+				slot.generation  = m_generation;
+				slot.key         = inst;
+				slot.value       = value;
+				slot.done        = true;
+				slot.log_start   = log_start;
+				slot.log_count   = static_cast<uint16_t>(span);
+				slot.overflowed  = m_overflow_count != overflow_start || span > kMaxLogEntries;
 				return;
 			}
 		}

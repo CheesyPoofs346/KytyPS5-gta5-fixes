@@ -24409,9 +24409,31 @@ void CheckDescriptorCacheSharedSubtree() {
   Require(name, "shared subtree revalidated", second[1].dwords[0] == 0x22222222u,
           "a descriptor whose only input reached it through a memo hit kept a stale value");
 
-  // Restore the shipped default so later tests are unaffected.
+  // Hammer arena reuse: the memo table is no longer cleared per Evaluator, it is retired by a
+  // generation stamp on a thread-local arena. A stamp that failed to retire an entry would hand
+  // this loop a previous iteration's value, which is the failure that rendered coronas as red
+  // blobs when cross-draw memo reuse was tried directly.
+  for (uint32_t i = 0; i < 64; i++) {
+    const uint32_t expected = 0x1000u + i;
+    std::vector<IR::DescriptorValue> pass;
+    evaluate(expected, pass);
+    Require(name, "arena reuse", pass.size() == 2 && pass[0].dwords[0] == expected &&
+                                     pass[1].dwords[0] == expected,
+            "a memo arena handed back a previous evaluation's value");
+  }
+
+  // Restore the shipped default so later tests are unaffected, then confirm the walk is still
+  // correct with the cache off - the memo arenas are shared by both paths.
   options.cache_descriptors = false;
   Config::Load(options);
+  for (uint32_t i = 0; i < 8; i++) {
+    const uint32_t expected = 0x2000u + i;
+    std::vector<IR::DescriptorValue> pass;
+    evaluate(expected, pass);
+    Require(name, "arena reuse uncached", pass.size() == 2 && pass[0].dwords[0] == expected &&
+                                              pass[1].dwords[0] == expected,
+            "the uncached walk returned a stale memoised value");
+  }
 }
 
 // The tile-size memo is keyed on every argument TileGetTextureSize takes, so a hit must be
