@@ -51,6 +51,9 @@ struct PreparedBindings {
 	// Decoded once in FindBuffers and reused by RebindBuffers, which used to decode the same
 	// snapshot dwords a second time for every buffer of every stage of every draw.
 	std::vector<ShaderBufferResource>             buffer_descriptors;
+	// Clamped against the guest range table by FindBuffers. RebindBuffers used to ask for the
+	// same answer a second time, and that query is a contended lock away.
+	std::vector<uint64_t>                         buffer_sizes;
 	std::vector<uint32_t>                         flattened_srt;
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;
