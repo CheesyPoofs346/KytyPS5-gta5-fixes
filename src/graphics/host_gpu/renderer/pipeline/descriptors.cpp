@@ -1294,32 +1294,43 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const ImageSubresourceRange range {view.base_level, view.level_count, view.base_layer,
 			                                   view.layer_count};
 			const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+
+			// The four cases below decide one target layout and access mask. Computing them
+			// first, then either transitioning now or staging for the pre-pass, keeps the two
+			// paths from drifting - and lets the descriptor be written with the layout the image
+			// will hold, which is what the shader sees either way.
+			vk::ImageLayout                     target_layout = vk::ImageLayout::eGeneral;
+			vk::AccessFlags2                    target_access {};
+			std::optional<ImageSubresourceRange> target_range = range;
 			if (image.info.data.Empty()) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              storage ? vk::AccessFlagBits2::eShaderRead |
-				                            vk::AccessFlagBits2::eShaderWrite
-				                      : vk::AccessFlagBits2::eShaderRead,
-				              range, vk_buffer);
+				target_access = storage ? vk::AccessFlagBits2::eShaderRead |
+				                              vk::AccessFlagBits2::eShaderWrite
+				                        : vk::AccessFlagBits2::eShaderRead;
 			} else if ((image.binding.force_general || image.binding.is_target) &&
 			           !image.info.IsDepth()) {
 				const vk::AccessFlags2 storage_access = image.binding.shader_write
 				                                            ? vk::AccessFlagBits2::eShaderWrite
 				                                            : vk::AccessFlags2 {};
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | storage_access |
-				                  vk::AccessFlagBits2::eColorAttachmentRead |
-				                  vk::AccessFlagBits2::eColorAttachmentWrite,
-				              {}, vk_buffer);
+				target_access = vk::AccessFlagBits2::eShaderRead | storage_access |
+				                vk::AccessFlagBits2::eColorAttachmentRead |
+				                vk::AccessFlagBits2::eColorAttachmentWrite;
+				target_range  = {};
 			} else if (storage) {
-				image.Transit(vk::ImageLayout::eGeneral,
-				              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-				              range, vk_buffer);
+				target_access = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 			} else {
-				image.Transit(image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-				                                   : vk::ImageLayout::eShaderReadOnlyOptimal,
-				              vk::AccessFlagBits2::eShaderRead, range, vk_buffer);
+				target_layout = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+				                                     : vk::ImageLayout::eShaderReadOnlyOptimal;
+				target_access = vk::AccessFlagBits2::eShaderRead;
 			}
-			binding.layout = image.backing.state.layout;
+
+			if (Config::DeferTransitionsEnabled()) {
+				m_pending_transitions.push_back(PendingTransition {
+				    descriptors.images[i].image_id, target_layout, target_access, target_range});
+				binding.layout = target_layout;
+			} else {
+				image.Transit(target_layout, target_access, target_range, vk_buffer);
+				binding.layout = image.backing.state.layout;
+			}
 		}
 
 		m_image_occurrences.assign(descriptors.images.size(), 0);

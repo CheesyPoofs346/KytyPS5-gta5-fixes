@@ -182,6 +182,25 @@ public:
 	// and writes only into prepared, touching no command buffer, image or cache.
 	void ResolveQueuedShaders(PreparedShaders& prepared);
 
+	// A layout transition a draw needs, recorded for later rather than emitted inline.
+	//
+	// Transit writes a barrier into the primary command buffer, which is the single thing that
+	// stops resource resolution running on a worker. Staging them changes no ordering: a batch's
+	// draws already replay after every transition their resolve recorded, so applying the list as
+	// an explicit pre-pass is what the code does today, made explicit.
+	struct PendingTransition {
+		ImageId                             image_id;
+		vk::ImageLayout                     layout = vk::ImageLayout::eUndefined;
+		vk::AccessFlags2                    access {};
+		std::optional<ImageSubresourceRange> range;
+	};
+
+	// Applies every staged transition, in the order requested. Main thread only.
+	void FlushPendingTransitions(CommandBuffer& buffer);
+	[[nodiscard]] bool HasPendingTransitions() const noexcept {
+		return !m_pending_transitions.empty();
+	}
+
 	bool EnqueueDrawIndex(QueuedDraw&& draw);
 	void DrainDrawQueue(CommandBuffer& buffer);
 	[[nodiscard]] bool DrawQueueEmpty() const noexcept { return m_draw_queue.Empty(); }
@@ -252,6 +271,7 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	std::vector<PendingTransition> m_pending_transitions;
 	DrawBatchQueue      m_draw_queue;
 	bool                m_draining = false;
 	std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>

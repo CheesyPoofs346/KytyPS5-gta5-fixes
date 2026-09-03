@@ -2368,6 +2368,25 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	return true;
 }
 
+void RenderExecutor::FlushPendingTransitions(CommandBuffer& buffer) {
+	if (m_pending_transitions.empty()) {
+		return;
+	}
+	// Applied in request order, on the primary, before the batch opens its render pass - which is
+	// where these barriers were already landing. Staging only changes who records them, not when
+	// the GPU sees them relative to the draws that need them.
+	auto& texture_cache = m_context.GetTextureCache();
+	auto  vk_buffer     = buffer.Handle();
+	for (const auto& transition: m_pending_transitions) {
+		auto* image = texture_cache.m_slot_images.try_get(transition.image_id);
+		if (image == nullptr) {
+			continue;   // retired between staging and flush; nothing to transition
+		}
+		image->Transit(transition.layout, transition.access, transition.range, vk_buffer);
+	}
+	m_pending_transitions.clear();
+}
+
 bool RenderExecutor::PrepareQueuedShaders(CommandBuffer& buffer, PreparedShaders& prepared) {
 	auto&       pipeline_cache = buffer.GetContext().GetPipelineCache();
 	const auto& vertex_info    = buffer.GetShaders().GetVs();
@@ -2474,9 +2493,10 @@ void FlushSecondaryBatch(RenderContext& context) {
 	auto& pool = context.GetDrawWorkerPool();
 	pool.EndSecondary(batch.worker);
 
-	// Staged uploads are recorded here, before the render pass opens and therefore before any draw
-	// in this batch executes. Resolve only stages them; this is the serial phase that applies them,
-	// in the order they were requested.
+	// Staged work is recorded here, before the render pass opens and therefore before any draw in
+	// this batch executes. Resolve only stages it; this is the serial phase that applies it, in
+	// the order it was requested.
+	context.GetRenderExecutor().FlushPendingTransitions(context.GetCommandScheduler().Current());
 	context.GetBufferCache().FlushPendingUploads();
 
 	auto& scheduler = context.GetCommandScheduler();

@@ -25,6 +25,7 @@ static std::atomic<bool> g_secondary_record {false};
 static std::atomic<uint32_t> g_draw_workers {1};
 static std::atomic<bool> g_draw_queue {false};
 static std::atomic<bool> g_defer_uploads {false};
+static std::atomic<bool> g_defer_transitions {false};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
@@ -53,6 +54,7 @@ void Load(const ConfigOptions& cfg) {
 	g_draw_workers.store(cfg.draw_workers, std::memory_order_relaxed);
 	g_draw_queue.store(cfg.draw_queue, std::memory_order_relaxed);
 	g_defer_uploads.store(cfg.defer_uploads, std::memory_order_relaxed);
+	g_defer_transitions.store(cfg.defer_transitions, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
@@ -153,6 +155,10 @@ bool DrawQueueEnabled() {
 
 bool DeferUploadsEnabled() {
 	return g_defer_uploads.load(std::memory_order_relaxed);
+}
+
+bool DeferTransitionsEnabled() {
+	return g_defer_transitions.load(std::memory_order_relaxed);
 }
 
 void SetHwCheck(bool enabled) {
