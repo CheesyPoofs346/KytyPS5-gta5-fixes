@@ -739,10 +739,32 @@ private:
 			return;
 		}
 
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
+		// Called on every mutation, under the lock the render thread needs: a full sort plus a
+		// freshly allocated rebuild, ~147k times a session. The table is already sorted almost
+		// always, and usually nothing is adjacent-and-mergeable, so both are normally waste.
+		// Same output either way - this only skips work that cannot change the result.
+		const auto less_by_start = [](const Range& left, const Range& right) {
+			return left.start < right.start;
+		};
+		if (!std::is_sorted(m_ranges.begin(), m_ranges.end(), less_by_start)) {
+			std::sort(m_ranges.begin(), m_ranges.end(), less_by_start);
+		}
+
+		bool any_mergeable = false;
+		for (size_t i = 1; i < m_ranges.size(); i++) {
+			const auto& previous = m_ranges[i - 1];
+			if (End(previous.start, previous.size) == m_ranges[i].start &&
+			    SameMergeKey(previous, m_ranges[i])) {
+				any_mergeable = true;
+				break;
+			}
+		}
+		if (!any_mergeable) {
+			return;
+		}
 
 		std::vector<Range> merged;
+		merged.reserve(m_ranges.size());
 		for (const auto& r: m_ranges) {
 			if (!merged.empty()) {
 				auto& last = merged[merged.size() - 1];
