@@ -265,6 +265,11 @@ thread_local ClampFastPath t_clamp_fast_path;
 // the generation is churning, and the printed value says how fast.
 thread_local uint64_t t_clamp_calls = 0;
 thread_local uint64_t t_clamp_hits  = 0;
+// A 96% hit rate that barely moved the phase means the average is hiding one of two very
+// different worlds: cheap hits with catastrophic misses, or hits that are not cheap at all.
+// Time the two paths separately rather than infer either from the average again.
+thread_local uint64_t t_clamp_hit_cycles  = 0;
+thread_local uint64_t t_clamp_miss_cycles = 0;
 
 class VirtualRanges {
 public:
@@ -500,8 +505,9 @@ public:
 		}
 		// 363 ns a call, 6.2 calls a draw, 15% of the whole draw - almost all of it the lock and
 		// a cache-missing binary search over a table that changes very rarely.
-		auto&      fast    = t_clamp_fast_path;
-		const auto current = m_generation.load(std::memory_order_acquire);
+		const auto entry_tsc = __builtin_ia32_rdtsc();
+		auto&      fast      = t_clamp_fast_path;
+		const auto current   = m_generation.load(std::memory_order_acquire);
 		if (fast.generation != current) {
 			fast.Reset(current);
 		}
@@ -511,15 +517,24 @@ public:
 			t_clamp_hits++;
 		}
 		if (t_clamp_calls % 200000 == 0) {
-			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu cached=%u\n",
+			const auto misses = t_clamp_calls - t_clamp_hits;
+			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu cached=%u "
+			            "hit=%.0f cyc miss=%.0f cyc\n",
 			            static_cast<unsigned long long>(t_clamp_calls),
 			            static_cast<unsigned long long>(t_clamp_hits),
 			            100.0 * static_cast<double>(t_clamp_hits) /
 			                static_cast<double>(t_clamp_calls),
-			            static_cast<unsigned long long>(current), fast.count);
+			            static_cast<unsigned long long>(current), fast.count,
+			            t_clamp_hits != 0 ? static_cast<double>(t_clamp_hit_cycles) /
+			                                    static_cast<double>(t_clamp_hits)
+			                              : 0.0,
+			            misses != 0 ? static_cast<double>(t_clamp_miss_cycles) /
+			                              static_cast<double>(misses)
+			                        : 0.0);
 			std::fflush(stdout);
 		}
 		if (hit) {
+			t_clamp_hit_cycles += __builtin_ia32_rdtsc() - entry_tsc;
 			return size;
 		}
 		Common::LockGuard lock(m_mutex);
@@ -550,6 +565,8 @@ public:
 			}
 			t_clamp_fast_path.Insert(vma->start, vma_end);
 		}
+
+		t_clamp_miss_cycles += __builtin_ia32_rdtsc() - entry_tsc;
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
