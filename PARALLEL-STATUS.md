@@ -386,3 +386,94 @@ for the first time, so expect that to be the debugging session, not a measuremen
 Run 2 forces the staged paths on the main thread, which is the only way to exercise them before
 resolution moves to workers. If it renders identically to run 1, the staging is correct and the
 remaining work is purely the find-or-create locking.
+
+---
+
+# Update 2026-09-03 late night — opt-in gate landed, shared-read path blocked
+
+Tests **53 ok**, builds clean, no game launched.
+
+## 1. Double-checked shared lookup — cannot be done yet, and here is the evidence
+
+Deferring `TouchImage` removed one write from the hit path. It did not make the hit path
+read-only. `FindTexture` still mutates on **every** call:
+
+```
+TouchImage(image);                       // now deferred
+if (desc.type == Storage) image.MarkGpuModified();
+RefreshImage(id, desc);                  // runs on every textured draw
+image.usage.storage = true;
+if (Config::DccClearOnSample()) MaterializeDccMetaClear(id, image, desc);
+```
+
+and `RefreshImage` itself mutates unconditionally:
+
+```
+TrackImage(id);
+image.SetMaybeCpuHash(hash);
+image.ResolveMaybeCpuHash(hash);
+```
+
+A shared-read hit path over that is a data race, and its failure mode is corrupted texture state
+rather than an error, so it was not implemented. **What has to happen first** is the same
+treatment `TouchImage` got, applied to the rest: `MarkGpuModified`, the `usage` flags and
+`TrackImage` are all per-image bookkeeping that could be recorded per worker and merged, leaving
+`RefreshImage`'s hash work and `MaterializeDccMetaClear` as the genuinely exclusive parts.
+
+That is a real piece of work with a clear shape, and it wants a run to validate.
+
+## 2. `--parallel-resolution`, default false (`92c6bbf`)
+
+The drain's parallel phase now runs only when asked for. With the flag off the drain is a plain
+serial walk and the main-thread path is byte-for-byte what it was before any of this existed.
+
+Named `--parallel-resolution` deliberately: `--parallel-resolve` already exists and means the
+legacy two-thread experiment that splits one draw's vertex and pixel resolve, measured at 2.7%.
+Two different things, and confusing them would waste a session.
+
+**What it dispatches:** the shader resource walk (`MaterializeResources`), which is safe on
+workers.
+
+**What it does not dispatch:** buffer and texture resource resolution. Audited tonight, these are
+the remaining races on that path:
+
+| state | problem |
+|---|---|
+| `m_gpu_modified_ranges.Add()` in `ObtainBuffer` | unprotected RangeSet mutation |
+| texture cache find-or-create | exclusive spinlock - correct, but serialises all workers |
+| `FindTexture` hit path | mutates, per section 1 |
+| `Image::binding` writes in `BindImage` | unprotected per-image state |
+
+Already safe and worth recording so nobody re-audits them: the binding storage pool is
+`static thread_local`, descriptor heaps and stream rings are per worker, the page table has its
+reader-writer lock, and `TouchBuffer`/`TouchImage` are deferred.
+
+## Test sequence for when you are back
+
+Run these in order. The first two are unchanged and are the ones that matter.
+
+```bash
+# 1. baseline the batching path again after tonight's changes - expect ~14.08 us/draw and no
+#    visual difference. Everything tonight is dormant here.
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true
+
+# 2. the 8-wide SRT walk, which has STILL never actually run 8-wide
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true               --draw-workers 8 --parallel-resolution true
+
+# 3. force the staged paths on the main thread, with validation. This is the only way to exercise
+#    the transition/clear/upload staging before resolution moves to workers.
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true               --defer-transitions true --vulkan-validation true
+```
+
+**Run 1** is the regression check: if it is not ~14 us/draw and visually identical, something
+tonight leaked into the default path.
+
+**Run 2** is the measurement. Watch `DrainCensus`: `phase2_walk` should fall from ~10% toward
+2-3%, and TOTAL toward ~13 us/draw. Note this is the first time the pool fix and the 8-worker
+walk have run together.
+
+**Run 3** is a correctness check with no performance meaning. If it renders identically to run 1,
+the staging is correct and the remaining work is purely the texture-cache locking in section 1.
+
+Baselines: **14.08 us/draw** (batching only, sec13), **15.75** (walk at 2 runners, par8),
+**16.37** (par9, census overhead included).
