@@ -255,11 +255,24 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
+	DrainQueuedDraws();
 	GetScheduler().Flush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
+	DrainQueuedDraws();
 	GetScheduler().FlushAndWait();
+}
+
+// Queued draws must be translated before the command buffer they belong to is submitted, or the
+// frame ships without them. Called from the command processor, never from the renderer's flush
+// path: translation re-enters buffer and texture resolution, and that path already holds the
+// memory tracker's region lock.
+void CommandProcessor::DrainQueuedDraws() {
+	if (!Config::DrawQueueEnabled() || !GetScheduler().Active()) {
+		return;
+	}
+	m_renderer.GetRenderExecutor().DrainDrawQueue(CurrentBuffer());
 }
 
 void CommandProcessor::BufferWait() {
@@ -1586,6 +1599,12 @@ void CommandProcessor::EmitGlobalBarrier() {
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
+	// Command-processor level, so no cache lock is held: safe to translate queued draws here.
+	// They must be recorded before this barrier, which is what the guest is asking to synchronise
+	// against.
+	if (Config::DrawQueueEnabled()) {
+		m_renderer.GetRenderExecutor().DrainDrawQueue(CurrentBuffer());
+	}
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }

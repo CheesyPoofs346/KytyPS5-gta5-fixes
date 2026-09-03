@@ -2379,19 +2379,13 @@ bool SecondaryBatchOpen() noexcept {
 }
 
 void FlushSecondaryBatch(RenderContext& context) {
-	// Queued draws have not been translated yet, so they must be turned into recorded commands
-	// before anything replays or submits. Ordered first for that reason.
+	// The draw queue is deliberately NOT drained here.
 	//
-	// Guarded: Current() asserts the scheduler is active, and this runs from EndRendering and
-	// Flush, which are reachable with no command buffer bound - during teardown, and throughout
-	// the unit tests, which is where this fired.
-	{
-		auto& scheduler = context.GetCommandScheduler();
-		auto& executor  = context.GetRenderExecutor();
-		if (scheduler.Active() && !executor.DrawQueueEmpty()) {
-			executor.DrainDrawQueue(scheduler.Current());
-		}
-	}
+	// Draining translates draws, and translation re-enters buffer and texture resolution. This
+	// function runs from CommandBuffer::EndRendering, which resolution itself calls while holding
+	// the memory tracker's region lock - so draining here deadlocks on that lock, which is the
+	// "recursive region tracking lock" abort. The queue is drained from the command processor
+	// instead, where no cache lock is held.
 
 	auto& batch = g_secondary_batch;
 	// flushing guards re-entry: the EndRendering below is itself a flush hook.

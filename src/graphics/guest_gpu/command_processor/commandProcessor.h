@@ -64,6 +64,7 @@ public:
 
 	void            BufferInit();
 	void            BufferFlush();
+	void                      DrainQueuedDraws();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
