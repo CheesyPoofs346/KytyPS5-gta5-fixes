@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -44,7 +45,18 @@ public:
 	Common::Mutex&      GetMutex() { return m_mutex; }
 	CommandScheduler&   GetCommandScheduler() { return m_command_scheduler; }
 	PipelineCache&      GetPipelineCache() { return m_pipeline_cache; }
-	DescriptorHeap&     GetDescriptorHeap() { return m_descriptor_heap; }
+	// Descriptor pools are externally synchronised, so each worker slot gets its own. Slot 0 is
+	// the main thread and keeps the original heap, so single-threaded behaviour is unchanged.
+	DescriptorHeap&     GetDescriptorHeap() {
+		const auto worker = CurrentDrawWorker();
+		if (worker == 0 || worker > m_worker_descriptor_heaps.size()) {
+			return m_descriptor_heap;
+		}
+		return *m_worker_descriptor_heaps[worker - 1];
+	}
+
+	// Called once the worker count is known; safe to call before any worker exists.
+	void CreateWorkerDescriptorHeaps(uint32_t worker_count);
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
@@ -67,6 +79,7 @@ private:
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
+	std::vector<std::unique_ptr<DescriptorHeap>> m_worker_descriptor_heaps;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	GpuResourceManager        m_gpu_resources;

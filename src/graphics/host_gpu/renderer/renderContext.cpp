@@ -106,4 +106,18 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	}
 }
 
+void RenderContext::CreateWorkerDescriptorHeaps(uint32_t worker_count) {
+	// worker_count includes slot 0, which uses the context's own heap; only the extra slots need
+	// their own. Idempotent so a later re-init cannot double-allocate pools.
+	const auto extra = worker_count > 0 ? worker_count - 1 : 0;
+	if (m_worker_descriptor_heaps.size() >= extra) {
+		return;
+	}
+	m_worker_descriptor_heaps.reserve(extra);
+	while (m_worker_descriptor_heaps.size() < extra) {
+		m_worker_descriptor_heaps.push_back(std::make_unique<DescriptorHeap>(
+		    m_graphics, m_command_scheduler.GetMasterSemaphore()));
+	}
+}
+
 } // namespace Libs::Graphics
