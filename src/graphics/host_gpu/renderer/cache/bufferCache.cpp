@@ -122,6 +122,23 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+void BufferCache::CreateWorkerStreamBuffers(uint32_t worker_count) {
+	const auto slots = std::min(worker_count, kMaxDrawWorkers);
+	const auto extra = slots > 0 ? slots - 1 : 0;
+	if (m_worker_stream_buffers.size() >= extra) {
+		return;
+	}
+	// 16 MiB rather than the main ring's 64: a worker ring serves its share of a frame's draws,
+	// not all of them, and running one dry costs a fallback to the normal buffer path rather than
+	// anything worse.
+	constexpr uint64_t kWorkerStreamSize = 16 * MiB;
+	m_worker_stream_buffers.reserve(extra);
+	while (m_worker_stream_buffers.size() < extra) {
+		m_worker_stream_buffers.push_back(std::make_unique<StreamBuffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Stream, kWorkerStreamSize));
+	}
+}
+
 void BufferCache::EndBatch() {
 	EXIT_IF(m_batch_depth == 0);
 	if (--m_batch_depth != 0) {

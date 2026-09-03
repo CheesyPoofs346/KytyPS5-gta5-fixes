@@ -1,6 +1,8 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
+#include <memory>
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/lruCache.h"
@@ -54,12 +56,27 @@ public:
 	// Deletions that land during a batch are recorded and applied at EndBatch, on one thread.
 	void BeginBatch() noexcept { m_batch_depth++; }
 	void EndBatch();
+
+	// Safe to call before any worker exists; idempotent.
+	void CreateWorkerStreamBuffers(uint32_t worker_count);
 	[[nodiscard]] bool BatchActive() const noexcept { return m_batch_depth != 0; }
 
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
-			case MemoryUsage::Stream: return m_stream_buffer;
+			case MemoryUsage::Stream: {
+				// One ring per worker slot. A single bump-allocated ring has one cursor, so two
+				// workers mapping concurrently would be handed overlapping regions and would
+				// silently corrupt each other's uniform data - no crash, just wrong constants.
+				// Slot 0 keeps the original 64 MiB ring, so single-threaded behaviour is
+				// unchanged; a worker ring that fills simply returns null from Map and the caller
+				// falls through to the normal buffer path.
+				const auto worker = CurrentDrawWorker();
+				if (worker == 0 || worker > m_worker_stream_buffers.size()) {
+					return m_stream_buffer;
+				}
+				return *m_worker_stream_buffers[worker - 1];
+			}
 			case MemoryUsage::Download: return m_download_buffer;
 			case MemoryUsage::DeviceLocal: return m_device_buffer;
 		}
@@ -124,6 +141,7 @@ private:
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
+	std::vector<std::unique_ptr<StreamBuffer>>         m_worker_stream_buffers;
 	TextureCache&                                     m_texture_cache;
 	std::vector<BufferId>                             m_retired_in_batch;
 	uint32_t                                          m_batch_depth        = 0;

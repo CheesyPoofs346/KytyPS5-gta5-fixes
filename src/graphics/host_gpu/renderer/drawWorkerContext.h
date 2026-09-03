@@ -12,6 +12,11 @@ namespace Libs::Graphics {
 // stream-buffer rings - are held one per slot and selected through this. Threading the index
 // through every call site instead would touch the whole draw path for no behavioural gain, and
 // the draw path is already ~40 functions deep.
+// Capped rather than "one per hardware thread": every slot costs a descriptor pool, a command
+// pool and a stream ring, and the stream rings are host-visible memory. Eight bounds that at
+// 112 MiB of extra rings while still giving 8-way parallelism across a ~12 us draw.
+inline constexpr uint32_t kMaxDrawWorkers = 8;
+
 inline thread_local uint32_t t_draw_worker_index = 0;
 
 [[nodiscard]] inline uint32_t CurrentDrawWorker() noexcept {
