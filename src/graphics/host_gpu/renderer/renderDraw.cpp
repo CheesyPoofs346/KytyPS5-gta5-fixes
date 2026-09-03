@@ -73,6 +73,18 @@ struct OpenSecondaryBatch {
 
 thread_local OpenSecondaryBatch g_secondary_batch;
 
+// Clears the recording flag on every exit path. ExecutePreparedDraw returns early in several
+// places after the batch has been joined - shader-skip filters among them - and a flag set by
+// hand there stays set forever: every later flush is suppressed, and the next batch tries to
+// begin a secondary on a worker that never stopped recording.
+class ScopedBatchRecording {
+public:
+	ScopedBatchRecording() { g_secondary_batch.recording = true; }
+	~ScopedBatchRecording() { g_secondary_batch.recording = false; }
+	ScopedBatchRecording(const ScopedBatchRecording&)            = delete;
+	ScopedBatchRecording& operator=(const ScopedBatchRecording&) = delete;
+};
+
 // The state the last flush opened a pass with, and whether there was one.
 //
 // A pass clears when the guest asked it to, and CommandBuffer::BeginRendering only honours that
@@ -1801,6 +1813,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// emitted by CommitBindings before BeginRendering rather than moved here.
 	const bool        secondary = Config::SecondaryRecordEnabled();
 	vk::CommandBuffer record    = vk_buffer;
+	std::optional<ScopedBatchRecording> batch_recording;
 	if (secondary) {
 		auto& pool = m_context.GetDrawWorkerPool(Config::DrawWorkerCount());
 		SecondaryRenderingFormats formats {};
@@ -1838,8 +1851,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			DynState() = {};
 		}
 		batch.draws++;
-		batch.recording = true;
-		record          = batch.buffer;
+		record = batch.buffer;
+		batch_recording.emplace();
 	}
 
 	DrawPhaseTimer commit_timer(DrawPhase::Commit);
@@ -1968,7 +1981,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		begin_rendering_timer.Stop();
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
-		g_secondary_batch.recording = false;
 	}
 
 	if (set_auto_debug) {
