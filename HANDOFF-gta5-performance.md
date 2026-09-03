@@ -404,6 +404,60 @@ something renders wrong.
 
 ---
 
+## 11b. Landed after the handoff was written (2026-09-02, all UNMEASURED)
+
+Four commits on `perf-occlusion-fix`. Every one builds, the suite is still 53 ok with only the
+pre-existing `UnifiedTextureCacheFlow` failure, and **not one of them has a frame-time number
+yet** - they all need the run in section 12.
+
+| commit | what | default |
+|---|---|---|
+| `24dcfdb` | descriptor cache made safe to enable | still OFF |
+| `322afff` | `--hw-check` toggle + F7 A/B cycle | hw-check ON (unchanged) |
+| `171f38f` | duplicate validation + duplicate buffer decode removed | active |
+| `7e980c3` | SRT memo no longer cleared per draw | active |
+
+### `24dcfdb` - why --cache-descriptors was corrupting
+
+`MaterializeResources` (3.80 us/draw, the largest single stage) already had a
+dependency-validated cache. Its recorder had three holes, all landmine 2:
+
+1. **A memo hit recorded nothing.** Shared subexpressions are the common case - descriptors hang
+   off the same SRT root - so the second descriptor cached with an empty dependency set and
+   revalidated as "unchanged" forever. Test `DescriptorCacheSharedSubtree` reproduces it and was
+   watched failing before the fix.
+2. Reads through `read_memory` were neither recorded nor marked uncacheable (latent: null on the
+   draw path today).
+3. `ReadConst` on a clean flat slot delegates to the clean evaluator, whose reads land in ITS
+   dependency set.
+
+Also fixed a false-*invalidation* bug that would have hidden any win: slot values were stored in
+read order and compared in ascending-bit order. Cache shrunk 2048 -> 256 entries (~600 KB ->
+~118 KB) because of the 24 KB vs 6 KB lesson already in this file.
+
+### `7e980c3` - the memo was memset before every draw
+
+256 slots value-initialized per Evaluator, twice per draw, consulted or not. Now thread-local
+arenas retired by a generation stamp. No entry survives into another evaluation, so this is NOT
+the cross-draw memo reuse that caused red blobs. Breaking the stamp deliberately makes the suite
+segfault, which is how the guard was verified rather than assumed.
+
+### How to measure all of it in one drive - F7
+
+F6 and its five documented steps are untouched. F7 is new and cycles four steps:
+
+```
+step 0 baseline (cache off, hw-check on) | 1 descriptor cache ON
+step 2 hw-check OFF                      | 3 cache ON + hw-check OFF
+```
+
+Same rules as F6: **hold each step 25-30 seconds**, discard the first 2 frames after each toggle.
+`DescriptorCacheCensus` prints hit rate every 200k lookups - a cache that never hits and a cache
+that helps look identical in fps if you only read fps.
+
+`--hw-check false` also gates the duplicate `ValidateResourceSpecialization` removed in
+`171f38f`, so step 2 measures both pieces of per-draw validation together.
+
 ## 12. If you do one thing
 
 Ask the user for one city drive, read `IndirectMultiCensus` and the tile-memo effect on
