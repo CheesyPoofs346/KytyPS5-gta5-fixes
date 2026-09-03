@@ -233,3 +233,71 @@ Run 2 is purely a correctness check. If anything renders differently with `--def
 the staged layout does not match what `Transit` would have produced, and `binding.layout` is the
 first thing to look at. Validation now survives the title's three pre-existing faults and stays
 fatal only for secondary command buffer errors, which is the class this work can break.
+
+---
+
+# Update 2026-09-03 late — both remaining blockers cleared
+
+Tests **53 ok**, builds clean, no game launched.
+
+## The staging rule changed, and that is the important part
+
+Deferral used to be controlled by a flag, which meant every consumer of a staged upload had to be
+found and drained. That failed twice. The failing test shows why it was never going to work: it
+calls `ObtainBuffer` and then records a `copyBuffer` from that buffer on the raw handle. A
+"consumer" is anyone who obtains a resource and then records against it - an unbounded set.
+
+Staging now keys on **who is running**, not on a flag:
+
+```
+MustStageForWorker()  ->  t_draw_worker_index != 0
+```
+
+- A main-thread caller records inline, exactly as it always has. No consumer can be surprised,
+  and no enumeration is needed.
+- A worker always stages, which is the property correctness actually depends on.
+- The `--defer-uploads` / `--defer-transitions` flags remain as force-on overrides, for testing
+  the staged paths deliberately.
+
+This is what closes the `--defer-uploads` blocker: there was never a single missing consumer to
+find.
+
+## Texture clears staged
+
+Both sites (`ClearImageFromBuffer`, and the DCC metadata clear) end the render pass, transition
+the image to TransferDst and clear it - three recordings into the primary from the resolve path.
+They now stage a `PendingClear`, and `TextureCache::FlushPendingClears` records them in the batch
+pre-pass.
+
+Pre-pass order is now: **clears, then transitions, then buffer uploads.** Clears write images that
+the transitions afterwards put into their sampled layout, so the order is load-bearing.
+
+## Where that leaves parallel resolution
+
+Everything that recorded into the primary from the per-draw resolve path is now stageable:
+
+| what | status |
+|---|---|
+| image layout transitions (`CommitBindings`) | staged, `9642fcc` |
+| texture clears (2 sites) | staged, `c0a0c97` |
+| buffer uploads (`SynchronizeBuffer`) | staged, `c3a9111` + `c0a0c97` |
+
+Remaining before resolution can move to `ParallelFor`:
+
+1. **`SynchronizeBuffer` still calls `EndRendering` on the immediate path.** Harmless on the main
+   thread; on a worker it must not run at all. Verify the staged path never reaches it.
+2. **Texture cache spinlock** (`m_lock`) is taken during resolution. It is a lock, so it is safe,
+   but eight workers contending on one spinlock will not scale - it wants the same treatment the
+   page table got (reader-writer, deferred writes).
+3. **`AcquireRenderTargets`** has not been audited for primary-buffer recording at all. It is
+   0.575 us/draw of the resolve path and it is the last unexamined piece.
+
+Only after those three does `ParallelFor` over resolution make sense. Wiring it before then gives
+eight threads racing on a spinlock and recording into one primary, which renders as corruption
+rather than erroring.
+
+## Test plan unchanged from the previous section
+
+The two runs listed above still stand. Nothing in this update changes behaviour on the main
+thread, so runs 1 and 2 should behave exactly as they would have before it - which is itself the
+thing to confirm first.
