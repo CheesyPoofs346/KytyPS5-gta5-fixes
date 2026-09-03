@@ -1,3 +1,4 @@
+#include <array>
 #include "SDL.h"
 #include "SDL_error.h"
 #include "SDL_events.h"
@@ -822,6 +823,24 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 			                          vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation);
 			break;
 		default: severity_str = "?";
+	}
+
+	// Pre-existing shader-generation faults in the title, not renderer faults. They abort the
+	// session the moment validation is on, which costs the only tool that reliably finds the
+	// renderer's own bugs - so they are reported loudly and survived rather than fatal.
+	//
+	// Deliberately a named list, not a severity downgrade: everything else validation calls an
+	// error stays fatal, including anything the batching or worker paths get wrong.
+	static constexpr std::array kNonFatalValidationIds {
+	    "VUID-RuntimeSpirv-OpEntryPoint-08743",
+	};
+	if (error && callback_data->pMessageIdName != nullptr) {
+		for (const auto* id: kNonFatalValidationIds) {
+			if (std::strcmp(callback_data->pMessageIdName, id) == 0) {
+				error = false;
+				break;
+			}
+		}
 	}
 
 	if (error) {
