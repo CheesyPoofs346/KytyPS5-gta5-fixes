@@ -815,6 +815,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 
 		uint32_t packet_dw = 0;
 		if (packet_is_draw) {
+			// Built here, before the draw runs, because this is the last point at which the
+			// registers still describe THIS draw. Behind the profile flag until workers consume
+			// it, so it costs nothing by default.
+			if (g_draw_profile.active && GetScheduler().Active()) {
+				DrawPhaseTimer snapshot_timer(DrawPhase::Snapshot);
+				auto&          buffer = CurrentBuffer();
+				if (!buffer.IsInvalid()) {
+					const auto before = m_snapshot_cache.SnapshotsBuilt();
+					m_snapshot_cache.Acquire(buffer.GetRegisters(), buffer.GetUserConfig(),
+					                         buffer.GetShaders());
+					g_draw_profile.snapshots_built += m_snapshot_cache.SnapshotsBuilt() - before;
+				}
+			}
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		} else {
 			DrawPhaseTimer packet_timer(DrawPhase::Pm4NonDraw);
