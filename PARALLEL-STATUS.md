@@ -301,3 +301,88 @@ rather than erroring.
 The two runs listed above still stand. Nothing in this update changes behaviour on the main
 thread, so runs 1 and 2 should behave exactly as they would have before it - which is itself the
 thing to confirm first.
+
+---
+
+# Update 2026-09-03 night — all three blockers addressed (`da67b26`)
+
+Tests **53 ok**, builds clean, no game launched.
+
+## 1. AcquireRenderTargets — it does record
+
+Audit answer: yes. `image.Transit(..., buffer.Handle())` for both the colour and the depth
+attachment, on the per-draw resolve path. Both now stage through the same `PendingTransition`
+list as `CommitBindings`. The attachment layout written into the RenderState is the one being
+requested, which is what `BeginRendering` has to agree with either way.
+
+That was the last unexamined piece of the resolve path.
+
+## 2. SynchronizeBuffer / RecordUpload — assert, not a branch
+
+`RecordUpload` records and ends the render pass. A worker reaching it would close a pass another
+thread is recording into, which corrupts silently rather than failing, so it is now
+`EXIT_IF(MustStageForWorker())`. Workers stage; the invariant is enforced rather than assumed.
+Also removed the now-redundant `EndRendering` in `FlushPendingUploads`.
+
+## 3. Texture cache lock — a reader-writer lock is the wrong tool here
+
+This one did not go as planned, and the audit is the reason. `FindTexture` mutates on **every**
+call, not only on a miss:
+
+```
+TouchImage(image);                       // LRU write
+if (desc.type == Storage) image.MarkGpuModified();
+RefreshImage(id, desc);
+image.usage.storage = true;
+```
+
+There is no read-only hit path, so a shared lock has nothing to take the shared side for - every
+caller ends up exclusive and the conversion buys nothing while costing a delicate rewrite of
+eight find-or-create functions.
+
+The useful equivalent of what the page table got is deferring the **writes**, which is what was
+done: `TouchImage` now records per worker and merges on the main thread, mirroring `TouchBuffer`.
+That removes the highest-frequency write on the resolve path.
+
+**Still exclusive, and correctly so:** the find-or-create bodies themselves. Making those
+concurrent means double-checked lookup plus exclusive create, per function, and that is the piece
+that genuinely needs a run to validate - it is the riskiest cache in the renderer and its failure
+mode is corruption, not an error.
+
+## State of the resolve path
+
+Everything that recorded into the primary from resolve is now staged or asserted:
+
+| path | status |
+|---|---|
+| `CommitBindings` transitions | staged |
+| `AcquireRenderTargets` colour + depth transitions | staged (`da67b26`) |
+| texture clears, both sites | staged |
+| buffer uploads | staged, worker path asserted |
+| texture LRU touches | deferred per worker |
+
+## What remains before ParallelFor over resolution
+
+1. **Find-or-create bodies still take the exclusive spinlock.** Eight workers will serialise
+   there. It is correct, just not scalable - and it is the next real piece of work.
+2. **Nothing has run with workers actually executing resolve.** Every staging path above is
+   currently dormant, because `MustStageForWorker()` is false on the main thread and resolution
+   is still serial. They are written and compiled but have never executed.
+
+That second point is the honest headline: the machinery is in place and green, and none of the
+worker paths have run once. The first run with resolution on workers is where they get exercised
+for the first time, so expect that to be the debugging session, not a measurement session.
+
+## Test plan when you return — unchanged, still the right order
+
+```bash
+# 1. the 8-wide SRT walk, which has still never actually run 8-wide
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true --draw-workers 8
+
+# 2. correctness of the staged paths, forced on, with validation
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true               --draw-workers 8 --defer-transitions true --vulkan-validation true
+```
+
+Run 2 forces the staged paths on the main thread, which is the only way to exercise them before
+resolution moves to workers. If it renders identically to run 1, the staging is correct and the
+remaining work is purely the find-or-create locking.
