@@ -193,7 +193,10 @@ vk::CommandBuffer DrawWorkerPool::BeginSecondary(uint32_t                       
 	// The primary may have an occlusion query running when this secondary is executed, so the
 	// secondary has to declare that it inherits one. Paired with the inheritedQueries feature.
 	inheritance.occlusionQueryEnable = VK_TRUE;
-	inheritance.queryFlags           = vk::QueryControlFlagBits::ePrecise;
+	// No flags, matching how the primary begins it (occlusionQueries.cpp: beginQuery with an empty
+	// QueryControlFlags). Precise would additionally require the occlusionQueryPrecise feature,
+	// and the count the guest reads does not need it.
+	inheritance.queryFlags           = vk::QueryControlFlags {};
 
 	vk::CommandBufferBeginInfo begin {};
 	begin.sType = vk::StructureType::eCommandBufferBeginInfo;
