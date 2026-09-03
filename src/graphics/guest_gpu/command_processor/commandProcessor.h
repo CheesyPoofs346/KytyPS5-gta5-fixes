@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/renderer/drawStateSnapshot.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
@@ -157,11 +158,15 @@ private:
 
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	// Immutable per-draw copy of the guest register file, rebuilt only when a register-writing
+	// packet has landed. Workers cannot read the live registers: ingest keeps moving them.
+	DrawStateSnapshotCache& SnapshotCache() noexcept { return m_snapshot_cache; }
 	void                CheckBuffer() const { GetScheduler().CheckActive(); }
 	GpuResourceManager& GetGpuResources() const { return m_renderer.GetGpuResources(); }
 
 	OcclusionQueries m_occlusion;
 	RenderContext&   m_renderer;
+	DrawStateSnapshotCache m_snapshot_cache;
 	HW::Context      m_ctx;
 	HW::Context      m_saved_ctx;
 	bool             m_context_state_pushed = false;

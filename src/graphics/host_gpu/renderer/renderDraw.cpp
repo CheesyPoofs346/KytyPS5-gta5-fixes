@@ -1387,7 +1387,11 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 
-	if (Config::ParallelResolveEnabled() && state.ps_active) {
+	// Lookup is locked, resolution is not. The default path used to call GetVertexProgram, which
+	// holds PipelineCache::m_mutex across the whole SRT walk - 3.4 us/draw, 26% of the draw, spent
+	// inside a lock that shader compilation on other threads also wants. Splitting it is a
+	// prerequisite for any parallel recording, and costs nothing single-threaded.
+	if (state.ps_active) {
 		// Locate both permutations first (cheap, locked). Vertex lookup publishes
 		// vs_input_info.stage.program, which is all pixel preparation needs - so pixel params can
 		// be built before either stage's resources are resolved. The two resolutions are then
@@ -1417,7 +1421,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool
 				constexpr size_t kWorthDispatching = 6;
 
 				bool       vs_ok      = false;
-				const bool dispatched = vs_resources >= kWorthDispatching &&
+				const bool dispatched = Config::ParallelResolveEnabled() &&
+				                        vs_resources >= kWorthDispatching &&
 				                        ResolveWorker::Instance().Dispatch([&] {
 					vs_ok = pipeline_cache.ResolveVertexResources(vs_program, vs_params,
 					                                              state.vs_input_info);

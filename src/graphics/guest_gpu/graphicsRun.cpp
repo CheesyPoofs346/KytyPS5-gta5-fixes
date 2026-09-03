@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "graphics/host_gpu/renderer/drawProfile.h"
+#include "graphics/host_gpu/renderer/drawStateSnapshot.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -793,12 +794,25 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 		// ~3 us/draw of frame time sits outside DrawIndex and has never been profiled. Draw and
 		// dispatch packets are timed by their own phases, so only the rest is charged here:
 		// register writes, waits, sync, everything between one draw and the next.
+		// IT_INDIRECT_BUFFER recurses into another command buffer, so its timer would span every
+		// packet inside it while those packets are timed too. That nesting is what made this phase
+		// report 670 us/draw. Excluded along with draws, which have their own phases.
 		const bool packet_is_draw =
+		    opcode == Pm4::IT_INDIRECT_BUFFER || opcode == Pm4::IT_INDIRECT_BUFFER_CNST ||
 		    opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
 		    opcode == Pm4::IT_DRAW_INDEX_AUTO || opcode == Pm4::IT_DRAW_INDIRECT ||
 		    opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDIRECT_MULTI ||
 		    opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI || opcode == Pm4::IT_DISPATCH_DIRECT ||
 		    opcode == Pm4::IT_DISPATCH_INDIRECT;
+		// Every path that writes the guest register file. A worker resolving a draw must not read
+		// registers that a later packet has already moved, so a draw's state is snapshotted
+		// whenever one of these has landed since the previous snapshot.
+		const bool packet_writes_registers =
+		    opcode == Pm4::IT_SET_CONTEXT_REG || opcode == Pm4::IT_SET_SH_REG ||
+		    opcode == Pm4::IT_SET_UCONFIG_REG || opcode == Pm4::IT_SET_UCONFIG_REG_INDEX ||
+		    opcode == Pm4::IT_SET_CONTEXT_REG_INDIRECT || opcode == Pm4::IT_SET_SH_REG_INDIRECT ||
+		    opcode == Pm4::IT_SET_UCONFIG_REG_INDIRECT || opcode == Pm4::IT_CLEAR_STATE;
+
 		uint32_t packet_dw = 0;
 		if (packet_is_draw) {
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
@@ -807,6 +821,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 			packet_timer.Stop();
 			g_draw_profile.pm4_packets++;
+		}
+		if (packet_writes_registers) {
+			m_snapshot_cache.MarkRegistersDirty();
 		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
