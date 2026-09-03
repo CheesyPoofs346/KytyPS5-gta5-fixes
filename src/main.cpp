@@ -350,6 +350,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--parallel-resolution") {
+			if (!ParseBool(value, options.config.parallel_resolution)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--defer-transitions") {
 			if (!ParseBool(value, options.config.defer_transitions)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

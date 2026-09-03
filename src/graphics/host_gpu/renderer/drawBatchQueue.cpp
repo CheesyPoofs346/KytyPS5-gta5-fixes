@@ -85,7 +85,9 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 		    &snapshot.context, &snapshot.user_config, &snapshot.shaders});
 	};
 
-	const auto workers = Config::DrawWorkerCount();
+	// Opt-in. Off, the drain is a plain serial walk of the queue and the main-thread path is
+	// byte-for-byte what it was before any of this existed.
+	const auto workers = Config::ParallelResolutionEnabled() ? Config::DrawWorkerCount() : 1u;
 	if (workers > 1) {
 		// Phase 1, serial: locate both permutations per draw. The lookup takes the program-cache
 		// mutex, so it cannot be part of the parallel phase.
