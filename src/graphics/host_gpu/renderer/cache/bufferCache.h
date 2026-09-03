@@ -46,6 +46,16 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// Ownership rule for parallel resolve: while a batch is open, no Buffer is destroyed.
+	//
+	// CreateBuffer merges overlapping ranges and deletes what it subsumes, and GC deletes by age.
+	// Either can free a Buffer that another worker is holding a pointer into - the addresses
+	// themselves are stable (SlotVector stores a deque), so destruction is the whole hazard.
+	// Deletions that land during a batch are recorded and applied at EndBatch, on one thread.
+	void BeginBatch() noexcept { m_batch_depth++; }
+	void EndBatch();
+	[[nodiscard]] bool BatchActive() const noexcept { return m_batch_depth != 0; }
+
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -115,6 +125,8 @@ private:
 	StreamBuffer                                      m_download_buffer;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
+	std::vector<BufferId>                             m_retired_in_batch;
+	uint32_t                                          m_batch_depth        = 0;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;

@@ -109,11 +109,34 @@ void BufferCache::DeleteBuffer(BufferId id) {
 		return;
 	}
 	Unregister(id);
+	// Unregister already marks the buffer deleted and takes it out of the lookup structures, so
+	// nothing new can find it. Only the destruction is held back.
+	if (m_batch_depth != 0) {
+		m_retired_in_batch.push_back(id);
+		return;
+	}
 	if (m_scheduler.Active()) {
 		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
 	} else {
 		m_slot_buffers.erase(id);
 	}
+}
+
+void BufferCache::EndBatch() {
+	EXIT_IF(m_batch_depth == 0);
+	if (--m_batch_depth != 0) {
+		return;
+	}
+	// Deferred rather than erased directly: the GPU may still be reading these, which is the same
+	// reason DeleteBuffer defers outside a batch.
+	for (const auto id: m_retired_in_batch) {
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		} else {
+			m_slot_buffers.erase(id);
+		}
+	}
+	m_retired_in_batch.clear();
 }
 
 std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& copy) {
@@ -759,7 +782,11 @@ void BufferCache::RunGarbageCollector() {
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 		Unregister(id);
-		m_slot_buffers.erase(id);
+		if (m_batch_depth != 0) {
+			m_retired_in_batch.push_back(id);
+		} else {
+			m_slot_buffers.erase(id);
+		}
 	}
 }
 
