@@ -2496,6 +2496,9 @@ void FlushSecondaryBatch(RenderContext& context) {
 	// Staged work is recorded here, before the render pass opens and therefore before any draw in
 	// this batch executes. Resolve only stages it; this is the serial phase that applies it, in
 	// the order it was requested.
+	// Order matters: clears transition images to TransferDst and write them, so they run before
+	// the transitions that put those images into their sampled layout for the draws.
+	context.GetTextureCache().FlushPendingClears();
 	context.GetRenderExecutor().FlushPendingTransitions(context.GetCommandScheduler().Current());
 	context.GetBufferCache().FlushPendingUploads();
 

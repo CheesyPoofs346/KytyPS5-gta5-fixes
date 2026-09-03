@@ -535,7 +535,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source && !Config::DeferUploadsEnabled()) {
+	if (source && !Config::DeferUploadsEnabled() && !MustStageForWorker()) {
 		// Immediate path, unchanged and still the default. Deferral is correct only if every
 		// consumer of an upload drains the list first, and enumerating those by hand missed one
 		// (RenderExecutorColorVolumeDiscovery caught it), so it stays behind a flag until a run

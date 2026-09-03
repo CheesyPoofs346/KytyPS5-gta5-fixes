@@ -92,6 +92,23 @@ public:
 	void ProcessDownloadImages();
 	void RunGarbageCollector();
 
+	// A clear an image needs, staged rather than recorded.
+	//
+	// Both clear sites end the render pass, transition the image to TransferDst and then clear -
+	// three recordings into the primary, reached from the per-draw resolve path. Same reason as
+	// image transitions and buffer uploads: a worker may not record there.
+	struct PendingClear {
+		ImageId                    image_id {};
+		vk::ImageSubresourceRange  range {};
+		vk::ClearColorValue        color {};
+		vk::ClearDepthStencilValue depth_stencil {};
+		bool                       is_depth = false;
+	};
+
+	// Records every staged clear, in request order. Main thread only.
+	void               FlushPendingClears();
+	[[nodiscard]] bool HasPendingClears() const noexcept { return !m_pending_clears.empty(); }
+
 private:
 	enum class TransferDirection { Upload, Download };
 	struct ColorTransferPlan;
@@ -187,6 +204,7 @@ private:
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
+	std::vector<PendingClear>                         m_pending_clears;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;

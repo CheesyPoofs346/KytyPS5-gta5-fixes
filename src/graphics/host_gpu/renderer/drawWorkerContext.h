@@ -23,6 +23,19 @@ inline thread_local uint32_t t_draw_worker_index = 0;
 	return t_draw_worker_index;
 }
 
+// Work that records into the primary command buffer must be staged when it originates on a
+// worker, and need not be when it originates on the main thread.
+//
+// This replaces trying to enumerate the consumers of a staged upload. That failed twice: a
+// consumer is anyone who obtains a resource and then records commands touching it, which is
+// unbounded - the test that caught it does exactly that, obtaining a buffer and immediately
+// recording a copyBuffer from it. A main-thread caller sees the recording happen inline, as it
+// always has, so no consumer can be surprised. Only workers stage, and the batch flush drains
+// their staged work on the main thread before any of it is replayed.
+[[nodiscard]] inline bool MustStageForWorker() noexcept {
+	return t_draw_worker_index != 0;
+}
+
 // Scoped so a worker slot cannot leak past the batch that set it - a stale index would silently
 // point a later main-thread draw at a worker's pool.
 class ScopedDrawWorker {

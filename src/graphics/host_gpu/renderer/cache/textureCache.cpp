@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/assert.h"
@@ -1608,21 +1609,60 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			EXIT("TextureCache: image clear retained guest ownership\n");
 		}
 	}
-	command.EndRendering();
-	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
-	              command.Handle());
 	const vk::ImageSubresourceRange range {aspect, 0, VK_REMAINING_MIP_LEVELS, 0,
 	                                       image.backing.layers};
-	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &color_clear, 1, &range);
+	if (MustStageForWorker()) {
+		PendingClear pending {};
+		pending.image_id      = selected;
+		pending.range         = range;
+		pending.is_depth      = aspect != vk::ImageAspectFlagBits::eColor;
+		pending.color         = color_clear;
+		pending.depth_stencil = vk::ClearDepthStencilValue {depth_clear, stencil_clear};
+		m_pending_clears.push_back(pending);
 	} else {
-		const vk::ClearDepthStencilValue clear {depth_clear, stencil_clear};
-		command.Handle().clearDepthStencilImage(
-		    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+		command.EndRendering();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+		              command.Handle());
+		if (aspect == vk::ImageAspectFlagBits::eColor) {
+			command.Handle().clearColorImage(image.backing.image,
+			                                 vk::ImageLayout::eTransferDstOptimal, &color_clear, 1,
+			                                 &range);
+		} else {
+			const vk::ClearDepthStencilValue clear {depth_clear, stencil_clear};
+			command.Handle().clearDepthStencilImage(
+			    image.backing.image, vk::ImageLayout::eTransferDstOptimal, &clear, 1, &range);
+		}
 	}
 	CommitGpuWrite(image);
 	return true;
+}
+
+void TextureCache::FlushPendingClears() {
+	if (m_pending_clears.empty()) {
+		return;
+	}
+	auto& command = m_scheduler.Current();
+	// Clears are transfers, so the pass has to be closed - which is why staging these matters:
+	// doing it inline from a worker would end a render pass another thread is recording into.
+	command.EndRendering();
+	const auto native = command.Handle();
+	for (const auto& pending: m_pending_clears) {
+		auto* image = m_slot_images.try_get(pending.image_id);
+		if (image == nullptr) {
+			continue;   // retired between staging and flush
+		}
+		image->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		               {}, native);
+		if (pending.is_depth) {
+			native.clearDepthStencilImage(image->backing.image,
+			                              vk::ImageLayout::eTransferDstOptimal,
+			                              &pending.depth_stencil, 1, &pending.range);
+		} else {
+			native.clearColorImage(image->backing.image, vk::ImageLayout::eTransferDstOptimal,
+			                       &pending.color, 1, &pending.range);
+		}
+	}
+	m_pending_clears.clear();
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
@@ -2168,17 +2208,25 @@ bool TextureCache::MaterializeDccMetaClear(ImageId id, Image& image, const Image
 	                               desc.view_info.layer_count, clear_value, false)) {
 		return false;
 	}
-	auto& command = m_scheduler.Current();
-	command.EndRendering();
-	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
-	              ImageSubresourceRange {desc.view_info.base_level, desc.view_info.level_count,
-	                                     desc.view_info.base_layer, desc.view_info.layer_count},
-	              command.Handle());
 	const vk::ImageSubresourceRange range {
 	    vk::ImageAspectFlagBits::eColor, desc.view_info.base_level, desc.view_info.level_count,
 	    desc.view_info.base_layer, desc.view_info.layer_count};
-	command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-	                                 &clear_value, 1, &range);
+	if (MustStageForWorker()) {
+		PendingClear pending {};
+		pending.image_id = id;
+		pending.range    = range;
+		pending.color    = clear_value;
+		m_pending_clears.push_back(pending);
+	} else {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+		              ImageSubresourceRange {desc.view_info.base_level, desc.view_info.level_count,
+		                                     desc.view_info.base_layer, desc.view_info.layer_count},
+		              command.Handle());
+		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                                 &clear_value, 1, &range);
+	}
 	if (!ResolveDccMetaClearLocked(metadata.range.address, desc.view_info.base_layer,
 	                               desc.view_info.layer_count, clear_value, true)) {
 		EXIT("TextureCache: failed to consume materialized DCC clear\n");

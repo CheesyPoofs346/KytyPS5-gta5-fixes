@@ -1323,7 +1323,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				target_access = vk::AccessFlagBits2::eShaderRead;
 			}
 
-			if (Config::DeferTransitionsEnabled()) {
+			if (Config::DeferTransitionsEnabled() || MustStageForWorker()) {
 				m_pending_transitions.push_back(PendingTransition {
 				    descriptors.images[i].image_id, target_layout, target_access, target_range});
 				binding.layout = target_layout;
