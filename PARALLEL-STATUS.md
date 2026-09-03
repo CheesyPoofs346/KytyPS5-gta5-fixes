@@ -16,6 +16,10 @@ Written overnight 2026-09-03. Everything below compiles and links; tests are 53 
 
 # 3. deferred translation through the collection queue, drained in guest order
 ./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true
+
+# 4. only if you want to help finish the upload work - EXPECTED TO BE WRONG somewhere,
+#    this is the flag whose remaining consumer has not been found yet
+./run-gta5.sh --present-mode Mailbox --secondary-record true --defer-uploads true
 ```
 
 Run 2 is the important one. Compare against last night's `--secondary-record true`, which ate
@@ -45,7 +49,38 @@ or ordering problem, and the fix is a missing flush hook.
 | `23eb846` | reader-writer lock on the page table, deferred per-worker LRU |
 | `f2c5cde` | `--draw-workers`, ownership scope tied to the batch |
 
-## Step 2 is blocked, and here is the exact reason
+## Night 2: deferred uploads built, gated off, and why
+
+`--defer-uploads` (default false) makes resolve *stage* buffer uploads instead of recording them,
+with `FlushPendingUploads` recording the list on the main thread before the batch opens its render
+pass. Both paths share one `RecordUpload`.
+
+It is off by default deliberately. Deferral is only correct if every consumer of an upload drains
+the list first, and enumerating consumers by hand failed twice in twenty minutes: the suite went
+53 -> 49 on `RenderExecutorColorVolumeDiscovery` ("upload/readback lost the final Z slice"), and
+hooking `Flush`, `FlushAndWait`, `DownloadBufferMemory` and `ReadMemoryOnGpu` still was not
+enough. Something else reads back through a path not yet found. Guessing at more hook points is
+the same mistake in a new costume, so the semantics now change only under a flag.
+
+**To finish it properly:** find the remaining consumer by running with `--defer-uploads true` and
+watching that one test, or better, invert the design - rather than enumerating consumers, make
+`CommandScheduler::Current()` drain pending uploads whenever the caller is about to record
+something that is not a batched draw. That is a chokepoint rather than a list, so it cannot miss a
+caller. It needs a re-entry guard, since `RecordUpload` calls `Current()` itself.
+
+## Step 2 is still blocked, and buffers were only half of it
+
+Even with uploads deferred, `ParallelFor` cannot be wired: **`textureCache` records into the
+primary during resolve as well** - three `m_scheduler.Current()` sites covering image uploads,
+clears and barriers, all reachable from `RebindImages`/`ResolveTexture` on the per-draw path.
+Texture uploads need the same staging treatment as buffer uploads before any resolve work can
+leave the main thread.
+
+So the remaining order is: finish the buffer-upload chokepoint, do the same for texture uploads,
+then wire `ParallelFor`. Wiring it before those two would produce eight threads recording into one
+primary out of order, which renders as corruption rather than as an error.
+
+## Step 2 blocker, original evidence
 
 `ParallelFor` is not wired over draws, because resolve cannot run off the main thread as the code
 stands. `BufferCache::SynchronizeBuffer` - reached from `ObtainBuffer`, which every draw hits for
