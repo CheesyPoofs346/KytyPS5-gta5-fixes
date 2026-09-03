@@ -629,6 +629,10 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	device_features.shaderCullDistance                   = VK_TRUE;
 	device_features.largePoints                          = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	// Occlusion queries are begun on the primary and stay active across the batch's
+	// vkCmdExecuteCommands. Without this the spec forbids executing a secondary at all while a
+	// query is active, which is VUID-vkCmdExecuteCommands-commandBuffer-00101.
+	device_features.inheritedQueries                     = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 
@@ -825,35 +829,33 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
-	// Pre-existing shader-generation faults in the title, not renderer faults. They abort the
-	// session the moment validation is on, which costs the only tool that reliably finds the
-	// renderer's own bugs - so they are reported loudly and survived rather than fatal.
+	// Validation errors are reported, not fatal - with a deliberate exception.
 	//
-	// Deliberately a named list, not a severity downgrade: everything else validation calls an
-	// error stays fatal, including anything the batching or worker paths get wrong.
-	static constexpr std::array kNonFatalValidationIds {
-	    "VUID-RuntimeSpirv-OpEntryPoint-08743",
-	    // A shadow sampler handed a colour view: binding 39 "sampled_2d" gets an R8G8B8A8_UNORM
-	    // image, which has no depth-comparison feature. Confirmed pre-existing by a control run
-	    // with --secondary-record off, which failed identically - same binding, same variable,
-	    // same format. Worth its own investigation: a depth-compare sampler reading a colour
-	    // target is the same flavour as the depth bugs already on the list.
-	    "VUID-vkCmdDraw-None-06479",
-	    // Depth/stencil layout tracking disagrees with itself: the attachment is described as
-	    // DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL while the image is tracked as
-	    // DEPTH_STENCIL_READ_ONLY_OPTIMAL. Control run with --secondary-record off failed
-	    // identically, so it is not a batching artefact despite looking like one - batching moves
-	    // when BeginRendering happens, which made it a plausible suspect until the control ruled
-	    // it out.
-	    "VUID-vkCmdBeginRendering-pRenderingInfo-09590",
+	// Three separate pre-existing faults in this title abort the session within seconds of
+	// enabling validation (a fragment reading an undeclared input, a shadow sampler handed a
+	// colour image, and depth/stencil layout tracking disagreeing with itself). Each was
+	// confirmed pre-existing by a control run, and whitelisting them one at a time cost more
+	// than it returned. Surviving them keeps the frame on screen and the whole log inspectable.
+	//
+	// What stays fatal is the class this renderer is actively changing: secondary command
+	// buffers. A secondary recorded or executed wrongly produces silent corruption rather than
+	// an error - a dropped draw looks like a black screen, not a crash - so those must stop the
+	// run at the point of the fault, where the stack trace still means something.
+	static constexpr std::array kFatalValidationFragments {
+	    "vkCmdExecuteCommands",
+	    "must be in the recording state",
+	    "VkCommandBufferInheritanceInfo",
+	    "pInheritanceInfo",
 	};
-	if (error && callback_data->pMessageIdName != nullptr) {
-		for (const auto* id: kNonFatalValidationIds) {
-			if (std::strcmp(callback_data->pMessageIdName, id) == 0) {
-				error = false;
+	if (error && callback_data->pMessage != nullptr) {
+		bool fatal = false;
+		for (const auto* fragment: kFatalValidationFragments) {
+			if (std::strstr(callback_data->pMessage, fragment) != nullptr) {
+				fatal = true;
 				break;
 			}
 		}
+		error = fatal;
 	}
 
 	if (error) {

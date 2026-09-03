@@ -190,6 +190,10 @@ vk::CommandBuffer DrawWorkerPool::BeginSecondary(uint32_t                       
 	vk::CommandBufferInheritanceInfo inheritance {};
 	inheritance.sType = vk::StructureType::eCommandBufferInheritanceInfo;
 	inheritance.pNext = &rendering;
+	// The primary may have an occlusion query running when this secondary is executed, so the
+	// secondary has to declare that it inherits one. Paired with the inheritedQueries feature.
+	inheritance.occlusionQueryEnable = VK_TRUE;
+	inheritance.queryFlags           = vk::QueryControlFlagBits::ePrecise;
 
 	vk::CommandBufferBeginInfo begin {};
 	begin.sType = vk::StructureType::eCommandBufferBeginInfo;
