@@ -25,6 +25,7 @@ enum class DrawPhase : uint32_t {
 	Bindings,
 	BindPrepare,        // of which
 	BindFindBuffers,    // of which
+	BindClampRange,     // of which, inside FindBuffers
 	BindRebindBuffers,  // of which
 	BindRebindImages,   // of which
 	VertexIndex,
@@ -42,6 +43,7 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 	switch (phase) {
 		case DrawPhase::BindPrepare:
 		case DrawPhase::BindFindBuffers:
+		case DrawPhase::BindClampRange:
 		case DrawPhase::BindRebindBuffers:
 		case DrawPhase::BindRebindImages: return true;
 		default: return false;
@@ -56,6 +58,7 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::Bindings: return "PrepareGraphicsBindings";
 		case DrawPhase::BindPrepare: return "  of which PrepareBindings";
 		case DrawPhase::BindFindBuffers: return "  of which FindBuffers";
+		case DrawPhase::BindClampRange: return "    of which ClampRangeSize";
 		case DrawPhase::BindRebindBuffers: return "  of which RebindBuffers";
 		case DrawPhase::BindRebindImages: return "  of which RebindImages";
 		case DrawPhase::VertexIndex: return "vertex+index buffers";
@@ -73,6 +76,7 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 struct DrawProfileState {
 	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> cycles {};
 	uint64_t                              draws   = 0;
+	uint64_t                              buffers = 0;   // resolved buffer descriptors
 	bool                                  active  = false;
 	bool                                  started = false;
 	std::chrono::steady_clock::time_point wall_start {};
@@ -147,8 +151,9 @@ inline void DrawProfileEndDraw() {
 	}
 	const double ns_per_cycle = static_cast<double>(wall_ns) / static_cast<double>(tsc);
 	const double draws        = static_cast<double>(profile.draws);
-	std::printf("DrawProfile: %llu draws, %.2f GHz effective\n",
-	            static_cast<unsigned long long>(profile.draws), 1.0 / ns_per_cycle);
+	std::printf("DrawProfile: %llu draws, %.2f GHz effective, %.1f buffers/draw\n",
+	            static_cast<unsigned long long>(profile.draws), 1.0 / ns_per_cycle,
+	            static_cast<double>(profile.buffers) / draws);
 	double accounted = 0.0;
 	for (uint32_t i = 0; i < static_cast<uint32_t>(DrawPhase::Count); i++) {
 		const auto   phase = static_cast<DrawPhase>(i);

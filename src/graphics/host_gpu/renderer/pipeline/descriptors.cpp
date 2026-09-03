@@ -1095,7 +1095,14 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_ids.emplace_back();
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		uint64_t size = 0;
+		{
+			// Takes a mutex and binary-searches the guest range table, per buffer per stage per
+			// draw. Timed separately to see how much of FindBuffers it actually is.
+			DrawPhaseTimer clamp_timer(DrawPhase::BindClampRange);
+			size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		}
+		g_draw_profile.buffers++;
 		prepared.buffer_ids.push_back(cache.FindBuffer(address, size));
 	}
 
