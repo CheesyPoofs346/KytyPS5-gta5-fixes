@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -1021,6 +1022,7 @@ void ReturnPooledBindingStorage(PreparedBindings& prepared) {
 
 PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
 	KYTY_PROFILER_FUNCTION();
+	DrawPhaseTimer draw_phase_timer(DrawPhase::BindPrepare);
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
@@ -1071,6 +1073,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	DrawPhaseTimer draw_phase_timer(DrawPhase::BindFindBuffers);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
 	const auto& snapshot = *prepared.snapshot;
@@ -1100,6 +1103,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	DrawPhaseTimer draw_phase_timer(DrawPhase::BindRebindBuffers);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program   = *prepared.program;
 	auto&       resources = prepared.resources;
@@ -1135,6 +1139,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	DrawPhaseTimer draw_phase_timer(DrawPhase::BindRebindImages);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
 	const auto& snapshot = *prepared.snapshot;
