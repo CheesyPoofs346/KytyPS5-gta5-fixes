@@ -20,6 +20,7 @@ namespace Libs::Graphics {
 // elapsed over the measured span, so no TSC frequency is assumed.
 enum class DrawPhase : uint32_t {
 	Preamble,
+	PendingOps,          // of which
 	RenderState,
 	RefreshShaders,
 	ShaderParams,        // of which
@@ -44,6 +45,7 @@ enum class DrawPhase : uint32_t {
 
 inline bool DrawPhaseIsChild(DrawPhase phase) {
 	switch (phase) {
+		case DrawPhase::PendingOps:
 		case DrawPhase::ShaderParams:
 		case DrawPhase::ShaderMaterialize:
 		case DrawPhase::BindPrepare:
@@ -58,6 +60,7 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 inline const char* DrawPhaseName(DrawPhase phase) {
 	switch (phase) {
 		case DrawPhase::Preamble: return "preamble+checks";
+		case DrawPhase::PendingOps: return "  of which PopPendingOperations";
 		case DrawPhase::RenderState: return "PrepareDrawRenderState";
 		case DrawPhase::RefreshShaders: return "RefreshShaders";
 		case DrawPhase::ShaderParams: return "  of which PrepareProgram";

@@ -676,13 +676,16 @@ static void DrawCensusTick() {
 	if (total % 20000 != 0) {
 		return;
 	}
-	LOGF("DrawCensus: accepted=%" PRIu64 " skip_empty=%" PRIu64 " skip_metadata=%" PRIu64
+	// LOGF is silenced in this build, so this census has never printed once and the skip rate is
+	// still unknown - and skipped draws dilute every per-draw average the profiler reports.
+	std::printf("DrawCensus: accepted=%" PRIu64 " skip_empty=%" PRIu64 " skip_metadata=%" PRIu64
 	     " skip_no_vs=%" PRIu64 " skip_ge=%" PRIu64 "\n",
 	     g_draw_accepted.load(std::memory_order_relaxed),
 	     g_draw_skip_empty.load(std::memory_order_relaxed),
 	     g_draw_skip_metadata.load(std::memory_order_relaxed),
 	     g_draw_skip_no_vs.load(std::memory_order_relaxed),
 	     g_draw_skip_ge.load(std::memory_order_relaxed));
+	std::fflush(stdout);
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
@@ -1895,7 +1898,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawPhaseTimer draw_preamble_timer(DrawPhase::Preamble);
 
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		// Calls MasterSemaphore::Refresh -> vkGetSemaphoreCounterValue, a driver round trip,
+		// plus a mutex acquire, on every draw - to poll a queue that is almost always empty
+		// and a counter that only advances on submission. ~62k driver calls a second.
+		DrawPhaseTimer pending_timer(DrawPhase::PendingOps);
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -2096,7 +2105,13 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
 	DrawPhaseTimer draw_total_timer(DrawPhase::Total);
 
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		// Calls MasterSemaphore::Refresh -> vkGetSemaphoreCounterValue, a driver round trip,
+		// plus a mutex acquire, on every draw - to poll a queue that is almost always empty
+		// and a counter that only advances on submission. ~62k driver calls a second.
+		DrawPhaseTimer pending_timer(DrawPhase::PendingOps);
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
