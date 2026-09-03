@@ -1,6 +1,8 @@
 #include "graphics/host_gpu/renderer/drawBatchQueue.h"
 
 #include "common/emulatorConfig.h"
+
+#include <cstdio>
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/drawWorkerPool.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -8,11 +10,66 @@
 
 namespace Libs::Graphics {
 
+namespace {
+
+// ParallelFor pays a fixed dispatch cost per batch, so its value depends entirely on how many
+// draws a batch actually carries. If batches are being cut to a handful of draws the dispatch
+// cannot pay for itself, and that is measured here rather than assumed.
+struct DrainCensus {
+	uint64_t drains        = 0;
+	uint64_t draws         = 0;
+	uint64_t prepare_cyc   = 0;   // phase 1, serial lookup
+	uint64_t parallel_cyc  = 0;   // phase 2, the walk across workers
+	uint64_t record_cyc    = 0;   // phase 3, serial recording
+	uint64_t buckets[6]    = {};  // 1, 2-4, 5-16, 17-64, 65-255, 256
+};
+
+thread_local DrainCensus t_drain;
+
+void NoteBatchSize(size_t size) {
+	const auto bucket = size <= 1     ? 0
+	                    : size <= 4   ? 1
+	                    : size <= 16  ? 2
+	                    : size <= 64  ? 3
+	                    : size <= 255 ? 4
+	                                  : 5;
+	t_drain.buckets[bucket]++;
+}
+
+void ReportDrainCensus() {
+	if (t_drain.drains % 2000 != 0) {
+		return;
+	}
+	const auto drains = static_cast<double>(t_drain.drains);
+	const auto total  = static_cast<double>(t_drain.prepare_cyc + t_drain.parallel_cyc +
+                                           t_drain.record_cyc);
+	std::printf("DrainCensus: drains=%llu draws/batch=%.1f | phase1_prepare=%.1f%% "
+	            "phase2_walk=%.1f%% phase3_record=%.1f%% | sizes 1:%llu 2-4:%llu 5-16:%llu "
+	            "17-64:%llu 65-255:%llu 256:%llu\n",
+	            static_cast<unsigned long long>(t_drain.drains),
+	            static_cast<double>(t_drain.draws) / drains,
+	            total > 0 ? 100.0 * static_cast<double>(t_drain.prepare_cyc) / total : 0.0,
+	            total > 0 ? 100.0 * static_cast<double>(t_drain.parallel_cyc) / total : 0.0,
+	            total > 0 ? 100.0 * static_cast<double>(t_drain.record_cyc) / total : 0.0,
+	            static_cast<unsigned long long>(t_drain.buckets[0]),
+	            static_cast<unsigned long long>(t_drain.buckets[1]),
+	            static_cast<unsigned long long>(t_drain.buckets[2]),
+	            static_cast<unsigned long long>(t_drain.buckets[3]),
+	            static_cast<unsigned long long>(t_drain.buckets[4]),
+	            static_cast<unsigned long long>(t_drain.buckets[5]));
+	std::fflush(stdout);
+}
+
+} // namespace
+
 void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	if (m_draws.empty()) {
 		return;
 	}
 	m_batches++;
+	t_drain.drains++;
+	t_drain.draws += m_draws.size();
+	NoteBatchSize(m_draws.size());
 
 	// Cleared before translating so a draw that triggers a flush mid-drain cannot re-enter and
 	// translate these entries twice.
@@ -32,11 +89,13 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	if (workers > 1) {
 		// Phase 1, serial: locate both permutations per draw. The lookup takes the program-cache
 		// mutex, so it cannot be part of the parallel phase.
+		const auto prepare_start = __builtin_ia32_rdtsc();
 		for (auto& draw: draws) {
 			const auto previous = bind(draw);
 			executor.PrepareQueuedShaders(buffer, draw.prepared);
 			buffer.SwapRegisterView(previous);
 		}
+		t_drain.prepare_cyc += __builtin_ia32_rdtsc() - prepare_start;
 
 		// Phase 2, parallel: the resource walk. 3.4 us/draw and the only phase in a draw that
 		// touches no command buffer, no image layout and no cache - which is exactly why this one
@@ -45,16 +104,19 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 		// No register view is bound here on purpose: the walk reads what PrepareQueuedShaders
 		// already captured into prepared, not the live registers, so workers never race the view
 		// the serial phases swap.
+		const auto parallel_start = __builtin_ia32_rdtsc();
 		auto& pool = buffer.GetContext().GetDrawWorkerPool(workers);
 		pool.ParallelFor(static_cast<uint32_t>(draws.size()),
 		                 [&draws, &executor](uint32_t index, uint32_t worker) {
 			                 ScopedDrawWorker slot(worker);
 			                 executor.ResolveQueuedShaders(draws[index].prepared);
 		                 });
+		t_drain.parallel_cyc += __builtin_ia32_rdtsc() - parallel_start;
 	}
 
 	// Phase 3, serial: record, in guest order. A draw whose permutation needed compiling arrives
 	// with prepared.valid false and resolves inline, exactly as it did before.
+	const auto record_start = __builtin_ia32_rdtsc();
 	for (auto& draw: draws) {
 		const auto previous = bind(draw);
 		executor.DrawIndex(draw.submit_id, buffer, draw.index_type_and_size, draw.index_count,
@@ -63,6 +125,8 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 		                   draw.first_instance, draw.prepared.valid ? &draw.prepared : nullptr);
 		buffer.SwapRegisterView(previous);
 	}
+	t_drain.record_cyc += __builtin_ia32_rdtsc() - record_start;
+	ReportDrainCensus();
 }
 
 } // namespace Libs::Graphics
