@@ -64,6 +64,7 @@ struct ConfigOptions {
 	bool                   secondary_record            = false;
 	uint32_t               draw_workers                = 1;
 	bool                   draw_queue                  = false;
+	bool                   defer_uploads               = false;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -162,6 +163,7 @@ bool     DrawProfileEnabled();
 bool     SecondaryRecordEnabled();
 uint32_t DrawWorkerCount();
 bool     DrawQueueEnabled();
+bool     DeferUploadsEnabled();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();

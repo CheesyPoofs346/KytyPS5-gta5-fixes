@@ -2357,6 +2357,11 @@ void FlushSecondaryBatch(RenderContext& context) {
 	auto& pool = context.GetDrawWorkerPool(1);
 	pool.EndSecondary(batch.worker);
 
+	// Staged uploads are recorded here, before the render pass opens and therefore before any draw
+	// in this batch executes. Resolve only stages them; this is the serial phase that applies them,
+	// in the order they were requested.
+	context.GetBufferCache().FlushPendingUploads();
+
 	auto& scheduler = context.GetCommandScheduler();
 	// The render pass opens only now, so every barrier the batch's draws needed was emitted on the
 	// primary while no pass was active - which is where Vulkan requires them.

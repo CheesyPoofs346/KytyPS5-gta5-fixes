@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
@@ -178,6 +179,51 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+void BufferCache::RecordUpload(vk::Buffer destination, uint64_t destination_size,
+                               vk::Buffer source, std::span<const vk::BufferCopy> copies) {
+	auto&      command = m_scheduler.Current();
+	// Transfers cannot sit inside a render pass.
+	command.EndRendering();
+	const auto native = command.Handle();
+
+	vk::BufferMemoryBarrier before {};
+	before.sType         = vk::StructureType::eBufferMemoryBarrier;
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+	                       vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = destination;
+	before.offset              = 0;
+	before.size                = destination_size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       0, nullptr, 1, &before, 0, nullptr);
+	native.copyBuffer(source, destination, static_cast<uint32_t>(copies.size()), copies.data());
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+}
+
+void BufferCache::FlushPendingUploads() {
+	if (m_pending_uploads.empty()) {
+		return;
+	}
+	auto& command = m_scheduler.Current();
+	// Uploads are transfers, so they cannot sit inside a render pass. The batch opens its pass
+	// after this runs, which is why this no longer has to tear one open.
+	command.EndRendering();
+	const auto native = command.Handle();
+
+	for (const auto& upload: m_pending_uploads) {
+		RecordUpload(upload.destination, upload.destination_size, upload.source, upload.copies);
+	}
+	m_pending_uploads.clear();
+}
+
 void BufferCache::CreateWorkerStreamBuffers(uint32_t worker_count) {
 	const auto slots = std::min(worker_count, kMaxDrawWorkers);
 	const auto extra = slots > 0 ? slots - 1 : 0;
@@ -237,6 +283,8 @@ std::pair<uint64_t, uint64_t> BufferCache::DownloadEnvelope(const DownloadCopy& 
 }
 
 void BufferCache::DownloadBufferMemory(std::span<const DownloadCopy> copies) {
+	// Reading back what an upload was supposed to have written requires that upload to exist.
+	FlushPendingUploads();
 	KYTY_PROFILER_FUNCTION();
 	std::vector<DownloadCopy> batch;
 	batch.reserve(copies.size());
@@ -365,6 +413,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 }
 
 void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) {
+	FlushPendingUploads();
 	// CPU invalidation reaches this point only for a GPU-owned tracker page. Resolve the exact
 	// Buffer owner on the GPU thread so the cache index remains single-thread-owned.
 	if (is_write && !IsRegionRegistered(vaddr, size)) {
@@ -486,32 +535,26 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
-	if (source) {
-		auto& command = m_scheduler.Current();
-		command.EndRendering();
-		const auto native = command.Handle();
-		vk::BufferMemoryBarrier before {};
-		before.sType         = vk::StructureType::eBufferMemoryBarrier;
-		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
-		                       vk::AccessFlagBits::eTransferRead |
-		                       vk::AccessFlagBits::eTransferWrite;
-		before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
-		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		before.buffer              = buffer.Handle();
-		before.offset              = 0;
-		before.size                = buffer.Size();
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::PipelineStageFlagBits::eTransfer,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &before, 0, nullptr);
-		native.copyBuffer(source, buffer.Handle(), static_cast<uint32_t>(copies.size()),
-		                  copies.data());
-		auto after          = before;
-		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
-		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                       vk::PipelineStageFlagBits::eAllCommands,
-		                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	if (source && !Config::DeferUploadsEnabled()) {
+		// Immediate path, unchanged and still the default. Deferral is correct only if every
+		// consumer of an upload drains the list first, and enumerating those by hand missed one
+		// (RenderExecutorColorVolumeDiscovery caught it), so it stays behind a flag until a run
+		// can prove the list is complete.
+		RecordUpload(buffer.Handle(), buffer.Size(), source, copies);
+	} else if (source) {
+		// Ordering guard. Uploads are replayed as a block before the batch's draws, so an upload
+		// requested after draws are already in the batch would move ahead of them and those draws
+		// would see data they must not. Replaying the batch first keeps guest order exact. This is
+		// no worse than before: the EndRendering this replaces tore the batch unconditionally.
+		if (SecondaryBatchOpen()) {
+			FlushSecondaryBatch(m_scheduler.Context());
+		}
+		PendingBufferUpload upload {};
+		upload.source           = source;
+		upload.destination      = buffer.Handle();
+		upload.destination_size = buffer.Size();
+		upload.copies.assign(copies.begin(), copies.end());
+		m_pending_uploads.push_back(std::move(upload));
 	}
 	if (is_texel_buffer && !is_written) {
 		return SynchronizeBufferFromImage(buffer, vaddr, size);

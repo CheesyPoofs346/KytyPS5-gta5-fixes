@@ -350,6 +350,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--defer-uploads") {
+			if (!ParseBool(value, options.config.defer_uploads)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--draw-queue") {
 			if (!ParseBool(value, options.config.draw_queue)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

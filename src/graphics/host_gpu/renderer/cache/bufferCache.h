@@ -62,6 +62,32 @@ public:
 	// six times a draw, so paying it single-threaded would be a regression for no benefit.
 	void SetConcurrent(bool concurrent) noexcept { m_concurrent = concurrent; }
 
+	// An upload the GPU still needs, staged but not yet recorded.
+	//
+	// Resolve used to record barrier/copyBuffer/barrier straight into the primary, which is both
+	// something a worker thread may not do and - now that draws are batched - a tear of the open
+	// batch on every upload, because it called EndRendering to leave the render pass.
+	struct PendingBufferUpload {
+		vk::Buffer                  source;
+		vk::Buffer                  destination;
+		uint64_t                    destination_size = 0;
+		std::vector<vk::BufferCopy> copies;
+	};
+
+	// Records every staged upload into the primary, in the order they were requested. Must run on
+	// the main thread, outside a render pass, before the draws that read them.
+	void FlushPendingUploads();
+
+private:
+	// The one place upload commands are recorded, shared by the immediate and deferred paths so
+	// they cannot drift apart.
+	void RecordUpload(vk::Buffer destination, uint64_t destination_size, vk::Buffer source,
+	                  std::span<const vk::BufferCopy> copies);
+
+public:
+
+	[[nodiscard]] bool HasPendingUploads() const noexcept { return !m_pending_uploads.empty(); }
+
 	// Safe to call before any worker exists; idempotent.
 	void CreateWorkerStreamBuffers(uint32_t worker_count);
 	[[nodiscard]] bool BatchActive() const noexcept { return m_batch_depth != 0; }
@@ -154,6 +180,7 @@ private:
 	// worker on a pure read path. Each worker records its touches and EndBatch merges them.
 	std::vector<std::vector<size_t>>                  m_deferred_touch;
 	bool                                              m_concurrent = false;
+	std::vector<PendingBufferUpload>                  m_pending_uploads;
 	std::vector<BufferId>                             m_retired_in_batch;
 	uint32_t                                          m_batch_depth        = 0;
 	uint64_t                                          m_total_used_memory  = 0;

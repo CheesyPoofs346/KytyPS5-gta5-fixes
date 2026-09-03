@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/secondaryBatch.h"
 
 #include "common/assert.h"
@@ -180,19 +181,26 @@ void CommandScheduler::EndRendering() {
 }
 
 void CommandScheduler::Flush() {
-	// A batch must not outlive the command buffer that will execute it.
+	// A batch must not outlive the command buffer that will execute it, and neither may an upload
+	// the GPU has been promised.
 	FlushSecondaryBatch(m_context);
+	m_context.GetBufferCache().FlushPendingUploads();
 	SubmitInfo submit;
 	Flush(submit);
 }
 
 void CommandScheduler::Flush(SubmitInfo& submit) {
 	FlushSecondaryBatch(m_context);
+	m_context.GetBufferCache().FlushPendingUploads();
 	Submit(submit);
 	BeginNext();
 }
 
 void CommandScheduler::FlushAndWait() {
+	// Submits directly rather than through Flush, so it needs the same drains: a wait that returns
+	// before a staged upload was recorded reads memory the GPU was never given.
+	FlushSecondaryBatch(m_context);
+	m_context.GetBufferCache().FlushPendingUploads();
 	const auto tick = Submit();
 	m_master.Wait(tick);
 	BeginNext();
