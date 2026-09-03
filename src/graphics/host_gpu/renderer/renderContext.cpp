@@ -106,6 +106,17 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 	}
 }
 
+DrawWorkerPool& RenderContext::GetDrawWorkerPool(uint32_t worker_count) {
+	if (m_draw_worker_pool == nullptr) {
+		const auto slots = std::min(std::max(worker_count, 1u), kMaxDrawWorkers);
+		m_draw_worker_pool = std::make_unique<DrawWorkerPool>(
+		    m_graphics, m_command_scheduler.GetMasterSemaphore(), slots);
+		CreateWorkerDescriptorHeaps(slots);
+		GetBufferCache().CreateWorkerStreamBuffers(slots);
+	}
+	return *m_draw_worker_pool;
+}
+
 void RenderContext::CreateWorkerDescriptorHeaps(uint32_t worker_count) {
 	// worker_count includes slot 0, which uses the context's own heap; only the extra slots need
 	// their own. Idempotent so a later re-init cannot double-allocate pools.

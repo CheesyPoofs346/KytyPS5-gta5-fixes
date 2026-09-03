@@ -24,7 +24,7 @@ public:
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
-	void           BeginRendering(const RenderState& state);
+	void           BeginRendering(const RenderState& state, bool secondary_contents = false);
 	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);

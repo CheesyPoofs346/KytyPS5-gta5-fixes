@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERCONTEXT_H_
 
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
+#include "graphics/host_gpu/renderer/drawWorkerPool.h"
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -57,6 +58,10 @@ public:
 
 	// Called once the worker count is known; safe to call before any worker exists.
 	void CreateWorkerDescriptorHeaps(uint32_t worker_count);
+
+	// Created on first use. One worker means no threads are spawned: the pool runs everything on
+	// the caller, which is exactly the single-worker proof of the secondary-buffer path.
+	DrawWorkerPool& GetDrawWorkerPool(uint32_t worker_count);
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	GpuResourceManager& GetGpuResources() { return m_gpu_resources; }
 	BufferCache&        GetBufferCache() { return m_gpu_resources.GetBufferCache(); }
@@ -80,6 +85,7 @@ private:
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
 	std::vector<std::unique_ptr<DescriptorHeap>> m_worker_descriptor_heaps;
+	std::unique_ptr<DrawWorkerPool>             m_draw_worker_pool;
 	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	GpuResourceManager        m_gpu_resources;

@@ -89,7 +89,9 @@ public:
 
 	void SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0 = 0, uint32_t arg1 = 0,
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
-	void BeginRendering(const RenderState& state) const;
+	// secondary_contents: draws will arrive via vkCmdExecuteCommands rather than inline. Vulkan
+	// forbids mixing the two in one render pass instance, so this is decided per BeginRendering.
+	void BeginRendering(const RenderState& state, bool secondary_contents = false) const;
 	void EndRendering() const;
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
@@ -148,9 +150,12 @@ public:
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
+	// record_target null means record binds into buffer itself; a non-null target sends them to a
+	// secondary while barriers still go to the primary.
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings);
+	                    std::span<PreparedBindings* const> bindings,
+	                    vk::CommandBuffer                  record_target = nullptr);
 
 private:
 	struct GraphicsBindings {

@@ -1743,8 +1743,36 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x200u);
 	}
+	// Secondary recording. A secondary inherits none of the primary's bound state - not the
+	// pipeline, descriptors, vertex/index buffers or dynamic state - so everything the draw needs
+	// must be recorded into it. Only the barriers stay on the primary, which is why they are
+	// emitted by CommitBindings before BeginRendering rather than moved here.
+	const bool        secondary = Config::SecondaryRecordEnabled();
+	DrawWorkerPool*   pool      = nullptr;
+	vk::CommandBuffer record    = vk_buffer;
+	if (secondary) {
+		pool = &m_context.GetDrawWorkerPool(1);
+		SecondaryRenderingFormats formats {};
+		formats.color_count = state.color_count;
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			formats.color_formats[i] = state.color_info[i].format;
+		}
+		formats.depth_format = state.depth_info.format;
+		// A stencil buffer is present iff the target allocates one; the depth target carries a
+		// single combined format for both aspects.
+		formats.stencil_format = state.depth_info.stencil_buffer_size != 0
+		                             ? state.depth_info.format
+		                             : vk::Format::eUndefined;
+		formats.samples = vulkan_sample_count(state.color_count > 0 ? state.color_info[0].samples
+		                                                            : state.depth_info.samples);
+		record = pool->BeginSecondary(CurrentDrawWorker(), formats);
+		// The dynamic-state cache keys on the primary's recording generation, so without this it
+		// would think the secondary already has state the secondary has never been given.
+		DynState() = {};
+	}
+
 	DrawPhaseTimer commit_timer(DrawPhase::Commit);
-	CommitVertexBuffers(vk_buffer, vertex_bindings);
+	CommitVertexBuffers(record, vertex_bindings);
 	if (bindings.pixel.has_value()) {
 		if (set_auto_debug) {
 			SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
@@ -1756,18 +1784,18 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		descriptor_stages[1] = &*bindings.pixel;
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
-	               std::span {descriptor_stages.data(), descriptor_stage_count});
+	               std::span {descriptor_stages.data(), descriptor_stage_count}, record);
 	// Bindings are fully consumed by CommitBindings; hand their heap buffers back so the next
 	// draw reuses them instead of allocating ~18 fresh vectors.
 	ReturnPooledBindingStorage(bindings.vertex);
 	if (bindings.pixel) {
 		ReturnPooledBindingStorage(*bindings.pixel);
 	}
-	CommitIndexBuffer(vk_buffer, index_binding);
+	CommitIndexBuffer(record, index_binding);
 	commit_timer.Stop();
 
 	DrawPhaseTimer dyn_state_timer(DrawPhase::DynState);
-	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
+	SetGraphicsDynamicParams(buffer, record, state.color_info, state.color_count,
 	                         state.depth_info,
 	                         state.ps_active ? state.ps_input_info.mrt_output_mask : 0u, draw.index_count);
 	dyn_state_timer.Stop();
@@ -1777,15 +1805,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	DrawPhaseTimer begin_rendering_timer(DrawPhase::BeginRendering);
-	m_context.GetCommandScheduler().BeginRendering(state.rendering);
+	m_context.GetCommandScheduler().BeginRendering(state.rendering, secondary);
 	{
 		// Consecutive draws frequently reuse a pipeline even when their bindings differ, so this
 		// skips a driver call without changing what gets bound.
 		auto&      dyn = DynState();
 		const bool retarget_pipe = dyn.Retarget();
 		auto*      raw = static_cast<VkPipeline>(pipeline.pipeline);
-		if (retarget_pipe || dyn.pipeline != raw) {
-			vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		if (secondary || retarget_pipe || dyn.pipeline != raw) {
+			record.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 			dyn.pipeline = raw;
 		}
 	}
@@ -1865,7 +1893,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	DrawCensusTick();
 		begin_rendering_timer.Stop();
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
-		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
+		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
+		if (secondary) {
+			pool->EndSecondary(CurrentDrawWorker());
+			vk_buffer.executeCommands(1, &record);
+		}
 	}
 
 	if (set_auto_debug) {

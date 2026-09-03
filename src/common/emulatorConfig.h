@@ -61,6 +61,7 @@ struct ConfigOptions {
 	bool                   dyn_state_cache             = true;
 	bool                   hw_check                    = true;
 	bool                   draw_profile                = false;
+	bool                   secondary_record            = false;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -156,6 +157,7 @@ bool     CacheDescriptors();
 bool     DynStateCacheEnabled();
 bool     HwCheckEnabled();
 bool     DrawProfileEnabled();
+bool     SecondaryRecordEnabled();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();

@@ -164,8 +164,8 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 	}
 }
 
-void CommandScheduler::BeginRendering(const RenderState& state) {
-	Current().BeginRendering(state);
+void CommandScheduler::BeginRendering(const RenderState& state, bool secondary_contents) {
+	Current().BeginRendering(state, secondary_contents);
 }
 
 void CommandScheduler::EndRendering() {

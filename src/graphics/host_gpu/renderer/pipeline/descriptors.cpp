@@ -1237,9 +1237,13 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
-                                    std::span<PreparedBindings* const> prepared_bindings) {
+                                    std::span<PreparedBindings* const> prepared_bindings,
+                                    vk::CommandBuffer                  record_target) {
 	KYTY_PROFILER_FUNCTION();
 	auto   vk_buffer        = buffer.Handle();
+	// Image layout transitions and barriers must stay on the primary, outside the render pass -
+	// a secondary recorded inside one may not contain them. Only the binds follow the draw.
+	const auto record = record_target ? record_target : vk_buffer;
 	size_t descriptor_count = 0;
 	size_t write_count      = 0;
 	constexpr auto GraphicsStages =
@@ -1397,16 +1401,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			          m_push_constants.begin() + offset / sizeof(uint32_t));
 		}
 	}
-	vk_buffer.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
-	                        ShaderRecompiler::IR::NativePushConstantSize,
-	                        m_push_constants.data());
+	record.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
+	                     ShaderRecompiler::IR::NativePushConstantSize, m_push_constants.data());
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
+			record.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+			                            static_cast<uint32_t>(m_descriptor_writes.size()),
+			                            m_descriptor_writes.data());
 		} else {
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
 			for (auto& write: m_descriptor_writes) {
@@ -1415,8 +1418,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			m_context.GetGraphics().device.updateDescriptorSets(
 			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
 			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
-			                             0, nullptr);
+			record.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set, 0,
+			                          nullptr);
 		}
 	}
 	for (auto* prepared: prepared_bindings) {
