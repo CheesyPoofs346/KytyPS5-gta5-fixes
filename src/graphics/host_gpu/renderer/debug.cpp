@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <fmt/format.h>
 
@@ -83,10 +85,71 @@ void uc_print(const char* func, const HW::UserConfig& uc) {
 	     user_en.vgpr3 ? "true" : "false");
 }
 
+namespace {
+
+// Scene variance in us/draw is +/-40% between city blocks, far larger than what these checks
+// cost, so an A/B on frame time cannot resolve them. Time the functions directly instead.
+// One clock pair is charged to every sample, so the overhead is measured once and reported
+// alongside the average rather than silently inflating it.
+class ScopedCallTimer {
+public:
+	ScopedCallTimer(const char* name, std::atomic<uint64_t>& total_ns, std::atomic<uint64_t>& calls)
+	    : m_name(name), m_total(total_ns), m_calls(calls),
+	      m_start(std::chrono::steady_clock::now()) {}
+
+	~ScopedCallTimer() {
+		const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                         std::chrono::steady_clock::now() - m_start)
+		                         .count();
+		const auto n = m_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto t =
+		    m_total.fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed) + elapsed;
+		if (n % 200000 == 0) {
+			std::printf("%s: calls=%llu avg=%.1f ns (clock overhead ~%.1f ns) total=%.1f ms\n",
+			            m_name, static_cast<unsigned long long>(n),
+			            static_cast<double>(t) / static_cast<double>(n), ClockOverheadNs(),
+			            static_cast<double>(t) / 1.0e6);
+			std::fflush(stdout);
+		}
+	}
+
+	ScopedCallTimer(const ScopedCallTimer&)            = delete;
+	ScopedCallTimer& operator=(const ScopedCallTimer&) = delete;
+
+private:
+	// Cost of the two clock reads this class itself performs, so it can be subtracted.
+	static double ClockOverheadNs() {
+		static const double overhead = [] {
+			constexpr int kIterations = 20000;
+			const auto    begin       = std::chrono::steady_clock::now();
+			for (int i = 0; i < kIterations; i++) {
+				const auto a = std::chrono::steady_clock::now();
+				const auto b = std::chrono::steady_clock::now();
+				(void)std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count();
+			}
+			const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                         std::chrono::steady_clock::now() - begin)
+			                         .count();
+			return static_cast<double>(elapsed) / kIterations;
+		}();
+		return overhead;
+	}
+
+	const char*            m_name;
+	std::atomic<uint64_t>& m_total;
+	std::atomic<uint64_t>& m_calls;
+	std::chrono::steady_clock::time_point m_start;
+};
+
+} // namespace
+
 void uc_check(const HW::UserConfig& uc) {
 	if (!Config::HwCheckEnabled()) {
 		return;
 	}
+	static std::atomic<uint64_t> uc_total_ns {0};
+	static std::atomic<uint64_t> uc_calls {0};
+	ScopedCallTimer              timer("UcCheckTiming", uc_total_ns, uc_calls);
 	const auto& user_en = uc.GetGeUserVgprEn();
 
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr1 != false);
@@ -1157,6 +1220,9 @@ void hw_check(const CommandBuffer& buffer) {
 	if (!Config::HwCheckEnabled()) {
 		return;
 	}
+	static std::atomic<uint64_t> hw_total_ns {0};
+	static std::atomic<uint64_t> hw_calls {0};
+	ScopedCallTimer              timer("HwCheckTiming", hw_total_ns, hw_calls);
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);
