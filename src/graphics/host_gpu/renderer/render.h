@@ -158,7 +158,8 @@ public:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_type_and_size,
 	               uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
 	               uint32_t instance_count = 1, uint32_t render_target_slice_offset = 0,
-	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0);
+	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0,
+	               const PreparedShaders* prepared = nullptr);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count, uint32_t flags,
 	              uint32_t render_target_slice_offset = 0, uint32_t instance_count = 1,
 	              uint32_t first_vertex = 0, uint32_t first_instance = 0);
@@ -173,6 +174,14 @@ public:
 	// secondary while barriers still go to the primary.
 	// Queues a draw for later translation against the snapshot supplied, and reports whether the
 	// queue reached capacity and should be drained.
+	// Locates both shader permutations for a queued draw and fills the static half of its input
+	// info. Serial: the permutation lookup takes the program-cache mutex.
+	bool PrepareQueuedShaders(CommandBuffer& buffer, PreparedShaders& prepared);
+
+	// Runs the resource walk for an already-located pair. Safe on a worker: it reads guest memory
+	// and writes only into prepared, touching no command buffer, image or cache.
+	void ResolveQueuedShaders(PreparedShaders& prepared);
+
 	bool EnqueueDrawIndex(QueuedDraw&& draw);
 	void DrainDrawQueue(CommandBuffer& buffer);
 	[[nodiscard]] bool DrawQueueEmpty() const noexcept { return m_draw_queue.Empty(); }

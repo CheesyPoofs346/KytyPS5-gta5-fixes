@@ -2,6 +2,9 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWBATCHQUEUE_H_
 
 #include "graphics/host_gpu/renderer/drawStateSnapshot.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"   // ShaderProgram
+#include "graphics/shader/shader.h"
+#include "graphics/shader/shaderCompiler.h"
 
 #include <cstdint>
 #include <memory>
@@ -16,8 +19,31 @@ class RenderExecutor;
 //
 // The snapshot is the whole point: the packet loop keeps writing HW::Context as it ingests, so a
 // draw translated later must not read the live registers - by then they describe a later draw.
+
+// The output of the shader resolve for one draw, computed ahead of recording.
+//
+// The resolve - MaterializeResources, reached through ResolveVertex/PixelResources - is the one
+// genuinely pure phase of a draw at 3.4 us, a quarter of the total. It reads guest memory and
+// writes here, touching no command buffer, no image layout and no cache, which is what makes it
+// the only part safe to run on workers without deferring the image-transition system first.
+struct PreparedShaders {
+	ShaderParams          vs_params {};
+	ShaderParams          ps_params {};
+	ShaderVertexInputInfo vs_input_info {};
+	ShaderPixelInputInfo  ps_input_info {};
+	ShaderProgram         vertex_program {};
+	ShaderProgram         pixel_program {};
+	PipelineCache::ProgramRef vs_program_ref {};
+	PipelineCache::ProgramRef ps_program_ref {};
+	bool                  ps_active = false;
+	// False when the permutation was not found and needs compiling, which only the serial path
+	// does. Those draws fall back to resolving inline.
+	bool                  valid     = false;
+};
+
 struct QueuedDraw {
 	std::shared_ptr<const DrawStateSnapshot> snapshot;
+	PreparedShaders                          prepared;
 	uint64_t                                 submit_id                  = 0;
 	uint32_t                                 index_type_and_size        = 0;
 	uint32_t                                 index_count                = 0;

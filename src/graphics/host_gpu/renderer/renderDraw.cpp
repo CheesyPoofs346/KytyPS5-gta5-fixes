@@ -1429,7 +1429,16 @@ private:
 } // namespace
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
-                           DrawRenderState& state) {
+                           DrawRenderState& state, const PreparedShaders* prepared = nullptr) {
+	// Already resolved on a worker: the walk is the expensive half and it is done, so take the
+	// result rather than repeat it. Only a permutation that needed compiling arrives unprepared.
+	if (prepared != nullptr && prepared->valid) {
+		state.vs_input_info  = prepared->vs_input_info;
+		state.ps_input_info  = prepared->ps_input_info;
+		state.vertex_program = prepared->vertex_program;
+		state.pixel_program  = prepared->pixel_program;
+		return;
+	}
 	EXIT_IF(draw.name == nullptr);
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -2007,7 +2016,8 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                uint32_t index_type_and_size, uint32_t index_count,
                                const void* index_addr, uint32_t flags, uint32_t type,
                                uint32_t instance_count, uint32_t render_target_slice_offset,
-                               int32_t vertex_offset_add, uint32_t first_instance) {
+                               int32_t vertex_offset_add, uint32_t first_instance,
+                               const PreparedShaders* prepared) {
 	KYTY_PROFILER_FUNCTION();
 
 	DrawProfileBeginDraw();
@@ -2194,7 +2204,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		DrawProfileNoteShaders(vs_ident.es_regs.data_addr, vs_ident.gs_regs.chksum,
 		                       ps_ident.ps_regs.data_addr, ps_ident.ps_regs.chksum);
 		DrawPhaseTimer timer(DrawPhase::RefreshShaders);
-		RefreshShaders(buffer, draw, true, state);
+		RefreshShaders(buffer, draw, true, state, prepared);
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
@@ -2356,6 +2366,67 @@ bool RenderExecutor::ResolveColorTargets(uint64_t submit_id, CommandBuffer& buff
 	destination.Resolve(source, {src.base_mip_level, 1, src.base_array_layer, 1},
 	                    {dst.base_mip_level, 1, dst.base_array_layer, 1});
 	return true;
+}
+
+bool RenderExecutor::PrepareQueuedShaders(CommandBuffer& buffer, PreparedShaders& prepared) {
+	auto&       pipeline_cache = buffer.GetContext().GetPipelineCache();
+	const auto& vertex_info    = buffer.GetShaders().GetVs();
+	const auto& pixel_info     = buffer.GetShaders().GetPs();
+	const auto& shader_regs    = buffer.GetRegisters().GetShaderRegisters();
+
+	prepared.valid     = false;
+	prepared.ps_active = DrawHasActivePixelShader(buffer);
+	if (!DrawHasValidVertexShader(buffer.GetShaders())) {
+		return false;
+	}
+
+	// Colour export mapping feeds the pixel permutation key, so it has to be rebuilt here rather
+	// than read from a later stage.
+	std::array<Prospero::ColorComponentMapping, RENDER_COLOR_ATTACHMENTS_MAX> target_export_mapping {};
+
+	prepared.vs_params = pipeline_cache.PrepareVertexParams(vertex_info, shader_regs,
+	                                                        prepared.vs_input_info);
+	PipelineCache::ProgramRef vs_program;
+	if (!pipeline_cache.LookupVertexProgram(prepared.vs_params, prepared.vs_input_info,
+	                                        prepared.vertex_program, vs_program)) {
+		return false;   // needs compiling; the serial path handles that
+	}
+	if (!prepared.ps_active) {
+		prepared.vs_program_ref = vs_program;
+		prepared.valid          = true;
+		return true;
+	}
+	prepared.ps_params =
+	    pipeline_cache.PreparePixelParams(pixel_info, shader_regs, prepared.vs_input_info,
+	                                      target_export_mapping, prepared.ps_input_info);
+	PipelineCache::ProgramRef ps_program;
+	if (!pipeline_cache.LookupPixelProgram(prepared.ps_params, prepared.ps_input_info,
+	                                       prepared.pixel_program, ps_program)) {
+		return false;
+	}
+	prepared.vs_program_ref = vs_program;
+	prepared.ps_program_ref = ps_program;
+	prepared.valid          = true;
+	return true;
+}
+
+void RenderExecutor::ResolveQueuedShaders(PreparedShaders& prepared) {
+	if (!prepared.valid) {
+		return;
+	}
+	// The parallel half. Deliberately unlocked - see PipelineCache::ResolveVertexResources - and
+	// it writes only into prepared, so eight of these can run at once.
+	auto& pipeline_cache = m_context.GetPipelineCache();
+	if (!pipeline_cache.ResolveVertexResources(prepared.vs_program_ref, prepared.vs_params,
+	                                           prepared.vs_input_info)) {
+		prepared.valid = false;
+		return;
+	}
+	if (prepared.ps_active &&
+	    !pipeline_cache.ResolvePixelResources(prepared.ps_program_ref, prepared.ps_params,
+	                                          prepared.ps_input_info)) {
+		prepared.valid = false;
+	}
 }
 
 bool RenderExecutor::EnqueueDrawIndex(QueuedDraw&& draw) {
