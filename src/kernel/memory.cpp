@@ -210,17 +210,61 @@ static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 // the requested size. Guarded by a generation that every mutating VirtualRanges method bumps,
 // so a stale entry can never be used - an over-bump only costs a miss.
 struct ClampFastPath {
-	uint64_t start      = 0;
-	uint64_t end        = 0;
+	// One entry hit 68% of queries; the misses were not stale, they were simply other ranges,
+	// and each miss costs ~1.2 us because the lock is contended by other threads. Holding the
+	// few ranges a frame actually touches is what removes those acquisitions.
+	static constexpr uint32_t kEntries = 8;
+
+	struct Entry {
+		uint64_t start = 0;
+		uint64_t end   = 0;
+	};
+
+	Entry    entries[kEntries] {};
+	uint32_t count      = 0;
 	uint64_t generation = UINT64_MAX;   // never equal to a real generation until first fill
+
+	// Returns true when [address, address+size) lies wholly inside a remembered committed range.
+	bool Contains(uint64_t address, uint64_t size) {
+		for (uint32_t i = 0; i < count; i++) {
+			const auto& entry = entries[i];
+			if (address >= entry.start && address < entry.end && size <= entry.end - address) {
+				if (i != 0) {
+					std::swap(entries[i], entries[0]);   // keep the hot range first
+				}
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void Reset(uint64_t new_generation) {
+		count      = 0;
+		generation = new_generation;
+	}
+
+	void Insert(uint64_t start, uint64_t end) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (entries[i].start == start && entries[i].end == end) {
+				return;
+			}
+		}
+		if (count < kEntries) {
+			count++;
+		}
+		for (uint32_t i = count - 1; i > 0; i--) {
+			entries[i] = entries[i - 1];
+		}
+		entries[0] = Entry {start, end};
+	}
 };
 
 thread_local ClampFastPath t_clamp_fast_path;
 
 // The fast path either hits or it does not; a frame time cannot tell which. If hits are near zero
 // the generation is churning, and the printed value says how fast.
-std::atomic<uint64_t> g_clamp_calls {0};
-std::atomic<uint64_t> g_clamp_hits {0};
+thread_local uint64_t t_clamp_calls = 0;
+thread_local uint64_t t_clamp_hits  = 0;
 
 class VirtualRanges {
 public:
@@ -456,21 +500,23 @@ public:
 		}
 		// 363 ns a call, 6.2 calls a draw, 15% of the whole draw - almost all of it the lock and
 		// a cache-missing binary search over a table that changes very rarely.
-		const auto& fast    = t_clamp_fast_path;
-		const auto  current = m_generation.load(std::memory_order_acquire);
-		const bool  hit     = fast.generation == current && virtual_addr >= fast.start &&
-		                 virtual_addr < fast.end && size <= fast.end - virtual_addr;
-		const auto calls = g_clamp_calls.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (hit) {
-			g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+		auto&      fast    = t_clamp_fast_path;
+		const auto current = m_generation.load(std::memory_order_acquire);
+		if (fast.generation != current) {
+			fast.Reset(current);
 		}
-		if (calls % 200000 == 0) {
-			const auto hits = g_clamp_hits.load(std::memory_order_relaxed);
-			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu\n",
-			            static_cast<unsigned long long>(calls),
-			            static_cast<unsigned long long>(hits),
-			            100.0 * static_cast<double>(hits) / static_cast<double>(calls),
-			            static_cast<unsigned long long>(current));
+		const bool hit = fast.Contains(virtual_addr, size);
+		t_clamp_calls++;
+		if (hit) {
+			t_clamp_hits++;
+		}
+		if (t_clamp_calls % 200000 == 0) {
+			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu cached=%u\n",
+			            static_cast<unsigned long long>(t_clamp_calls),
+			            static_cast<unsigned long long>(t_clamp_hits),
+			            100.0 * static_cast<double>(t_clamp_hits) /
+			                static_cast<double>(t_clamp_calls),
+			            static_cast<unsigned long long>(current), fast.count);
 			std::fflush(stdout);
 		}
 		if (hit) {
@@ -497,9 +543,13 @@ public:
 		}
 
 		// Only committed ranges reach here, which is what the fast path is allowed to assume.
-		t_clamp_fast_path.start      = vma->start;
-		t_clamp_fast_path.end        = vma_end;
-		t_clamp_fast_path.generation = m_generation.load(std::memory_order_relaxed);
+		{
+			const auto generation = m_generation.load(std::memory_order_relaxed);
+			if (t_clamp_fast_path.generation != generation) {
+				t_clamp_fast_path.Reset(generation);
+			}
+			t_clamp_fast_path.Insert(vma->start, vma_end);
+		}
 
 		uint64_t clamped_size = std::min(size, vma_end - virtual_addr);
 		uint64_t expected     = virtual_addr + clamped_size;
