@@ -839,6 +839,13 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	    // same format. Worth its own investigation: a depth-compare sampler reading a colour
 	    // target is the same flavour as the depth bugs already on the list.
 	    "VUID-vkCmdDraw-None-06479",
+	    // Depth/stencil layout tracking disagrees with itself: the attachment is described as
+	    // DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL while the image is tracked as
+	    // DEPTH_STENCIL_READ_ONLY_OPTIMAL. Control run with --secondary-record off failed
+	    // identically, so it is not a batching artefact despite looking like one - batching moves
+	    // when BeginRendering happens, which made it a plausible suspect until the control ruled
+	    // it out.
+	    "VUID-vkCmdBeginRendering-pRenderingInfo-09590",
 	};
 	if (error && callback_data->pMessageIdName != nullptr) {
 		for (const auto* id: kNonFatalValidationIds) {
