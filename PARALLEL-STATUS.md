@@ -8,14 +8,14 @@ Written overnight 2026-09-03. Everything below compiles and links; tests are 53 
 ## Test it like this
 
 ```bash
-# 1. baseline, unchanged code path (both flags off)
+# 1. baseline, unchanged code path (all flags off)
 ./run-gta5.sh --present-mode Mailbox
 
 # 2. batching - this is the RAM and overhead fix, still one thread
 ./run-gta5.sh --present-mode Mailbox --secondary-record true
 
-# 3. same, with the concurrent structures engaged (still one recording thread, see below)
-./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-workers 8
+# 3. deferred translation through the collection queue, drained in guest order
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true
 ```
 
 Run 2 is the important one. Compare against last night's `--secondary-record true`, which ate
@@ -44,6 +44,36 @@ or ordering problem, and the fix is a missing flush hook.
 | `bdc7de9` | **batching** - one secondary carries many draws, cut on render-state change |
 | `23eb846` | reader-writer lock on the page table, deferred per-worker LRU |
 | `f2c5cde` | `--draw-workers`, ownership scope tied to the batch |
+
+## Step 2 is blocked, and here is the exact reason
+
+`ParallelFor` is not wired over draws, because resolve cannot run off the main thread as the code
+stands. `BufferCache::SynchronizeBuffer` - reached from `ObtainBuffer`, which every draw hits for
+every buffer - does three things a worker may not do:
+
+1. calls `command.EndRendering()`, which now flushes the secondary batch;
+2. records a barrier, a `copyBuffer` and another barrier into the **primary** command buffer;
+3. allocates out of the shared staging ring via `UploadCopies`.
+
+So "resolve" is not a pure phase that produces descriptors - it emits commands. Running it on
+eight threads would have eight threads recording into one primary, out of order, whatever the
+caches do about locking. No amount of page-table locking fixes that, which is why the locks landed
+but the dispatch did not.
+
+**The unblocker, and the next thing to build:** resolve must produce a *list* of required uploads
+instead of recording them - address, size, source offset - and a serial phase must apply that list
+in guest order before the batch is replayed. The memory tracker's upload bookkeeping has to move
+with it, since `ForEachUploadRange` also clears CPU-dirty state as a side effect. That is a
+contained change to `bufferCache`, but it changes when uploads become visible to the GPU, so it
+wants a run to validate rather than a night of unverified edits.
+
+## Assumption the queue relies on
+
+A queued draw holds raw guest pointers (`index_addr`, and everything resolve reads). Deferring
+translation means reading that memory later than the packet arrived. This is the same assumption
+the console makes - its command processor consumes packets asynchronously, so a title cannot
+overwrite data a submitted draw still needs - but it is an assumption, and if `--draw-queue`
+produces corruption that plain `--secondary-record` does not, this is the first thing to suspect.
 
 ## What is NOT done - read this before assuming 16 cores are running
 
