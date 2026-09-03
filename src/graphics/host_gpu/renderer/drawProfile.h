@@ -22,6 +22,8 @@ enum class DrawPhase : uint32_t {
 	Preamble,
 	RenderState,
 	RefreshShaders,
+	ShaderParams,        // of which
+	ShaderMaterialize,   // of which
 	Bindings,
 	BindPrepare,        // of which
 	BindFindBuffers,    // of which
@@ -41,6 +43,8 @@ enum class DrawPhase : uint32_t {
 
 inline bool DrawPhaseIsChild(DrawPhase phase) {
 	switch (phase) {
+		case DrawPhase::ShaderParams:
+		case DrawPhase::ShaderMaterialize:
 		case DrawPhase::BindPrepare:
 		case DrawPhase::BindFindBuffers:
 		case DrawPhase::BindClampRange:
@@ -55,6 +59,8 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::Preamble: return "preamble+checks";
 		case DrawPhase::RenderState: return "PrepareDrawRenderState";
 		case DrawPhase::RefreshShaders: return "RefreshShaders";
+		case DrawPhase::ShaderParams: return "  of which PrepareProgram";
+		case DrawPhase::ShaderMaterialize: return "  of which lookup+materialize";
 		case DrawPhase::Bindings: return "PrepareGraphicsBindings";
 		case DrawPhase::BindPrepare: return "  of which PrepareBindings";
 		case DrawPhase::BindFindBuffers: return "  of which FindBuffers";
@@ -77,6 +83,13 @@ struct DrawProfileState {
 	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> cycles {};
 	uint64_t                              draws   = 0;
 	uint64_t                              buffers = 0;   // resolved buffer descriptors
+	// The ceiling on any "skip it when the state has not changed" design is how often the state
+	// actually does not change. Measure that rather than assume it.
+	uint64_t                              same_shader_pair = 0;
+	uint64_t                              prev_vs_addr     = 0;
+	uint64_t                              prev_vs_chksum   = 0;
+	uint64_t                              prev_ps_addr     = 0;
+	uint64_t                              prev_ps_chksum   = 0;
 	bool                                  active  = false;
 	bool                                  started = false;
 	std::chrono::steady_clock::time_point wall_start {};
@@ -133,6 +146,23 @@ inline void DrawProfileBeginDraw() {
 	}
 }
 
+// Called once per draw with the identity of both bound shaders.
+inline void DrawProfileNoteShaders(uint64_t vs_addr, uint64_t vs_chksum, uint64_t ps_addr,
+                                   uint64_t ps_chksum) {
+	auto& profile = g_draw_profile;
+	if (!profile.active) {
+		return;
+	}
+	if (vs_addr == profile.prev_vs_addr && vs_chksum == profile.prev_vs_chksum &&
+	    ps_addr == profile.prev_ps_addr && ps_chksum == profile.prev_ps_chksum) {
+		profile.same_shader_pair++;
+	}
+	profile.prev_vs_addr   = vs_addr;
+	profile.prev_vs_chksum = vs_chksum;
+	profile.prev_ps_addr   = ps_addr;
+	profile.prev_ps_chksum = ps_chksum;
+}
+
 inline void DrawProfileEndDraw() {
 	auto& profile = g_draw_profile;
 	if (!profile.active) {
@@ -154,6 +184,8 @@ inline void DrawProfileEndDraw() {
 	std::printf("DrawProfile: %llu draws, %.2f GHz effective, %.1f buffers/draw\n",
 	            static_cast<unsigned long long>(profile.draws), 1.0 / ns_per_cycle,
 	            static_cast<double>(profile.buffers) / draws);
+	std::printf("  %-28s %7.1f%% of draws reuse the previous draw's shader pair\n", "state reuse",
+	            100.0 * static_cast<double>(profile.same_shader_pair) / draws);
 	double accounted = 0.0;
 	for (uint32_t i = 0; i < static_cast<uint32_t>(DrawPhase::Count); i++) {
 		const auto   phase = static_cast<DrawPhase>(i);

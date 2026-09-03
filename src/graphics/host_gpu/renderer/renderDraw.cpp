@@ -2060,6 +2060,10 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	{
+		const auto& vs_ident = buffer.GetShaders().GetVs();
+		const auto& ps_ident = buffer.GetShaders().GetPs();
+		DrawProfileNoteShaders(vs_ident.es_regs.data_addr, vs_ident.gs_regs.chksum,
+		                       ps_ident.ps_regs.data_addr, ps_ident.ps_regs.chksum);
 		DrawPhaseTimer timer(DrawPhase::RefreshShaders);
 		RefreshShaders(buffer, draw, true, state);
 	}

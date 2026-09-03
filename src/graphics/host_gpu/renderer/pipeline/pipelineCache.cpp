@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include "graphics/host_gpu/renderer/drawProfile.h"
+
 #include "common/assert.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -452,7 +454,10 @@ bool PipelineCache::ResolvePixelResources(const ProgramRef& program, const Shade
 ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
                                               const HW::ShaderRegisters&  sh,
                                               ShaderVertexInputInfo&      input_info) {
-	const auto params = PrepareVertexParams(regs, sh, input_info);
+	DrawPhaseTimer params_timer(DrawPhase::ShaderParams);
+	const auto     params = PrepareVertexParams(regs, sh, input_info);
+	params_timer.Stop();
+	DrawPhaseTimer materialize_timer(DrawPhase::ShaderMaterialize);
 	return MaterializeVertexProgram(params, input_info);
 }
 
@@ -475,7 +480,10 @@ ShaderProgram PipelineCache::GetPixelProgram(
     const ShaderVertexInputInfo&                        vertex_info,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               input_info) {
+	DrawPhaseTimer params_timer(DrawPhase::ShaderParams);
 	const auto params = PreparePixelParams(regs, sh, vertex_info, target_export_mapping, input_info);
+	params_timer.Stop();
+	DrawPhaseTimer materialize_timer(DrawPhase::ShaderMaterialize);
 	return MaterializePixelProgram(params, input_info);
 }
 
