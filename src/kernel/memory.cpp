@@ -217,6 +217,11 @@ struct ClampFastPath {
 
 thread_local ClampFastPath t_clamp_fast_path;
 
+// The fast path either hits or it does not; a frame time cannot tell which. If hits are near zero
+// the generation is churning, and the printed value says how fast.
+std::atomic<uint64_t> g_clamp_calls {0};
+std::atomic<uint64_t> g_clamp_hits {0};
+
 class VirtualRanges {
 public:
 	struct Range {
@@ -451,10 +456,24 @@ public:
 		}
 		// 363 ns a call, 6.2 calls a draw, 15% of the whole draw - almost all of it the lock and
 		// a cache-missing binary search over a table that changes very rarely.
-		const auto& fast = t_clamp_fast_path;
-		if (fast.generation == m_generation.load(std::memory_order_acquire) &&
-		    virtual_addr >= fast.start && virtual_addr < fast.end &&
-		    size <= fast.end - virtual_addr) {
+		const auto& fast    = t_clamp_fast_path;
+		const auto  current = m_generation.load(std::memory_order_acquire);
+		const bool  hit     = fast.generation == current && virtual_addr >= fast.start &&
+		                 virtual_addr < fast.end && size <= fast.end - virtual_addr;
+		const auto calls = g_clamp_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (hit) {
+			g_clamp_hits.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (calls % 200000 == 0) {
+			const auto hits = g_clamp_hits.load(std::memory_order_relaxed);
+			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu\n",
+			            static_cast<unsigned long long>(calls),
+			            static_cast<unsigned long long>(hits),
+			            100.0 * static_cast<double>(hits) / static_cast<double>(calls),
+			            static_cast<unsigned long long>(current));
+			std::fflush(stdout);
+		}
+		if (hit) {
 			return size;
 		}
 		Common::LockGuard lock(m_mutex);
