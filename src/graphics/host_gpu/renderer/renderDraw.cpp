@@ -2336,7 +2336,17 @@ bool SecondaryBatchOpen() noexcept {
 void FlushSecondaryBatch(RenderContext& context) {
 	// Queued draws have not been translated yet, so they must be turned into recorded commands
 	// before anything replays or submits. Ordered first for that reason.
-	context.GetRenderExecutor().DrainDrawQueue(context.GetCommandScheduler().Current());
+	//
+	// Guarded: Current() asserts the scheduler is active, and this runs from EndRendering and
+	// Flush, which are reachable with no command buffer bound - during teardown, and throughout
+	// the unit tests, which is where this fired.
+	{
+		auto& scheduler = context.GetCommandScheduler();
+		auto& executor  = context.GetRenderExecutor();
+		if (scheduler.Active() && !executor.DrawQueueEmpty()) {
+			executor.DrainDrawQueue(scheduler.Current());
+		}
+	}
 
 	auto& batch = g_secondary_batch;
 	// flushing guards re-entry: the EndRendering below is itself a flush hook.
