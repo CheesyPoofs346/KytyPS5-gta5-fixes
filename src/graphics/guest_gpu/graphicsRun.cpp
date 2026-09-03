@@ -1,5 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
+#include "graphics/host_gpu/renderer/drawProfile.h"
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -788,8 +790,24 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			     total_dw - remaining_dw, packet_header);
 		}
 
-		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		// ~3 us/draw of frame time sits outside DrawIndex and has never been profiled. Draw and
+		// dispatch packets are timed by their own phases, so only the rest is charged here:
+		// register writes, waits, sync, everything between one draw and the next.
+		const bool packet_is_draw =
+		    opcode == Pm4::IT_DRAW_INDEX_2 || opcode == Pm4::IT_DRAW_INDEX_OFFSET_2 ||
+		    opcode == Pm4::IT_DRAW_INDEX_AUTO || opcode == Pm4::IT_DRAW_INDIRECT ||
+		    opcode == Pm4::IT_DRAW_INDEX_INDIRECT || opcode == Pm4::IT_DRAW_INDIRECT_MULTI ||
+		    opcode == Pm4::IT_DRAW_INDEX_INDIRECT_MULTI || opcode == Pm4::IT_DISPATCH_DIRECT ||
+		    opcode == Pm4::IT_DISPATCH_INDIRECT;
+		uint32_t packet_dw = 0;
+		if (packet_is_draw) {
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		} else {
+			DrawPhaseTimer packet_timer(DrawPhase::Pm4NonDraw);
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+			packet_timer.Stop();
+			g_draw_profile.pm4_packets++;
+		}
 		EXIT_IF(packet_dw > remaining_dw);
 		if (execution.m_suspended) {
 			if (execution.m_buffer_stack.size() > buffer_index + 1) {

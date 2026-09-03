@@ -37,6 +37,7 @@ enum class DrawPhase : uint32_t {
 	DynState,
 	BeginRendering,
 	Emit,
+	Pm4NonDraw,          // outside DrawIndex entirely: every other PM4 packet
 	Total,
 	Count,
 };
@@ -74,6 +75,7 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::DynState: return "SetGraphicsDynamicParams";
 		case DrawPhase::BeginRendering: return "BeginRendering+bind";
 		case DrawPhase::Emit: return "EmitDrawPrimitives";
+		case DrawPhase::Pm4NonDraw: return "PM4 non-draw packets";
 		case DrawPhase::Total: return "TOTAL DrawIndex";
 		default: return "?";
 	}
@@ -86,6 +88,7 @@ struct DrawProfileState {
 	// The ceiling on any "skip it when the state has not changed" design is how often the state
 	// actually does not change. Measure that rather than assume it.
 	uint64_t                              same_shader_pair = 0;
+	uint64_t                              pm4_packets      = 0;
 	uint64_t                              prev_vs_addr     = 0;
 	uint64_t                              prev_vs_chksum   = 0;
 	uint64_t                              prev_ps_addr     = 0;
@@ -186,11 +189,13 @@ inline void DrawProfileEndDraw() {
 	            static_cast<double>(profile.buffers) / draws);
 	std::printf("  %-28s %7.1f%% of draws reuse the previous draw's shader pair\n", "state reuse",
 	            100.0 * static_cast<double>(profile.same_shader_pair) / draws);
+	std::printf("  %-28s %7.1f non-draw PM4 packets per draw\n", "packet rate",
+	            static_cast<double>(profile.pm4_packets) / draws);
 	double accounted = 0.0;
 	for (uint32_t i = 0; i < static_cast<uint32_t>(DrawPhase::Count); i++) {
 		const auto   phase = static_cast<DrawPhase>(i);
 		const double ns    = static_cast<double>(profile.cycles[i]) * ns_per_cycle / draws;
-		if (phase != DrawPhase::Total && !DrawPhaseIsChild(phase)) {
+		if (phase != DrawPhase::Total && phase != DrawPhase::Pm4NonDraw && !DrawPhaseIsChild(phase)) {
 			accounted += ns;
 		}
 		std::printf("  %-28s %8.3f us/draw\n", DrawPhaseName(phase), ns / 1000.0);

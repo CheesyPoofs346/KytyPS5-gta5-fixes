@@ -1264,7 +1264,11 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 	Evaluator                    clean_evaluator(program, clean_runtime);
 	Evaluator                    evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
 	evaluator.SetRecording(use_cache);
-	std::vector<DescriptorValue> evaluated;
+	// Pooled rather than local: this runs twice a draw, and a fresh vector here is a malloc and
+	// a free every time. The transactional guarantee is unchanged - the destination is still only
+	// written once everything has succeeded.
+	static thread_local std::vector<DescriptorValue> evaluated;
+	evaluated.clear();
 	evaluated.reserve(requests.size());
 	for (const auto& request: requests) {
 		const auto* source = Source(program, request.source);
@@ -1312,7 +1316,8 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 		}
 		evaluated.push_back(value);
 	}
-	std::vector<uint32_t> flattened;
+	static thread_local std::vector<uint32_t> flattened;
+	flattened.clear();
 	if (evaluate_flat) {
 		flattened.resize(program.srt_reads.size());
 		for (const auto& read: program.srt_reads) {
@@ -1326,9 +1331,11 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 			}
 		}
 	}
-	results = std::move(evaluated);
+	// assign, not move: moving would hand the pool's buffer away and allocate a fresh one next
+	// draw, and it would also throw away the destination's capacity. Both sides stay warm.
+	results.assign(evaluated.begin(), evaluated.end());
 	if (evaluate_flat) {
-		flat = std::move(flattened);
+		flat.assign(flattened.begin(), flattened.end());
 	}
 	return true;
 }

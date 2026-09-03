@@ -557,8 +557,12 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 	for (const auto& sampler: program.info.samplers) {
 		requests.push_back({sampler.source, sampler.first_use_pc});
 	}
-	std::vector<DescriptorValue> values;
-	std::vector<uint32_t>        flattened_srt;
+	// Same reason as the thread_local pools above: this runs twice a draw, and each of these was
+	// a malloc and a free every time.
+	static thread_local std::vector<DescriptorValue> values;
+	static thread_local std::vector<uint32_t>        flattened_srt;
+	values.clear();
+	flattened_srt.clear();
 	if (!EvaluateRuntimeSources(program, requests, runtime, values, flattened_srt, clean_flat_slots,
 	                            error)) {
 		return false;
@@ -593,7 +597,8 @@ bool MaterializeResources(const Program& program, const SrtRuntime& runtime,
 			    DescriptorSourceRequest {source->indirect_image->heap_source, image.first_use_pc}};
 			SrtRuntime clean_runtime  = runtime;
 			clean_runtime.read_memory = runtime.read_specialization_memory;
-			std::vector<DescriptorValue> tables;
+			static thread_local std::vector<DescriptorValue> tables;
+			tables.clear();
 			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables, error)) {
 				return false;
 			}
