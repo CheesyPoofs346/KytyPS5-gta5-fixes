@@ -84,6 +84,9 @@ void uc_print(const char* func, const HW::UserConfig& uc) {
 }
 
 void uc_check(const HW::UserConfig& uc) {
+	if (!Config::HwCheckEnabled()) {
+		return;
+	}
 	const auto& user_en = uc.GetGeUserVgprEn();
 
 	EXIT_NOT_IMPLEMENTED(user_en.vgpr1 != false);
@@ -1146,7 +1149,14 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 	return ScissorRectClamp(final, extent.width, extent.height);
 }
 
+// ~125 EXIT_NOT_IMPLEMENTED conditions across ten sub-checks, run on every draw against
+// register state that rarely changes between draws. Nothing here affects rendering: the checks
+// only abort on state the translator does not implement. Gated so the per-draw cost can be
+// measured, and so a long profiling run can drop it.
 void hw_check(const CommandBuffer& buffer) {
+	if (!Config::HwCheckEnabled()) {
+		return;
+	}
 	const auto& hw      = buffer.GetRegisters();
 	const auto  rt_slot = render_target_first_bound_slot(buffer);
 	const auto& rt      = hw.GetRenderTarget(rt_slot);

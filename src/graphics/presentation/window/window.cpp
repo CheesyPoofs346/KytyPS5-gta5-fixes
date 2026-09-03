@@ -290,6 +290,30 @@ static void GameEventKeyboard(WindowLoopState& game, const EventKeyboard& key) {
 					std::fflush(stdout);
 				}
 				break;
+			case SDLK_F7:
+				// A/B the two changes that are not simple filters: the descriptor cache (off by
+				// default) and the per-draw register validation (on by default). Four steps in
+				// one drive measure each alone and both together, against the same workload.
+				if (!key.repeat) {
+					static int step7 = 0;
+					static const char* const names7[4] = {
+					    "baseline (cache off, hw-check on)", "descriptor cache ON",
+					    "hw-check OFF", "cache ON + hw-check OFF"};
+					::printf("[F7 result] %s: %.2f fps average over %llu frames\n",
+					         names7[step7], Config::AverageFps(),
+					         static_cast<unsigned long long>(Config::FpsSampleCount()));
+					step7                = (step7 + 1) % 4;
+					const bool desc_cache = (step7 == 1 || step7 == 3);
+					const bool hw_check   = (step7 != 2 && step7 != 3);
+					Config::SetCacheDescriptors(desc_cache);
+					Config::SetHwCheck(hw_check);
+					Config::ResetFpsAverage();
+					::printf("[F7 step %d] %s  (cache=%d hw-check=%d) - fps average reset\n",
+					         step7, names7[step7], static_cast<int>(desc_cache),
+					         static_cast<int>(hw_check));
+					std::fflush(stdout);
+				}
+				break;
 			case SDLK_F4:
 				if (!key.repeat) {
 					const bool show = !Config::ShowFpsOverlay();

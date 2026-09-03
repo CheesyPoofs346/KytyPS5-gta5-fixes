@@ -59,6 +59,7 @@ struct ConfigOptions {
 	// Per-draw redundancy filters. Default on; each can be turned off individually so a
 	// rendering regression can be attributed without a rebuild.
 	bool                   dyn_state_cache             = true;
+	bool                   hw_check                    = true;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -152,6 +153,9 @@ bool     DccClearOnSample();
 bool     ParallelResolveEnabled();
 bool     CacheDescriptors();
 bool     DynStateCacheEnabled();
+bool     HwCheckEnabled();
+void     SetHwCheck(bool enabled);
+void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();
 bool     BufferDedupEnabled();
 void     SetPerDrawFilters(bool dyn_state, bool pipeline, bool dedup);
