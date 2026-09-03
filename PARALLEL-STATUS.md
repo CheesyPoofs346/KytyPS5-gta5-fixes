@@ -135,3 +135,101 @@ draw work caps the whole plan near 4x, not 16x.
 
 Worth fixing that measurement before investing in the collection restructure, because it decides
 whether the restructure buys 4x or 1.5x.
+
+---
+
+# Update 2026-09-03 evening — the number that redirects the plan
+
+Tests **53 ok**, everything links. No game launches happened while you were away.
+
+## Recording is not the bottleneck; resolution is
+
+The drain census reported `phase3_record = 83.7%`, which reads as "recording is the bottleneck".
+It is not. Phase 3 is *everything after the SRT walk*, and almost all of it is resource
+resolution against shared caches. Splitting it by the measured per-phase profile:
+
+| Phase 3 work | us/draw | parallelisable? |
+|---|---|---|
+| PrepareGraphicsBindings | 3.373 | no - buffer/texture caches |
+| vertex+index buffers | 1.035 | no - buffer cache |
+| AcquireRenderTargets | 0.575 | no - texture cache |
+| CreateGraphicsPipeline | 0.323 | no - locked pipeline cache |
+| PrepareDrawRenderState + preamble | 0.710 | no |
+| Commit vb/desc/ib | 0.618 | yes |
+| BeginRendering+bind | 0.426 | yes |
+| SetGraphicsDynamicParams | 0.087 | yes |
+| EmitDrawPrimitives | 0.044 | yes |
+
+**Actual Vulkan recording is ~1.18 us of ~11.9 - about 10%**, and part of that 0.618 is image
+transitions that must stay serial anyway. Multi-threading recording has a ceiling of roughly
+**5-9%**, not 83.7%.
+
+The work worth doing is parallelising **resolution** (~5.9 us/draw). It needs exactly the same
+prerequisite - stopping resolve from touching the primary command buffer - so the plan was right,
+the payoff is just somewhere else than it looked. That is what tonight went into.
+
+## Landed tonight
+
+| commit | what |
+|---|---|
+| `3568035` | SRT resource walk runs across the worker pool |
+| `dd3d1cb` | worker pool sized from --draw-workers, not by whoever asks first |
+| `9642fcc` | image layout transitions staged for a serial pre-pass (--defer-transitions) |
+
+### The pool bug, and why the 8-wide walk has never run
+
+`GetDrawWorkerPool(count)` created the pool on first use and the first caller won -
+`FlushSecondaryBatch` asking for 1, which always runs before the first queue drain. The pool was
+built with **one worker**, so ParallelFor had two runners and the walk got 2x instead of 8x. That
+is exactly the two-cores-busy reading. It now takes no argument and reads the config itself.
+
+**So the 15.75 us/draw result was measured 2-wide. The 8-worker walk has never actually run.**
+First thing to check on return.
+
+### Transition staging
+
+`Image::Transit` writes a barrier straight into the primary, from `CommitBindings`, for every
+sampled image of every draw - the single thing stopping resolution running on a worker. The four
+layout cases now compute one target layout and access mask, then either transition inline
+(default) or stage a `PendingTransition` applied before the batch opens its render pass. The
+descriptor is written with the layout the image will hold.
+
+Ordering is unchanged by construction: a batch's draws already replay after every transition
+their resolve recorded, so the staged pre-pass is what the code already did - only who records
+them moves.
+
+## Not done, deliberately
+
+Parallel recording is not wired. At a ~9% ceiling it is not worth the risk ahead of the
+resolution work, and it needs texture clears deferred too - the three `m_scheduler.Current()`
+sites in `textureCache` are image *clears*, which transition and clear, so they need the same
+treatment as `Transit`.
+
+Remaining blockers for parallel resolution, in order:
+
+1. `--defer-uploads` still has one unfound consumer. Built, gated off.
+2. Texture clears need staging, same pattern as transitions.
+3. `ObtainBuffer` -> `SynchronizeBuffer` records uploads and calls `EndRendering`; stageable once
+   1 and 2 are done.
+4. Then resolution moves to ParallelFor, and recording comes with it.
+
+## Test plan on return
+
+```bash
+# 1. the 8-wide walk, which has never actually run 8-wide
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true --draw-workers 8
+
+# 2. correctness of staged transitions - expect no visual change
+./run-gta5.sh --present-mode Mailbox --secondary-record true --draw-queue true               --draw-workers 8 --defer-transitions true --vulkan-validation true
+```
+
+Baselines: **14.08 us/draw** (batching only, sec13), **15.75** (walk at 2 runners, par8),
+**16.37** (par9, census overhead included).
+
+Watch `DrainCensus`: `phase2_walk` should fall from ~10% toward 2-3% if the pool fix worked, and
+TOTAL should land near 13 us/draw. That is the honest expected size.
+
+Run 2 is purely a correctness check. If anything renders differently with `--defer-transitions`,
+the staged layout does not match what `Transit` would have produced, and `binding.layout` is the
+first thing to look at. Validation now survives the title's three pre-existing faults and stays
+fatal only for secondary command buffer errors, which is the class this work can break.
