@@ -48,6 +48,9 @@ struct PreparedBindings {
 	const ShaderRecompiler::IR::ResourceSnapshot* snapshot = nullptr;
 	NativeDescriptors                             resources;
 	std::vector<BufferId>                         buffer_ids;
+	// Decoded once in FindBuffers and reused by RebindBuffers, which used to decode the same
+	// snapshot dwords a second time for every buffer of every stage of every draw.
+	std::vector<ShaderBufferResource>             buffer_descriptors;
 	std::vector<uint32_t>                         flattened_srt;
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;

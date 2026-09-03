@@ -967,6 +967,7 @@ struct BindingStorage {
 	std::vector<TextureBinding> images;
 	std::vector<vk::Sampler>    samplers;
 	std::vector<BufferId>       buffer_ids;
+	std::vector<ShaderBufferResource> buffer_descriptors;
 	std::vector<uint32_t>       flattened_srt;
 	std::vector<uint32_t>       user_data;
 };
@@ -988,12 +989,14 @@ void TakePooledStorage(PreparedBindings& prepared) {
 	slot.images.clear();
 	slot.samplers.clear();
 	slot.buffer_ids.clear();
+	slot.buffer_descriptors.clear();
 	slot.flattened_srt.clear();
 	slot.user_data.clear();
 	prepared.resources.buffers  = std::move(slot.buffers);
 	prepared.resources.images   = std::move(slot.images);
 	prepared.resources.samplers = std::move(slot.samplers);
 	prepared.buffer_ids         = std::move(slot.buffer_ids);
+	prepared.buffer_descriptors = std::move(slot.buffer_descriptors);
 	prepared.flattened_srt      = std::move(slot.flattened_srt);
 	prepared.user_data          = std::move(slot.user_data);
 }
@@ -1010,6 +1013,7 @@ void ReturnPooledBindingStorage(PreparedBindings& prepared) {
 	slot.images        = std::move(prepared.resources.images);
 	slot.samplers      = std::move(prepared.resources.samplers);
 	slot.buffer_ids    = std::move(prepared.buffer_ids);
+	slot.buffer_descriptors = std::move(prepared.buffer_descriptors);
 	slot.flattened_srt = std::move(prepared.flattened_srt);
 	slot.user_data     = std::move(prepared.user_data);
 	pool.push_back(std::move(slot));
@@ -1020,9 +1024,15 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
-	std::string error;
-	if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot, &error)) {
-		EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
+	// ShaderMaterializeStageRuntime already validated this exact pair before publishing it,
+	// and both halves are immutable shared_ptr<const> from that point on - so this re-runs a
+	// decision that cannot have changed. Kept under the same gate as the other per-draw
+	// validation rather than deleted outright.
+	if (Config::HwCheckEnabled()) {
+		std::string error;
+		if (!ShaderRecompiler::IR::ValidateResourceSpecialization(program, snapshot, &error)) {
+			EXIT("invalid native shader runtime snapshot: %s\n", error.c_str());
+		}
 	}
 
 	PreparedBindings prepared;
@@ -1068,8 +1078,10 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 
 	prepared.buffer_ids.clear();
 	prepared.buffer_ids.reserve(program.info.buffers.size());
+	prepared.buffer_descriptors.clear();
+	prepared.buffer_descriptors.resize(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		ShaderBufferResource descriptor;
+		ShaderBufferResource& descriptor = prepared.buffer_descriptors[i];
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		const auto address = descriptor.Base48();
 		const auto stride  = descriptor.Stride();
@@ -1090,7 +1102,6 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program   = *prepared.program;
-	const auto& snapshot  = *prepared.snapshot;
 	auto&       resources = prepared.resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_ids.size() != program.info.buffers.size());
@@ -1104,9 +1115,9 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.user_data[dword] |= offset << shift;
 	};
+	EXIT_IF(prepared.buffer_descriptors.size() != program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		ShaderBufferResource descriptor;
-		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
+		const ShaderBufferResource& descriptor = prepared.buffer_descriptors[i];
 		uint32_t buffer_offset = 0;
 		resources.buffers.push_back(NativeStorageBuffer(m_context, descriptor,
 		                                                program.info.buffers[i], program.stage, i,
