@@ -24,6 +24,52 @@ namespace Libs::Graphics {
 
 namespace {
 
+// Conditional locks: no-ops until workers are actually running, so the single-threaded path pays
+// nothing. Written as guards rather than if-statements at each site so an early return cannot
+// leave the lock held.
+class MaybeSharedLock {
+public:
+	MaybeSharedLock(std::shared_mutex& lock, bool engaged): m_lock(lock), m_engaged(engaged) {
+		if (m_engaged) {
+			m_lock.lock_shared();
+		}
+	}
+	~MaybeSharedLock() {
+		if (m_engaged) {
+			m_lock.unlock_shared();
+		}
+	}
+	KYTY_CLASS_NO_COPY(MaybeSharedLock);
+
+private:
+	std::shared_mutex& m_lock;
+	bool               m_engaged;
+};
+
+class MaybeUniqueLock {
+public:
+	MaybeUniqueLock(std::shared_mutex& lock, bool engaged): m_lock(lock), m_engaged(engaged) {
+		if (m_engaged) {
+			m_lock.lock();
+		}
+	}
+	~MaybeUniqueLock() {
+		if (m_engaged) {
+			m_lock.unlock();
+		}
+	}
+	KYTY_CLASS_NO_COPY(MaybeUniqueLock);
+
+private:
+	std::shared_mutex& m_lock;
+	bool               m_engaged;
+};
+
+} // namespace
+
+
+namespace {
+
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
@@ -65,7 +111,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 	EXIT_IF(!PageTable::TryGetPageRange(buffer.CpuAddress(), buffer.Size(), pages));
 	for (size_t page = pages.first; page < pages.last_exclusive; ++page) {
 		if constexpr (insert) {
-			m_page_table[page] = id;
+			m_page_table[page] = id;   // caller holds the unique lock
 		} else {
 			m_page_table[page] = {};
 		}
@@ -98,9 +144,19 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
-	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+	if (buffer.is_deleted) {
+		return;
 	}
+	// Recorded per worker and merged at EndBatch: this runs on every buffer resolution, so a
+	// shared LRU here would serialise the workers on what is otherwise a read-only path.
+	if (m_concurrent && m_batch_depth != 0) {
+		const auto worker = CurrentDrawWorker();
+		if (worker < m_deferred_touch.size()) {
+			m_deferred_touch[worker].push_back(buffer.lru_id);
+			return;
+		}
+	}
+	m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 }
 
 void BufferCache::DeleteBuffer(BufferId id) {
@@ -131,6 +187,7 @@ void BufferCache::CreateWorkerStreamBuffers(uint32_t worker_count) {
 	// 16 MiB rather than the main ring's 64: a worker ring serves its share of a frame's draws,
 	// not all of them, and running one dry costs a fallback to the normal buffer path rather than
 	// anything worse.
+	m_deferred_touch.resize(kMaxDrawWorkers);
 	constexpr uint64_t kWorkerStreamSize = 16 * MiB;
 	m_worker_stream_buffers.reserve(extra);
 	while (m_worker_stream_buffers.size() < extra) {
@@ -146,6 +203,12 @@ void BufferCache::EndBatch() {
 	}
 	// Deferred rather than erased directly: the GPU may still be reading these, which is the same
 	// reason DeleteBuffer defers outside a batch.
+	for (auto& touches: m_deferred_touch) {
+		for (const auto lru_id: touches) {
+			m_lru_cache.Touch(lru_id, m_gc_tick);
+		}
+		touches.clear();
+	}
 	for (const auto id: m_retired_in_batch) {
 		if (m_scheduler.Active()) {
 			m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
@@ -359,18 +422,23 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
-	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
-	if (owner != nullptr && *owner) {
-		auto& buffer = m_slot_buffers[*owner];
-		if (buffer.IsInBounds(vaddr, size)) {
-			return *owner;
+	{
+		MaybeSharedLock lock(m_page_table_lock, m_concurrent);
+		const auto*     owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+		if (owner != nullptr && *owner) {
+			auto& buffer = m_slot_buffers[*owner];
+			if (buffer.IsInBounds(vaddr, size)) {
+				return *owner;
+			}
 		}
 	}
+	// Creating mutates the page table and the address index, so it takes the unique lock inside.
 	return CreateBuffer(vaddr, size);
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
-	auto& command = m_scheduler.Current();
+	MaybeUniqueLock lock(m_page_table_lock, m_concurrent);
+	auto&           command = m_scheduler.Current();
 	EXIT_IF(command.IsInvalid());
 	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
 	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);

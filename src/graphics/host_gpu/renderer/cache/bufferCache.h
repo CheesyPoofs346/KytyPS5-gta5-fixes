@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_BUFFERCACHE_H_
 
 #include <memory>
+#include <shared_mutex>
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "common/abi.h"
 #include "common/common.h"
@@ -56,6 +57,10 @@ public:
 	// Deletions that land during a batch are recorded and applied at EndBatch, on one thread.
 	void BeginBatch() noexcept { m_batch_depth++; }
 	void EndBatch();
+
+	// Locking is off until workers actually run. A shared_lock is ~20 ns and FindBuffer runs about
+	// six times a draw, so paying it single-threaded would be a regression for no benefit.
+	void SetConcurrent(bool concurrent) noexcept { m_concurrent = concurrent; }
 
 	// Safe to call before any worker exists; idempotent.
 	void CreateWorkerStreamBuffers(uint32_t worker_count);
@@ -143,6 +148,12 @@ private:
 	StreamBuffer                                      m_device_buffer;
 	std::vector<std::unique_ptr<StreamBuffer>>         m_worker_stream_buffers;
 	TextureCache&                                     m_texture_cache;
+	// Guards m_page_table and m_buffers, which Register/Unregister mutate together.
+	std::shared_mutex                                 m_page_table_lock;
+	// TouchBuffer writes the LRU on every buffer resolution, so shared it would serialise every
+	// worker on a pure read path. Each worker records its touches and EndBatch merges them.
+	std::vector<std::vector<size_t>>                  m_deferred_touch;
+	bool                                              m_concurrent = false;
 	std::vector<BufferId>                             m_retired_in_batch;
 	uint32_t                                          m_batch_depth        = 0;
 	uint64_t                                          m_total_used_memory  = 0;
