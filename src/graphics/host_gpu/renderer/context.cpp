@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/profiler.h"
@@ -132,6 +133,17 @@ void CommandBuffer::BeginRendering(const RenderState& state, bool secondary_cont
 }
 
 void CommandBuffer::EndRendering() const {
+	// The chokepoint for batched draws. Nine call sites end the pass here to record a transfer -
+	// buffer uploads, texture uploads, clears, stream copies, compute - and each one then reads a
+	// target the batch has not written yet, because its draws are still sitting in an unreplayed
+	// secondary. That is the black screen: the work was recorded and submitted, but after whatever
+	// consumed the target.
+	//
+	// Hooking the scheduler's EndRendering was not enough, and enumerating the nine would be the
+	// same mistake as enumerating upload consumers. Flushing here cannot miss a caller.
+	// Re-entrant: the flush ends the pass it opens, and its own guard stops the recursion.
+	FlushSecondaryBatch(m_context);
+
 	if (!m_rendering) {
 		return;
 	}
