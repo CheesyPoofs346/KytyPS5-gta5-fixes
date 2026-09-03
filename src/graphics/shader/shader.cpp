@@ -1,5 +1,7 @@
 #include "graphics/shader/shader.h"
 
+#include "graphics/host_gpu/renderer/drawProfile.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -860,7 +862,10 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
 	                                   ReadShaderGuestMemory)) {
 		return LogPermutationMismatch(*program, "VS", error);
 	}
-	ApplyVertexOutputs(info, *program);
+	{
+		DrawPhaseTimer outputs_timer(DrawPhase::ApplyOutputs);
+		ApplyVertexOutputs(info, *program);
+	}
 	return true;
 }
 
@@ -871,7 +876,10 @@ bool MaterializeProgram(const std::shared_ptr<const ShaderRecompiler::IR::Progra
 	                                   ReadShaderGuestMemory)) {
 		return LogPermutationMismatch(*program, "PS", error);
 	}
-	ApplyPixelOutputs(info, *program);
+	{
+		DrawPhaseTimer outputs_timer(DrawPhase::ApplyOutputs);
+		ApplyPixelOutputs(info, *program);
+	}
 	return true;
 }
 

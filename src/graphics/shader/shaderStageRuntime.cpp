@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include "graphics/host_gpu/renderer/drawProfile.h"
+
 #include <utility>
 
 namespace Libs::Graphics {
@@ -22,10 +24,20 @@ bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::P
 	runtime.read_specialization_memory = read_specialization_memory;
 	runtime.userdata                   = read_memory_data;
 	ShaderRecompiler::IR::ResourceSnapshot snapshot;
-	if (!ShaderRecompiler::IR::MaterializeResources(*program, runtime, snapshot, error) ||
-	    !ShaderRecompiler::IR::ValidateResourceSpecialization(*program, snapshot, error)) {
-		return false;
+	{
+		DrawPhaseTimer evaluate_timer(DrawPhase::SrtEvaluate);
+		if (!ShaderRecompiler::IR::MaterializeResources(*program, runtime, snapshot, error)) {
+			return false;
+		}
 	}
+	{
+		// The copy of this in PrepareBindings is behind --hw-check; this one never was.
+		DrawPhaseTimer validate_timer(DrawPhase::SrtValidate);
+		if (!ShaderRecompiler::IR::ValidateResourceSpecialization(*program, snapshot, error)) {
+			return false;
+		}
+	}
+	DrawPhaseTimer snapshot_timer(DrawPhase::SrtSnapshot);
 	auto resources =
 	    std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(std::move(snapshot));
 	stage = {std::move(program), std::move(resources)};

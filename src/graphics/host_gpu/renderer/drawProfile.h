@@ -26,6 +26,10 @@ enum class DrawPhase : uint32_t {
 	ShaderParams,        // of which
 	ShaderLookup,        // of which, takes the program-cache mutex
 	ShaderMaterialize,   // of which
+	SrtEvaluate,         // of which, the actual expression walk
+	SrtValidate,         // of which, the ungated ValidateResourceSpecialization
+	SrtSnapshot,         // of which, snapshot construction + make_shared
+	ApplyOutputs,        // of which, ApplyVertex/PixelOutputs
 	Bindings,
 	BindPrepare,        // of which
 	BindFindBuffers,    // of which
@@ -50,6 +54,10 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::ShaderParams:
 		case DrawPhase::ShaderLookup:
 		case DrawPhase::ShaderMaterialize:
+		case DrawPhase::SrtEvaluate:
+		case DrawPhase::SrtValidate:
+		case DrawPhase::SrtSnapshot:
+		case DrawPhase::ApplyOutputs:
 		case DrawPhase::BindPrepare:
 		case DrawPhase::BindFindBuffers:
 		case DrawPhase::BindClampRange:
@@ -68,6 +76,10 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::ShaderParams: return "  of which PrepareProgram";
 		case DrawPhase::ShaderLookup: return "  of which cache lookup (locked)";
 		case DrawPhase::ShaderMaterialize: return "  of which SRT materialize";
+		case DrawPhase::SrtEvaluate: return "    of which expression walk";
+		case DrawPhase::SrtValidate: return "    of which Validate (ungated)";
+		case DrawPhase::SrtSnapshot: return "    of which snapshot+make_shared";
+		case DrawPhase::ApplyOutputs: return "    of which ApplyOutputs";
 		case DrawPhase::Bindings: return "PrepareGraphicsBindings";
 		case DrawPhase::BindPrepare: return "  of which PrepareBindings";
 		case DrawPhase::BindFindBuffers: return "  of which FindBuffers";
