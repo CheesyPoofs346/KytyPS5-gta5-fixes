@@ -1052,7 +1052,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		} else {
 			multi_draws.fetch_add(draw_count, std::memory_order_relaxed);
 		}
-		if (total % 2000 == 0) {
+		if (total == 1 || total % 500 == 0) {
 			std::printf("IndirectMultiCensus: calls=%" PRIu64 " zero_count=%" PRIu64 " draws_issued=%" PRIu64
 			     " from_count_addr=%d\n",
 			     total, multi_zero.load(std::memory_order_relaxed),

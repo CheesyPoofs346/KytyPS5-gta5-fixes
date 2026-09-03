@@ -9,6 +9,8 @@
 #include <span>
 #include <array>
 #include <bit>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
 #include <unordered_map>
@@ -432,21 +434,62 @@ public:
 	// depended on - which user-data slots, and which (address, value) pairs it read - and the
 	// next draw can re-read just those and compare. If they match, the result is provably
 	// identical and the whole walk is skipped.
-	static constexpr size_t kMaxRecordedReads = 12;
-	static constexpr size_t kMaxRecordedSlots = 16;
+	// An input is either a user-data slot or a memory dword. The previous representation kept
+	// slots in a bitmask and their values in append order, then compared them by ascending bit
+	// index - so any expression that read its slots out of order compared value A against slot B
+	// and reported a false change. Storing the slot alongside its value removes that coupling.
+	static constexpr uint32_t kNoSlot            = 0xffffffffu;
+	static constexpr size_t   kMaxRecordedInputs = 24;
+	// Bounds how much a deeply shared expression graph can replay into the log.
+	static constexpr size_t   kMaxLogEntries     = 4096;
 
-	struct Dependencies {
-		uint64_t user_data_mask = 0;
-		uint32_t slot_values[kMaxRecordedSlots] {};
-		uint32_t slot_count = 0;
-		uint64_t addresses[kMaxRecordedReads] {};
-		uint32_t values[kMaxRecordedReads] {};
-		uint32_t read_count = 0;
-		bool     overflowed = false;   // too many reads to track: never cacheable
+	struct DepEntry {
+		uint64_t address = 0;        // memory address; 0 when this entry is a user-data slot
+		uint32_t value   = 0;
+		uint32_t slot    = kNoSlot;  // user-data slot; kNoSlot when this entry is a memory read
 	};
 
-	void          BeginRecording() { m_deps = {}; }
-	const Dependencies& RecordedDependencies() const { return m_deps; }
+	struct Dependencies {
+		DepEntry inputs[kMaxRecordedInputs] {};
+		uint32_t count      = 0;
+		bool     overflowed = false;   // too many inputs, or an input we cannot re-read
+	};
+
+	// Only the descriptor cache needs the log, so the default path records nothing at all.
+	void SetRecording(bool record) { m_record = record; }
+
+	void BeginRecording() {
+		m_request_start    = static_cast<uint32_t>(m_log.size());
+		m_request_overflow = m_overflow_count;
+	}
+
+	// Collapses this request's slice of the log into a dependency set.
+	Dependencies RecordedDependencies() const {
+		Dependencies deps;
+		if (m_overflow_count != m_request_overflow) {
+			deps.overflowed = true;
+			return deps;
+		}
+		for (size_t i = m_request_start; i < m_log.size(); i++) {
+			const auto& entry = m_log[i];
+			bool        duplicate = false;
+			for (uint32_t d = 0; d < deps.count; d++) {
+				if (deps.inputs[d].slot == entry.slot && deps.inputs[d].address == entry.address) {
+					duplicate = true;
+					break;
+				}
+			}
+			if (duplicate) {
+				continue;
+			}
+			if (deps.count >= kMaxRecordedInputs) {
+				deps.overflowed = true;
+				return deps;
+			}
+			deps.inputs[deps.count++] = entry;
+		}
+		return deps;
+	}
 
 	bool Evaluate(Value value, uint32_t& result, std::string* error) {
 		uint64_t wide = 0;
@@ -488,11 +531,13 @@ private:
 			return Fail(error, "cyclic typed runtime value");
 		}
 		MemoMarkVisiting(inst);
-		uint64_t out = 0;
+		const auto log_start      = static_cast<uint32_t>(m_log.size());
+		const auto overflow_start = m_overflow_count;
+		uint64_t   out            = 0;
 		if (!EvaluateInst(*inst, out, error)) {
 			return false;
 		}
-		MemoInsert(inst, out);
+		MemoInsert(inst, out, log_start, overflow_start);
 		result = out;
 		return true;
 	}
@@ -603,15 +648,12 @@ private:
 			if (!m_runtime.read_memory(m_runtime.userdata, address, &word)) {
 				return Fail(error, fmt::format("constant read failed at 0x{:016x}", address));
 			}
+			// This read is not logged below, so revalidation could never see it change.
+			// Anything reaching this path must never be cached.
+			MarkOverflow();
 		} else {
 			std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
-			if (m_deps.read_count < kMaxRecordedReads) {
-				m_deps.addresses[m_deps.read_count] = address;
-				m_deps.values[m_deps.read_count]    = word;
-				m_deps.read_count++;
-			} else {
-				m_deps.overflowed = true;
-			}
+			LogInput(address, word, kNoSlot);
 		}
 		result = word;
 		return true;
@@ -632,19 +674,9 @@ private:
 				    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
 					return Fail(error, fmt::format("user SGPR {} is unavailable", reg));
 				}
-				if (const auto slot = reg - m_program.user_data_base; slot < 64) {
-					if ((m_deps.user_data_mask & (uint64_t {1} << slot)) == 0) {
-						if (m_deps.slot_count < kMaxRecordedSlots) {
-							m_deps.user_data_mask |= uint64_t {1} << slot;
-							m_deps.slot_values[m_deps.slot_count++] = m_runtime.user_data[slot];
-						} else {
-							m_deps.overflowed = true;
-						}
-					}
-				} else {
-					m_deps.overflowed = true;
-				}
-				result = m_runtime.user_data[reg - m_program.user_data_base];
+				const auto slot = reg - m_program.user_data_base;
+				result          = m_runtime.user_data[slot];
+				LogInput(0, static_cast<uint32_t>(result), slot);
 				return true;
 			}
 			case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
@@ -666,6 +698,10 @@ private:
 				}
 				if (slot.U32() < m_clean_flat_slots.size() &&
 				    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
+					// The clean evaluator records dependencies into its own m_deps and reads
+					// through read_specialization_memory, so this subtree is invisible to our
+					// revalidation. Refuse to cache rather than cache a partial key.
+					MarkOverflow();
 					m_clean_evaluator->SetUsePc(m_use_pc);
 					return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
 					                                       result, error);
@@ -907,7 +943,14 @@ private:
 		                               ValueOpcodeName(inst.GetOpcode())));
 	}
 
-	Dependencies                              m_deps;
+	// Append-only record of every input read during this call. A subtree owns the slice it
+	// appended, which is what lets a memo hit hand its inputs to the expression above it.
+	bool                                      m_record = false;
+	std::vector<DepEntry>                     m_log;
+	std::vector<DepEntry>                     m_replay_scratch;
+	uint32_t                                  m_request_start    = 0;
+	uint32_t                                  m_overflow_count   = 0;
+	uint32_t                                  m_request_overflow = 0;
 	const Program&                            m_program;
 	const SrtRuntime&                         m_runtime;
 	std::span<const uint8_t>                  m_clean_flat_slots;
@@ -923,9 +966,26 @@ private:
 	static constexpr size_t kMemoBits = 8;
 	static constexpr size_t kMemoSize = size_t {1} << kMemoBits;
 
+	void MarkOverflow() { m_overflow_count++; }
+
+	void LogInput(uint64_t address, uint32_t value, uint32_t slot) {
+		if (!m_record) {
+			return;
+		}
+		if (m_log.size() >= kMaxLogEntries) {
+			MarkOverflow();
+			return;
+		}
+		m_log.push_back(DepEntry {address, value, slot});
+	}
+
 	struct MemoSlot {
 		const Inst* key   = nullptr;
 		uint64_t    value = 0;
+		// The slice of the log this subtree appended, replayed on a hit.
+		uint32_t    log_start  = 0;
+		uint32_t    log_count  = 0;
+		bool        overflowed = false;
 		// "Currently being evaluated" lives here rather than in a separate vector: the old cycle
 		// check was a linear scan of m_visiting on EVERY node, and expressions are 10-20 deep.
 		bool        done  = false;
@@ -940,13 +1000,14 @@ private:
 	}
 
 	// Returns: 1 = resolved (out set), 0 = not present, -1 = currently being evaluated (cycle).
-	int MemoLookup(const Inst* inst, uint64_t& out) const {
+	int MemoLookup(const Inst* inst, uint64_t& out) {
 		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
 			if (m_memo[i].key == inst) {
 				if (!m_memo[i].done) {
 					return -1;
 				}
 				out = m_memo[i].value;
+				ReplayMemo(m_memo[i]);
 				return 1;
 			}
 			if (m_memo[i].key == nullptr) {
@@ -969,12 +1030,38 @@ private:
 		}
 	}
 
-	void MemoInsert(const Inst* inst, uint64_t value) {
+	// A memo hit performs no reads, so without this the enclosing expression would record
+	// nothing for the subtree it just reused - and a cache entry built from that window would
+	// revalidate as unchanged no matter what those inputs did.
+	void ReplayMemo(const MemoSlot& slot) {
+		if (!m_record) {
+			return;
+		}
+		if (slot.overflowed) {
+			MarkOverflow();
+			return;
+		}
+		if (slot.log_count == 0) {
+			return;
+		}
+		if (m_log.size() + slot.log_count > kMaxLogEntries) {
+			MarkOverflow();
+			return;
+		}
+		m_replay_scratch.assign(m_log.begin() + slot.log_start,
+		                        m_log.begin() + slot.log_start + slot.log_count);
+		m_log.insert(m_log.end(), m_replay_scratch.begin(), m_replay_scratch.end());
+	}
+
+	void MemoInsert(const Inst* inst, uint64_t value, uint32_t log_start, uint32_t overflow_start) {
 		for (size_t i = MemoIndex(inst), probe = 0; probe < 8; probe++, i = (i + 1) & (kMemoSize - 1)) {
 			if (m_memo[i].key == nullptr || m_memo[i].key == inst) {
-				m_memo[i].key   = inst;
-				m_memo[i].value = value;
-				m_memo[i].done  = true;
+				m_memo[i].key        = inst;
+				m_memo[i].value      = value;
+				m_memo[i].done       = true;
+				m_memo[i].log_start  = log_start;
+				m_memo[i].log_count  = static_cast<uint32_t>(m_log.size()) - log_start;
+				m_memo[i].overflowed = m_overflow_count != overflow_start;
 				return;
 			}
 		}
@@ -1014,12 +1101,41 @@ struct DescriptorEntry {
 	bool                     valid = false;
 };
 
-constexpr size_t kDescCacheBits = 11;
+// 256 entries x ~460 B ~= 118 KB. An earlier memo in this project measured worse at 24 KB
+// than at 6 KB once it left L1, so size this deliberately rather than making it large.
+constexpr size_t kDescCacheBits = 8;
 constexpr size_t kDescCacheSize = size_t {1} << kDescCacheBits;
 
 std::array<DescriptorEntry, kDescCacheSize>& DescriptorCache() {
 	static thread_local std::array<DescriptorEntry, kDescCacheSize> cache;
 	return cache;
+}
+
+// Hit rate decides whether this cache is worth its memory at all; without it, enabling the
+// flag and reading a frame time cannot tell a working cache from a cache that never hits.
+std::atomic<uint64_t> g_desc_lookups {0};
+std::atomic<uint64_t> g_desc_hits {0};
+std::atomic<uint64_t> g_desc_uncacheable {0};
+
+void DescriptorCacheTick(bool hit, bool uncacheable) {
+	const auto total = g_desc_lookups.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (hit) {
+		g_desc_hits.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (uncacheable) {
+		g_desc_uncacheable.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (total % 200000 == 0) {
+		const auto hits = g_desc_hits.load(std::memory_order_relaxed);
+		const auto over = g_desc_uncacheable.load(std::memory_order_relaxed);
+		std::printf("DescriptorCacheCensus: lookups=%llu hits=%llu (%.1f%%) uncacheable=%llu "
+		            "(%.1f%%)\n",
+		            static_cast<unsigned long long>(total),
+		            static_cast<unsigned long long>(hits),
+		            100.0 * static_cast<double>(hits) / static_cast<double>(total),
+		            static_cast<unsigned long long>(over),
+		            100.0 * static_cast<double>(over) / static_cast<double>(total));
+	}
 }
 
 size_t DescriptorSlot(const void* program, uint32_t source) {
@@ -1035,22 +1151,18 @@ bool DependenciesStillHold(const Evaluator::Dependencies& deps,
 	if (deps.overflowed) {
 		return false;
 	}
-	uint32_t i = 0;
-	uint64_t m = deps.user_data_mask;
-	while (m != 0) {
-		const auto slot = static_cast<size_t>(std::countr_zero(m));
-		m &= m - 1;
-		if (slot >= user_data.size() || i >= deps.slot_count ||
-		    user_data[slot] != deps.slot_values[i]) {
-			return false;
-		}
-		i++;
-	}
-	for (uint32_t r = 0; r < deps.read_count; r++) {
-		uint32_t current = 0;
-		std::memcpy(&current, reinterpret_cast<const void*>(deps.addresses[r]), sizeof(current));
-		if (current != deps.values[r]) {
-			return false;
+	for (uint32_t i = 0; i < deps.count; i++) {
+		const auto& input = deps.inputs[i];
+		if (input.slot != Evaluator::kNoSlot) {
+			if (input.slot >= user_data.size() || user_data[input.slot] != input.value) {
+				return false;
+			}
+		} else {
+			uint32_t current = 0;
+			std::memcpy(&current, reinterpret_cast<const void*>(input.address), sizeof(current));
+			if (current != input.value) {
+				return false;
+			}
 		}
 	}
 	return true;
@@ -1078,8 +1190,10 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 	}
 	SrtRuntime clean_runtime  = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
+	const bool                   use_cache = Config::CacheDescriptors();
 	Evaluator                    clean_evaluator(program, clean_runtime);
 	Evaluator                    evaluator(program, runtime, clean_flat_slots, &clean_evaluator);
+	evaluator.SetRecording(use_cache);
 	std::vector<DescriptorValue> evaluated;
 	evaluated.reserve(requests.size());
 	for (const auto& request: requests) {
@@ -1095,12 +1209,12 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 		DescriptorValue value;
 		value.dword_count = source->dword_count;
 
-		const bool use_cache = Config::CacheDescriptors();
-		auto&      slot      = DescriptorCache()[DescriptorSlot(&program, request.source)];
+		auto& slot = DescriptorCache()[DescriptorSlot(&program, request.source)];
 		if (use_cache && slot.valid && slot.program == &program &&
 		    slot.program_hash == program.shader_hash && slot.source == request.source &&
 		    slot.dword_count == source->dword_count &&
 		    DependenciesStillHold(slot.deps, runtime.user_data)) {
+			DescriptorCacheTick(true, false);
 			evaluated.push_back(slot.value);
 			continue;
 		}
@@ -1112,7 +1226,8 @@ bool EvaluateRuntimeSourcesImpl(const Program&                           program
 			}
 		}
 		if (use_cache) {
-			const auto& deps = evaluator.RecordedDependencies();
+			const auto deps = evaluator.RecordedDependencies();
+			DescriptorCacheTick(false, deps.overflowed);
 			if (!deps.overflowed) {
 				slot.program      = &program;
 				slot.program_hash = program.shader_hash;

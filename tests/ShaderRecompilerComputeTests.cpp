@@ -24351,6 +24351,69 @@ void CheckDepthAttachmentWrites() {
   std::printf("[host]    %-32s ok\n", "DepthAttachmentWrites");
 }
 
+
+// Two descriptor sources sharing one subexpression. The evaluator memoizes shared nodes across
+// the batch, so the second source's walk never reaches the GetUserData node and never records
+// it as a dependency. If the descriptor cache stores that entry with the resulting incomplete
+// dependency set, the entry revalidates as "unchanged" forever and the second descriptor keeps
+// a stale value the moment the user data changes. This drives exactly that sequence.
+void CheckDescriptorCacheSharedSubtree() {
+  constexpr const char *name = "DescriptorCacheSharedSubtree";
+  EnsureConfigInitialized();
+  Config::ConfigOptions options;
+  options.printf_direction = Config::OutputDirection::Silent;
+  options.cache_descriptors = true;
+  Config::Load(options);
+
+  namespace IR = Libs::Graphics::ShaderRecompiler::IR;
+
+  IR::Inst shared(IR::ValueOpcode::GetUserData);
+  shared.SetArg(0, IR::Value(static_cast<IR::ScalarReg>(0)));
+
+  IR::Program program;
+  program.srt_plan_complete = true;
+  program.user_data_base = 0;
+  program.user_data_count = 64;
+  program.shader_hash = 0x5137c0de5137c0deull;
+  program.descriptor_sources.resize(2);
+  for (auto &source : program.descriptor_sources) {
+    source.dword_count = 1;
+    source.dwords[0] = IR::Value(&shared);
+  }
+
+  const IR::DescriptorSourceRequest requests[] = {{0, 0}, {1, 0}};
+
+  auto evaluate = [&](uint32_t user_value, std::vector<IR::DescriptorValue> &out) {
+    const uint32_t user_data[] = {user_value};
+    IR::SrtRuntime runtime;
+    runtime.user_data = user_data;
+    std::string error;
+    const bool ok =
+        IR::EvaluateDescriptorSources(program, requests, runtime, out, &error);
+    Require(name, "evaluate", ok, "descriptor evaluation failed: " + error);
+  };
+
+  // First pass populates the cache: source 0 walks and records, source 1 hits the memo.
+  std::vector<IR::DescriptorValue> first;
+  evaluate(0x11111111u, first);
+  Require(name, "first pass", first.size() == 2 && first[0].dwords[0] == 0x11111111u &&
+                                  first[1].dwords[0] == 0x11111111u,
+          "initial evaluation did not read the user data");
+
+  // The only input either descriptor depends on has changed, so both must change with it.
+  std::vector<IR::DescriptorValue> second;
+  evaluate(0x22222222u, second);
+  Require(name, "walked source revalidated",
+          second.size() == 2 && second[0].dwords[0] == 0x22222222u,
+          "the directly-walked descriptor went stale");
+  Require(name, "shared subtree revalidated", second[1].dwords[0] == 0x22222222u,
+          "a descriptor whose only input reached it through a memo hit kept a stale value");
+
+  // Restore the shipped default so later tests are unaffected.
+  options.cache_descriptors = false;
+  Config::Load(options);
+}
+
 // The tile-size memo is keyed on every argument TileGetTextureSize takes, so a hit must be
 // indistinguishable from a recomputation. The cache holds 16 entries; this drives far more
 // distinct keys than that, in an interleaved order, so eviction and slot collisions are both
@@ -25736,6 +25799,7 @@ int main(int argc, char **argv) {
     CheckDepthAttachmentWrites();
     CheckDynamicRenderingState();
   CheckTileSizeMemo();
+  CheckDescriptorCacheSharedSubtree();
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColor1DDiscovery();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
@@ -25881,6 +25945,7 @@ int main(int argc, char **argv) {
   CheckDepthAttachmentWrites();
   CheckDynamicRenderingState();
   CheckTileSizeMemo();
+  CheckDescriptorCacheSharedSubtree();
   CheckDepthTargetFootprints();
   CheckSlotVectorLifetime();
 #else
