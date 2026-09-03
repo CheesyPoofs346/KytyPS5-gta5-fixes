@@ -201,8 +201,18 @@ struct PipelineCache::ProgramCache {
 		BuildStageStaticKey(input_info, key_scratch);
 		auto& permutations = programs[{stage, params.hash}];
 		for (const auto& permutation: permutations) {
-			if (permutation.static_key == key_scratch &&
-			    MaterializeProgram(permutation.program, params, input_info)) {
+			if (permutation.static_key != key_scratch) {
+				continue;
+			}
+			// Same short-circuit as before: only a key match reaches materialization, and a
+			// failed materialization keeps searching. Timed apart from the lock and key compare
+			// that surround it, because the two want completely different fixes.
+			bool materialized = false;
+			{
+				DrawPhaseTimer materialize_timer(DrawPhase::ShaderMaterialize);
+				materialized = MaterializeProgram(permutation.program, params, input_info);
+			}
+			if (materialized) {
 				return permutation.handle;
 			}
 		}
@@ -457,7 +467,7 @@ ShaderProgram PipelineCache::GetVertexProgram(const HW::VertexShaderInfo& regs,
 	DrawPhaseTimer params_timer(DrawPhase::ShaderParams);
 	const auto     params = PrepareVertexParams(regs, sh, input_info);
 	params_timer.Stop();
-	DrawPhaseTimer materialize_timer(DrawPhase::ShaderMaterialize);
+	DrawPhaseTimer lookup_timer(DrawPhase::ShaderLookup);
 	return MaterializeVertexProgram(params, input_info);
 }
 
@@ -483,7 +493,7 @@ ShaderProgram PipelineCache::GetPixelProgram(
 	DrawPhaseTimer params_timer(DrawPhase::ShaderParams);
 	const auto params = PreparePixelParams(regs, sh, vertex_info, target_export_mapping, input_info);
 	params_timer.Stop();
-	DrawPhaseTimer materialize_timer(DrawPhase::ShaderMaterialize);
+	DrawPhaseTimer lookup_timer(DrawPhase::ShaderLookup);
 	return MaterializePixelProgram(params, input_info);
 }
 

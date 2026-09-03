@@ -24,6 +24,7 @@ enum class DrawPhase : uint32_t {
 	RenderState,
 	RefreshShaders,
 	ShaderParams,        // of which
+	ShaderLookup,        // of which, takes the program-cache mutex
 	ShaderMaterialize,   // of which
 	Bindings,
 	BindPrepare,        // of which
@@ -47,6 +48,7 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 	switch (phase) {
 		case DrawPhase::PendingOps:
 		case DrawPhase::ShaderParams:
+		case DrawPhase::ShaderLookup:
 		case DrawPhase::ShaderMaterialize:
 		case DrawPhase::BindPrepare:
 		case DrawPhase::BindFindBuffers:
@@ -64,7 +66,8 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::RenderState: return "PrepareDrawRenderState";
 		case DrawPhase::RefreshShaders: return "RefreshShaders";
 		case DrawPhase::ShaderParams: return "  of which PrepareProgram";
-		case DrawPhase::ShaderMaterialize: return "  of which lookup+materialize";
+		case DrawPhase::ShaderLookup: return "  of which cache lookup (locked)";
+		case DrawPhase::ShaderMaterialize: return "  of which SRT materialize";
 		case DrawPhase::Bindings: return "PrepareGraphicsBindings";
 		case DrawPhase::BindPrepare: return "  of which PrepareBindings";
 		case DrawPhase::BindFindBuffers: return "  of which FindBuffers";
@@ -111,7 +114,12 @@ inline uint64_t DrawProfileReadCycles() {
 class DrawPhaseTimer {
 public:
 	explicit DrawPhaseTimer(DrawPhase phase): m_phase(phase) {
-		if (g_draw_profile.active) {
+		// Latch whether profiling was on at construction. Reading g_draw_profile.active again in
+		// Stop() is wrong: a timer opened before the first draw of a frame (active still false)
+		// would then subtract a start of 0 from a full TSC value and poison the accumulator with
+		// ~10^13 cycles. That is what made the PM4 phase report 670 us/draw.
+		m_active = g_draw_profile.active;
+		if (m_active) {
 			m_start = DrawProfileReadCycles();
 		}
 	}
@@ -120,7 +128,7 @@ public:
 
 	// Phases interleave with declarations that outlive them, so they cannot all be plain scopes.
 	void Stop() {
-		if (g_draw_profile.active && !m_stopped) {
+		if (m_active && !m_stopped) {
 			g_draw_profile.cycles[static_cast<size_t>(m_phase)] +=
 			    DrawProfileReadCycles() - m_start;
 			m_stopped = true;
@@ -135,6 +143,7 @@ public:
 private:
 	DrawPhase m_phase;
 	uint64_t  m_start   = 0;
+	bool      m_active  = false;
 	bool      m_stopped = false;
 };
 
