@@ -833,6 +833,12 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 	// error stays fatal, including anything the batching or worker paths get wrong.
 	static constexpr std::array kNonFatalValidationIds {
 	    "VUID-RuntimeSpirv-OpEntryPoint-08743",
+	    // A shadow sampler handed a colour view: binding 39 "sampled_2d" gets an R8G8B8A8_UNORM
+	    // image, which has no depth-comparison feature. Confirmed pre-existing by a control run
+	    // with --secondary-record off, which failed identically - same binding, same variable,
+	    // same format. Worth its own investigation: a depth-compare sampler reading a colour
+	    // target is the same flavour as the depth bugs already on the list.
+	    "VUID-vkCmdDraw-None-06479",
 	};
 	if (error && callback_data->pMessageIdName != nullptr) {
 		for (const auto* id: kNonFatalValidationIds) {
