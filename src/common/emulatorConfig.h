@@ -60,6 +60,7 @@ struct ConfigOptions {
 	// rendering regression can be attributed without a rebuild.
 	bool                   dyn_state_cache             = true;
 	bool                   hw_check                    = true;
+	bool                   draw_profile                = false;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -154,6 +155,7 @@ bool     ParallelResolveEnabled();
 bool     CacheDescriptors();
 bool     DynStateCacheEnabled();
 bool     HwCheckEnabled();
+bool     DrawProfileEnabled();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();

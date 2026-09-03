@@ -350,6 +350,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--draw-profile") {
+			if (!ParseBool(value, options.config.draw_profile)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--hw-check") {
 			if (!ParseBool(value, options.config.hw_check)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());

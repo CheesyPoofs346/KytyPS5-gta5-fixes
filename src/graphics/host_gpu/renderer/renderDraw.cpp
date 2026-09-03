@@ -49,6 +49,146 @@
 
 namespace Libs::Graphics {
 
+namespace {
+
+// The Tracy breakdown accounts for ~11.5 of the ~16 us a draw costs; nobody has established
+// where the rest goes, and a stage with no zone is invisible. These phases tile the whole of
+// DrawIndex, so the printed table shows the remainder explicitly instead of leaving it implied.
+//
+// rdtsc rather than steady_clock: a clock pair costs ~31 ns, which at a dozen phases would be
+// most of what is being measured. Cycles are converted once at print time against wall clock
+// elapsed over the whole measured span, so no TSC frequency needs to be assumed.
+enum class DrawPhase : uint32_t {
+	Preamble,
+	RenderState,
+	RefreshShaders,
+	Bindings,
+	VertexIndex,
+	RenderTargets,
+	Pipeline,
+	Commit,
+	DynState,
+	BeginRendering,
+	Emit,
+	Total,
+	Count,
+};
+
+const char* DrawPhaseName(DrawPhase phase) {
+	switch (phase) {
+		case DrawPhase::Preamble: return "preamble+checks";
+		case DrawPhase::RenderState: return "PrepareDrawRenderState";
+		case DrawPhase::RefreshShaders: return "RefreshShaders";
+		case DrawPhase::Bindings: return "PrepareGraphicsBindings";
+		case DrawPhase::VertexIndex: return "vertex+index buffers";
+		case DrawPhase::RenderTargets: return "AcquireRenderTargets";
+		case DrawPhase::Pipeline: return "CreateGraphicsPipeline";
+		case DrawPhase::Commit: return "Commit vb/desc/ib";
+		case DrawPhase::DynState: return "SetGraphicsDynamicParams";
+		case DrawPhase::BeginRendering: return "BeginRendering+bind";
+		case DrawPhase::Emit: return "EmitDrawPrimitives";
+		case DrawPhase::Total: return "TOTAL DrawIndex";
+		default: return "?";
+	}
+}
+
+struct DrawProfileState {
+	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> cycles {};
+	uint64_t                              draws   = 0;
+	bool                                  active  = false;
+	bool                                  started = false;
+	std::chrono::steady_clock::time_point wall_start {};
+	uint64_t                              tsc_start = 0;
+};
+
+thread_local DrawProfileState g_draw_profile;
+
+inline uint64_t ReadCycles() {
+	return __builtin_ia32_rdtsc();
+}
+
+class DrawPhaseTimer {
+public:
+	explicit DrawPhaseTimer(DrawPhase phase): m_phase(phase) {
+		if (g_draw_profile.active) {
+			m_start = ReadCycles();
+		}
+	}
+
+	~DrawPhaseTimer() { Stop(); }
+
+	// Phases interleave with declarations that outlive them, so they cannot all be plain scopes.
+	void Stop() {
+		if (g_draw_profile.active && !m_stopped) {
+			g_draw_profile.cycles[static_cast<size_t>(m_phase)] += ReadCycles() - m_start;
+			m_stopped = true;
+		}
+	}
+
+	DrawPhaseTimer(const DrawPhaseTimer&)            = delete;
+	DrawPhaseTimer& operator=(const DrawPhaseTimer&) = delete;
+
+private:
+	DrawPhase m_phase;
+	uint64_t  m_start   = 0;
+	bool      m_stopped = false;
+};
+
+// Called once per draw, at the top of DrawIndex, before any phase timer.
+void DrawProfileBeginDraw() {
+	auto& profile  = g_draw_profile;
+	profile.active = Config::DrawProfileEnabled();
+	if (!profile.active) {
+		return;
+	}
+	if (!profile.started) {
+		profile.started    = true;
+		profile.wall_start = std::chrono::steady_clock::now();
+		profile.tsc_start  = ReadCycles();
+	}
+}
+
+void DrawProfileEndDraw() {
+	auto& profile = g_draw_profile;
+	if (!profile.active) {
+		return;
+	}
+	profile.draws++;
+	if (profile.draws % 200000 != 0) {
+		return;
+	}
+	const auto wall_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                         std::chrono::steady_clock::now() - profile.wall_start)
+	                         .count();
+	const auto tsc = ReadCycles() - profile.tsc_start;
+	if (tsc == 0 || wall_ns <= 0) {
+		return;
+	}
+	const double ns_per_cycle = static_cast<double>(wall_ns) / static_cast<double>(tsc);
+	const double draws        = static_cast<double>(profile.draws);
+	std::printf("DrawProfile: %llu draws, %.2f GHz effective\n",
+	            static_cast<unsigned long long>(profile.draws), 1.0 / ns_per_cycle);
+	double accounted = 0.0;
+	for (uint32_t i = 0; i < static_cast<uint32_t>(DrawPhase::Count); i++) {
+		const auto   phase = static_cast<DrawPhase>(i);
+		const double ns    = static_cast<double>(profile.cycles[i]) * ns_per_cycle / draws;
+		if (phase != DrawPhase::Total) {
+			accounted += ns;
+		}
+		std::printf("  %-26s %8.3f us/draw\n", DrawPhaseName(phase), ns / 1000.0);
+	}
+	const double total =
+	    static_cast<double>(profile.cycles[static_cast<size_t>(DrawPhase::Total)]) * ns_per_cycle /
+	    draws;
+	std::printf("  %-26s %8.3f us/draw  (%.1f%% of total)\n", "sum of phases", accounted / 1000.0,
+	            total > 0.0 ? 100.0 * accounted / total : 0.0);
+	std::printf("  %-26s %8.3f us/draw\n", "UNACCOUNTED", (total - accounted) / 1000.0);
+	std::fflush(stdout);
+}
+
+} // namespace
+
+
 int32_t ResolveVertexOffset(uint32_t index_offset, const ShaderVertexInputInfo& vs_input_info) {
 	if (index_offset != 0 || !vs_input_info.fetch_embedded) {
 		return static_cast<int32_t>(index_offset);
@@ -1663,10 +1803,14 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
+	DrawPhaseTimer bindings_timer(DrawPhase::Bindings);
 	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
 	                                        state.ps_active);
+	bindings_timer.Stop();
+	DrawPhaseTimer vertex_index_timer(DrawPhase::VertexIndex);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
+	vertex_index_timer.Stop();
 	// GTA's missing world models all arrive here with the same pixel shader and reversed-Z
 	// GEQUAL. Capture the target immediately before that test; AcquireRenderTargets restores the
 	// attachment layout after this diagnostic copy.
@@ -1678,8 +1822,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    depth_image, static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
 		    state.depth_info.desc.view_info.base_layer, state.depth_info.depth_buffer_vaddr);
 	}
+	DrawPhaseTimer render_target_timer(DrawPhase::RenderTargets);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
+	render_target_timer.Stop();
 	{
 		const auto& dc_probe = buffer.GetRegisters().GetDepthControl();
 		const auto& vp_probe = buffer.GetRegisters().GetScreenViewport().viewports[0];
@@ -1710,10 +1856,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
+	DrawPhaseTimer pipeline_timer(DrawPhase::Pipeline);
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.vertex_program, state.pixel_program, draw.index_count);
+	pipeline_timer.Stop();
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1725,6 +1873,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x200u);
 	}
+	DrawPhaseTimer commit_timer(DrawPhase::Commit);
 	CommitVertexBuffers(vk_buffer, vertex_bindings);
 	if (bindings.pixel.has_value()) {
 		if (set_auto_debug) {
@@ -1745,15 +1894,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		ReturnPooledBindingStorage(*bindings.pixel);
 	}
 	CommitIndexBuffer(vk_buffer, index_binding);
+	commit_timer.Stop();
 
+	DrawPhaseTimer dyn_state_timer(DrawPhase::DynState);
 	SetGraphicsDynamicParams(buffer, vk_buffer, state.color_info, state.color_count,
 	                         state.depth_info,
 	                         state.ps_active ? state.ps_input_info.mrt_output_mask : 0u, draw.index_count);
+	dyn_state_timer.Stop();
 
 	LogDrawPhase(draw.name, "BeginRendering");
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
+	DrawPhaseTimer begin_rendering_timer(DrawPhase::BeginRendering);
 	m_context.GetCommandScheduler().BeginRendering(state.rendering);
 	{
 		// Consecutive draws frequently reuse a pipeline even when their bindings differ, so this
@@ -1840,6 +1993,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 	}
 	DrawCensusTick();
+		begin_rendering_timer.Stop();
+		DrawPhaseTimer emit_timer(DrawPhase::Emit);
 		EmitDrawPrimitives(ucfg, vk_buffer, state.vs_input_info, draw, emit);
 	}
 
@@ -1869,6 +2024,13 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                uint32_t instance_count, uint32_t render_target_slice_offset,
                                int32_t vertex_offset_add, uint32_t first_instance) {
 	KYTY_PROFILER_FUNCTION();
+
+	DrawProfileBeginDraw();
+	struct DrawProfileEndGuard {
+		~DrawProfileEndGuard() { DrawProfileEndDraw(); }
+	} draw_profile_end_guard;
+	DrawPhaseTimer draw_total_timer(DrawPhase::Total);
+	DrawPhaseTimer draw_preamble_timer(DrawPhase::Preamble);
 
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
@@ -2023,12 +2185,22 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	index_source.type = index_type;
 
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, true, state)) {
+	draw_preamble_timer.Stop();
+	bool render_state_ok = false;
+	{
+		DrawPhaseTimer timer(DrawPhase::RenderState);
+		render_state_ok =
+		    PrepareDrawRenderState(submit_id, buffer, draw, render_target_slice_offset, true, state);
+	}
+	if (!render_state_ok) {
 		ResetBindings();
 		return;
 	}
 
-	RefreshShaders(buffer, draw, true, state);
+	{
+		DrawPhaseTimer timer(DrawPhase::RefreshShaders);
+		RefreshShaders(buffer, draw, true, state);
+	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, true, false, index_type_and_size, index_addr);
 
@@ -2050,6 +2222,12 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_
                               uint32_t instance_count, uint32_t first_vertex,
                               uint32_t first_instance) {
 	KYTY_PROFILER_FUNCTION();
+
+	DrawProfileBeginDraw();
+	struct DrawProfileEndGuard {
+		~DrawProfileEndGuard() { DrawProfileEndDraw(); }
+	} draw_profile_end_guard;
+	DrawPhaseTimer draw_total_timer(DrawPhase::Total);
 
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();

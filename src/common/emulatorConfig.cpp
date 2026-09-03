@@ -20,6 +20,7 @@ static std::atomic<bool> g_dyn_state_cache {true};
 // Per-draw register validation and the descriptor cache are toggled live by the F7 harness,
 // so they are atomics rather than plain config fields.
 static std::atomic<bool> g_hw_check {true};
+static std::atomic<bool> g_draw_profile {false};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
@@ -43,6 +44,7 @@ void Load(const ConfigOptions& cfg) {
 	g_pad_speaker_muted.store(cfg.pad_speaker_muted, std::memory_order_relaxed);
 	g_dyn_state_cache.store(cfg.dyn_state_cache, std::memory_order_relaxed);
 	g_hw_check.store(cfg.hw_check, std::memory_order_relaxed);
+	g_draw_profile.store(cfg.draw_profile, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
@@ -123,6 +125,10 @@ void SetCacheDescriptors(bool enabled) {
 
 bool HwCheckEnabled() {
 	return g_hw_check.load(std::memory_order_relaxed);
+}
+
+bool DrawProfileEnabled() {
+	return g_draw_profile.load(std::memory_order_relaxed);
 }
 
 void SetHwCheck(bool enabled) {
