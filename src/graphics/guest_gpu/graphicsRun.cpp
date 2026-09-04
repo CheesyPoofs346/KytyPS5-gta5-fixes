@@ -1,3 +1,4 @@
+#include <chrono>
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "graphics/host_gpu/renderer/drawProfile.h"
@@ -37,6 +38,53 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+// Frame thread census.
+//
+// Every measurement so far has been INSIDE a draw. None of it explains a 16-thread machine sitting
+// at 20-30%. This measures the frame at the thread level instead: how long the guest thread is
+// blocked in WaitForIdle, and how long the GPU thread is actually processing versus idle.
+//
+// The architecture makes the question sharp. Submission::commands is a std::span into GUEST
+// memory, not a copy, so the guest may not reuse its command buffer until the GPU thread is done
+// reading it - which is what Done() -> WaitForIdle() enforces, once per frame (m_done_num is the
+// frame counter the whole profiler uses). Guest and GPU thread therefore alternate instead of
+// pipelining. What that costs depends entirely on the split this prints.
+namespace {
+
+std::atomic<uint64_t> g_guest_blocked_ns {0};   // guest thread inside WaitForIdle
+std::atomic<uint64_t> g_gpu_busy_ns {0};        // GPU thread inside Process()
+std::atomic<uint64_t> g_census_frames {0};
+std::chrono::steady_clock::time_point g_census_start {};
+
+void ReportFrameThreadCensus(int frame) {
+	if (frame % 300 != 0) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (g_census_start.time_since_epoch().count() == 0) {
+		g_census_start = now;
+		return;
+	}
+	const auto wall_ns =
+	    static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - g_census_start)
+	                            .count());
+	const auto frames  = static_cast<double>(g_census_frames.exchange(0, std::memory_order_relaxed));
+	const auto blocked = static_cast<double>(g_guest_blocked_ns.exchange(0, std::memory_order_relaxed));
+	const auto busy    = static_cast<double>(g_gpu_busy_ns.exchange(0, std::memory_order_relaxed));
+	if (frames > 0.0 && wall_ns > 0.0) {
+		std::printf("FrameThreads: %.1f ms/frame | guest blocked %.1f ms (%.0f%%) | gpu busy %.1f ms "
+		            "(%.0f%%) | overlap headroom %.1f ms\n",
+		            wall_ns / frames / 1e6, blocked / frames / 1e6, 100.0 * blocked / wall_ns,
+		            busy / frames / 1e6, 100.0 * busy / wall_ns,
+		            (wall_ns - busy) / frames / 1e6);
+		std::fflush(stdout);
+	}
+	g_census_start = now;
+}
+
+} // namespace
+
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
@@ -192,7 +240,9 @@ void GuestGpu::Done() {
 		WaitForIdle();
 	}
 	m_graphics_done = true;
-	m_done_num++;
+	const auto frame = ++m_done_num;
+	g_census_frames.fetch_add(1, std::memory_order_relaxed);
+	ReportFrameThreadCensus(frame);
 }
 
 int GuestGpu::GetFrameNum() const {
@@ -458,10 +508,16 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForIdle() {
+	const auto        start = std::chrono::steady_clock::now();
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
 	}
+	g_guest_blocked_ns.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                              std::chrono::steady_clock::now() - start)
+	                              .count()),
+	    std::memory_order_relaxed);
 }
 
 void GuestGpu::ThreadRun(void* data) {
@@ -540,7 +596,13 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
-		const bool complete = gpu->Process(submission);
+		const auto process_start = std::chrono::steady_clock::now();
+		const bool complete      = gpu->Process(submission);
+		g_gpu_busy_ns.fetch_add(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - process_start)
+		                              .count()),
+		    std::memory_order_relaxed);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
 		if (!complete) {
