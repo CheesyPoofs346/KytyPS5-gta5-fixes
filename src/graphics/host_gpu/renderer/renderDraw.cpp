@@ -2512,6 +2512,7 @@ void FlushSecondaryBatch(RenderContext& context) {
 	// the transitions that put those images into their sampled layout for the draws.
 	context.GetTextureCache().FlushPendingClears();
 	context.GetTextureCache().FlushDeferredTouches();
+	context.GetTextureCache().FlushDeferredTracks();
 	context.GetRenderExecutor().FlushPendingTransitions(context.GetCommandScheduler().Current());
 	context.GetBufferCache().FlushPendingUploads();
 

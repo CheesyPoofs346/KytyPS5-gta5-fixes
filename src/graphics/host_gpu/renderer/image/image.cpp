@@ -715,7 +715,9 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 
 uint64_t Image::HashGuestEdges() const {
 	constexpr uint64_t                         page_mask = TRACKER_PAGE_SIZE - 1;
-	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
+	// Deliberately not value-initialised. Only the head_size + tail_size bytes filled below are
+	// ever read, and zeroing all 8 KiB first cost about as much as the hash itself.
+	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes;   // NOLINT(*-member-init)
 	const auto                                 range = info.data;
 	const uint64_t head_end     = std::min(range.End(), (range.address + page_mask) & ~page_mask);
 	const uint64_t tail_begin   = std::max(range.address, range.End() & ~page_mask);

@@ -111,6 +111,9 @@ public:
 
 	// Merges the workers' recorded LRU touches. Main thread only.
 	void               FlushDeferredTouches();
+
+	// Re-arms the page watchers for images a worker found stale. Main thread only.
+	void               FlushDeferredTracks();
 	[[nodiscard]] bool HasPendingClears() const noexcept { return !m_pending_clears.empty(); }
 
 private:
@@ -211,6 +214,8 @@ private:
 	std::vector<PendingClear>                         m_pending_clears;
 	std::vector<std::vector<size_t>>                  m_deferred_touch =
 	    std::vector<std::vector<size_t>>(kMaxDrawWorkers);
+	std::vector<std::vector<ImageId>>                 m_deferred_track =
+	    std::vector<std::vector<ImageId>>(kMaxDrawWorkers);
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;

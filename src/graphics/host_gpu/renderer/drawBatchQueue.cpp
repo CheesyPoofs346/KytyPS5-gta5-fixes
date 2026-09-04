@@ -14,6 +14,9 @@ namespace Libs::Graphics {
 // 10496 bytes when PreparedShaders was embedded, which cost ~3.2 us/draw on its own.
 static_assert(sizeof(QueuedDraw) <= 128, "QueuedDraw must stay small - see m_prepared");
 
+// Defined in textureCache.cpp; declared here rather than in the public header because it is a
+// diagnostic, not part of the cache's interface.
+void ReportHashCensus();
 namespace {
 
 // ParallelFor pays a fixed dispatch cost per batch, so its value depends entirely on how many
@@ -39,6 +42,7 @@ void NoteBatchSize(size_t size) {
 	                                  : 5;
 	t_drain.buckets[bucket]++;
 }
+
 
 void ReportDrainCensus() {
 	if (t_drain.drains % 2000 != 0) {
@@ -144,6 +148,9 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	}
 	t_drain.record_cyc += __builtin_ia32_rdtsc() - record_start;
 	ReportDrainCensus();
+	if (t_drain.drains % 2000 == 0) {
+		ReportHashCensus();
+	}
 }
 
 } // namespace Libs::Graphics
