@@ -278,6 +278,12 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	}
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
 	                                                              resource.formatted, id);
+	if (buffer == nullptr) {
+		// A worker abandoned the draw inside ObtainBuffer - a written buffer, which publishes into
+		// shared state. The half-built view is discarded with the rest of the prepared entry and
+		// phase 3 rebuilds the bindings serially.
+		return result;
+	}
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;

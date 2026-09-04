@@ -604,10 +604,26 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid() || vaddr == 0 || size == 0 ||
-	    vaddr >= TRACKER_ADDRESS_SIZE || size > TRACKER_ADDRESS_SIZE - vaddr) {
+	// Address validity is a property of the request and always holds.
+	if (vaddr == 0 || size == 0 || vaddr >= TRACKER_ADDRESS_SIZE ||
+	    size > TRACKER_ADDRESS_SIZE - vaddr) {
+		EXIT("BufferCache: invalid buffer request range\n");
+	}
+	// A recording command buffer is a precondition only for the caller that records inline.
+	// SynchronizeBuffer already stages its upload when MustStageForWorker(), and the staged work
+	// is replayed on the main thread at the batch flush, so a worker resolving between
+	// submissions - where Current() is legitimately invalid - is not an error. Enforcing it there
+	// is what aborted the first parallel-bindings run.
+	if (!MustStageForWorker() && m_scheduler.Current().IsInvalid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
+	}
+
+	// A written buffer publishes into m_gpu_modified_ranges below, which is shared and has no
+	// per-worker staging. Writable bindings are a small minority, so a worker abandons the draw
+	// rather than the cache growing another deferral path for them.
+	if (is_written && MustStageForWorker()) {
+		RequestWorkerBailout();
+		return {nullptr, 0};
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
@@ -615,10 +631,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
-		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
+		// Through the selector, not m_stream_buffer directly. A StreamBuffer is bump-allocated
+		// from one cursor, so two workers mapping the shared ring are handed overlapping regions
+		// and silently overwrite each other's uniform and vertex data - which is exactly the
+		// stretched geometry and detached meshes the first attempt produced. Slot 0 resolves back
+		// to m_stream_buffer, so the main thread's behaviour is unchanged.
+		auto& stream          = GetUtilityBuffer(MemoryUsage::Stream);
+		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
-			m_stream_buffer.Commit();
-			return {&m_stream_buffer, offset};
+			stream.Commit();
+			return {&stream, offset};
 		}
 	}
 
