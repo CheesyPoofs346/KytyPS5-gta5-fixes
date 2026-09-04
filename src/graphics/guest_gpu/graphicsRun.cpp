@@ -55,6 +55,11 @@ namespace {
 std::atomic<uint64_t> g_guest_blocked_ns {0};   // guest thread inside WaitForIdle
 std::atomic<uint64_t> g_gpu_busy_ns {0};        // GPU thread inside Process()
 std::atomic<uint64_t> g_census_frames {0};
+// When every queued submission is blocked - DE/CE interleaving that cannot progress - the GPU
+// thread sleeps 100us and retries. That is a poll, not a wait on an event, so if it fires often it
+// is pure dead time on the one thread that does all the work.
+std::atomic<uint64_t> g_blocked_polls {0};
+std::atomic<uint64_t> g_blocked_poll_ns {0};
 std::chrono::steady_clock::time_point g_census_start {};
 
 void ReportFrameThreadCensus(int frame) {
@@ -78,6 +83,12 @@ void ReportFrameThreadCensus(int frame) {
 		            wall_ns / frames / 1e6, blocked / frames / 1e6, 100.0 * blocked / wall_ns,
 		            busy / frames / 1e6, 100.0 * busy / wall_ns,
 		            (wall_ns - busy) / frames / 1e6);
+		const auto polls    = g_blocked_polls.exchange(0, std::memory_order_relaxed);
+		const auto poll_ns  = g_blocked_poll_ns.exchange(0, std::memory_order_relaxed);
+		std::printf("  blocked-queue polls: %.1f/frame costing %.2f ms/frame (%.0f%% of wall)\n",
+		            static_cast<double>(polls) / frames,
+		            static_cast<double>(poll_ns) / frames / 1e6,
+		            100.0 * static_cast<double>(poll_ns) / wall_ns);
 		std::fflush(stdout);
 	}
 	g_census_start = now;
@@ -595,7 +606,14 @@ void GuestGpu::ThreadRun(void* data) {
 				}
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
+					const auto poll_start = std::chrono::steady_clock::now();
 					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					g_blocked_polls.fetch_add(1, std::memory_order_relaxed);
+					g_blocked_poll_ns.fetch_add(
+					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                              std::chrono::steady_clock::now() - poll_start)
+					                              .count()),
+					    std::memory_order_relaxed);
 					for (auto& queue: gpu->m_queues) {
 						if (!queue.empty()) {
 							queue.front().blocked = false;
