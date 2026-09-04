@@ -1245,13 +1245,6 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	}
 	if (bindings.vertex.program->info.uses_dma ||
 	    (bindings.pixel && bindings.pixel->program->info.uses_dma)) {
-		// PrepareBda mutates shared GPU resource state, so a worker abandons the draw and phase 3
-		// rebuilds its bindings inline - the same bail-out the texture cache paths use. Returning
-		// the half-built bindings is safe because the caller drops them on a bail-out.
-		if (MustStageForWorker()) {
-			RequestWorkerBailout();
-			return bindings;
-		}
 		m_context.GetGpuResources().PrepareBda();
 	}
 	RebindBuffers(bindings.vertex);

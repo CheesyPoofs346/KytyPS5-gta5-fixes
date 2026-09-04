@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_DRAWBATCHQUEUE_H_
 
 #include "graphics/host_gpu/renderer/drawStateSnapshot.h"
-#include "graphics/host_gpu/renderer/pipeline/descriptors.h"   // GraphicsBindings
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"   // ShaderProgram
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -40,20 +39,6 @@ struct PreparedShaders {
 	// False when the permutation was not found and needs compiling, which only the serial path
 	// does. Those draws fall back to resolving inline.
 	bool                  valid     = false;
-
-	// Both stages' resource bindings, when phase 2 built them.
-	//
-	// This is the real target: PrepareGraphicsBindings measured 3.865 us of a 9.543 us draw -
-	// 40.5%, four times all Vulkan recording combined. Unlike the SRT walk it is cache lookup and
-	// descriptor building rather than pointer chasing, so it has a reason to scale that the walk
-	// did not. Whether it actually does is what the smoke test answers.
-	//
-	// Heap-owning (six vectors per stage), so entries are reused across drains rather than
-	// reallocated - the same reason PreparedShaders lives in a side vector at all.
-	GraphicsBindings      bindings {};
-	// Separate from `valid`: a draw can resolve its shaders on a worker and still have to build
-	// its bindings serially, when PrepareBda forces a bail-out.
-	bool                  bindings_valid = false;
 };
 
 struct QueuedDraw {

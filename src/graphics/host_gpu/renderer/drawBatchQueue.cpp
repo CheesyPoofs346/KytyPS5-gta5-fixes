@@ -137,16 +137,12 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 			                 // invalidate this one.
 			                 (void)TakeWorkerBailout();
 			                 executor.ResolveQueuedShaders(prepared[index]);
-			                 if (Config::TestParallelBindingsEnabled()) {
-			                 	 executor.ResolveQueuedBindings(prepared[index]);
-			                 }
 			                 if (TakeWorkerBailout()) {
 				                 // The walk reached work only the main thread may do. Whatever it
 				                 // produced is discarded rather than patched up - phase 3 resolves
 				                 // this draw inline, which is the same path an uncompiled
 				                 // permutation already takes.
 				                 prepared[index].valid = false;
-				                 prepared[index].bindings_valid = false;
 				                 g_bailouts.fetch_add(1, std::memory_order_relaxed);
 			                 }
 		                 });
@@ -160,7 +156,8 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	for (size_t i = 0; i < draws.size(); i++) {
 		auto&      draw     = draws[i];
 		const auto previous = bind(draw);
-		auto* prepared = have_prepared && m_prepared[i].valid ? &m_prepared[i] : nullptr;
+		const auto* prepared =
+		    have_prepared && m_prepared[i].valid ? &m_prepared[i] : nullptr;
 		executor.DrawIndex(draw.submit_id, buffer, draw.index_type_and_size, draw.index_count,
 		                   draw.index_addr, draw.flags, draw.type, draw.instance_count,
 		                   draw.render_target_slice_offset, draw.vertex_offset_add,

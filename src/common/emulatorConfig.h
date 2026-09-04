@@ -67,7 +67,7 @@ struct ConfigOptions {
 	bool                   defer_uploads               = false;
 	bool                   defer_transitions           = false;
 	bool                   parallel_resolution         = false;
-	bool                   test_parallel_bindings        = false;
+	bool                   test_parallel_record        = false;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -169,8 +169,8 @@ bool     DrawQueueEnabled();
 bool     DeferUploadsEnabled();
 bool     DeferTransitionsEnabled();
 bool     ParallelResolutionEnabled();
-// Smoke test: build both stages' resource bindings in phase 2 instead of serially per draw.
-bool     TestParallelBindingsEnabled();
+// Smoke test for parallel recording: split a batch across at most 2 secondaries.
+bool     TestParallelRecordEnabled();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();
