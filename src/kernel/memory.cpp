@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -294,7 +295,7 @@ public:
 
 	bool Add(uint64_t start, uint64_t size, uint64_t offset, int protection, int memory_type,
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		if (start == 0 || size == 0) {
@@ -325,7 +326,7 @@ public:
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		auto position = LowerBound(start);
@@ -339,14 +340,14 @@ public:
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 
 		return FindOverlap(start, size) != nullptr;
 	}
 
 	bool QueryOverlap(uint64_t start, uint64_t size, Range* out) {
 		EXIT_IF(out == nullptr);
-		Common::LockGuard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 
 		const auto* overlap = FindOverlap(start, size);
 		if (overlap == nullptr) {
@@ -357,7 +358,7 @@ public:
 	}
 
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
@@ -372,7 +373,7 @@ public:
 
 	bool ConsumeReserved(uint64_t start, uint64_t size,
 	                     VirtualRangeType type = VirtualRangeType::Reserved) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		auto end = End(start, size);
@@ -389,7 +390,7 @@ public:
 
 	bool ConsumeReservedSpan(uint64_t start, uint64_t size, Range* first_range = nullptr,
 	                         VirtualRangeType type = VirtualRangeType::Reserved) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		if (size == 0) {
@@ -421,7 +422,7 @@ public:
 	}
 
 	void Rename(uint64_t start, uint64_t size, const char* name) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		auto position = LowerBound(start);
@@ -434,14 +435,14 @@ public:
 	}
 
 	void Protect(uint64_t start, uint64_t size, int protection) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
 
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
-		Common::LockGuard lock(m_mutex);
+		std::unique_lock lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
@@ -450,7 +451,7 @@ public:
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 
 		auto next = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), addr,
@@ -473,7 +474,7 @@ public:
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		out->clear();
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -554,7 +555,7 @@ public:
 			return size;
 		}
 		const auto        lock_start = __builtin_ia32_rdtsc();
-		Common::LockGuard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 		t_clamp_lock_cycles += __builtin_ia32_rdtsc() - lock_start;
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
@@ -603,7 +604,7 @@ public:
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
-		Common::LockGuard lock(m_mutex);
+		std::shared_lock lock(m_mutex);
 
 		uint64_t used = 0;
 		for (const auto& r: m_ranges) {
@@ -816,7 +817,16 @@ private:
 	// Bumped by every mutating method while holding the lock, so the lock-free clamp fast path
 	// can tell whether its cached range is still valid.
 	std::atomic<uint64_t> m_generation {0};
-	Common::Mutex      m_mutex;
+	// Shared, because the readers dominate and were serialising against each other. With eight
+	// workers each calling ClampRangeSize ~6 times a draw, a miss measured 6902 cycles, of which
+	// the acquisition alone was the majority - and the cost fell to 1621 when the same build ran
+	// with two workers. Contention that scales with thread count is contention between readers.
+	//
+	// Every method that mutates m_ranges keeps unique_lock, including Protect, Rename and
+	// SetMemoryType: those look read-only but EditUnlocked splits a range to apply an attribute to
+	// part of one, which moves boundaries. The six readers only read m_ranges and write through a
+	// caller-provided out pointer.
+	std::shared_mutex m_mutex;
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
