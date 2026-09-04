@@ -1,3 +1,28 @@
+# ABANDONED - measured 2026-09-03, before implementation
+
+`--draw-profile` over a city drive settled it. Of `TOTAL DrawIndex` = 9.543 us/draw:
+
+- Vulkan recording (`Commit` + `DynState` + `BeginRendering+bind` + `Emit`) = **0.904 us, 9.5%**
+- `PrepareGraphicsBindings` alone = **3.865 us, 40.5%**
+
+DrawIndex is 67.7% of frame time, so parallel secondary recording targets ~6.4% of the frame.
+Perfect 8-way parallelism on it is worth about +1 fps. Not worth the refactor.
+
+**Root error:** `DrainCensus`'s `phase3_record = 79.5%` counts the whole serial `DrawIndex` call,
+derivation and recording together. This document was written reading that field name literally, as
+if it meant Vulkan recording. It never did.
+
+**Real target:** `PrepareGraphicsBindings` - resource resolution, not recording, so it belongs in
+phase 2's existing parallel walk rather than in secondaries. See
+[[gta5-real-target-preparegraphicsbindings]].
+
+Steps 1 and 2 of the plan below were built anyway and are kept: the per-secondary generation fix
+(commit 1d8a9dd) repaired a real latent bug, and the thread_local register view (46ca537) and
+unshared draw scratch are prerequisites for running ANY draw work on workers, including the real
+target. Only the partitioning design below is dead.
+
+---
+
 # Parallel secondary command buffer recording — design scope
 
 Target: `phase3_record`, stable at **79.5%** of drain time across every run. Phases 1 and 2 are
