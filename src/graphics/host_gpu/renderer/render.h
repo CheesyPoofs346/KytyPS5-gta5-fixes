@@ -203,7 +203,7 @@ public:
 	               uint32_t index_count, const void* index_addr, uint32_t flags, uint32_t type,
 	               uint32_t instance_count = 1, uint32_t render_target_slice_offset = 0,
 	               int32_t vertex_offset_add = 0, uint32_t first_instance = 0,
-	               const PreparedShaders* prepared = nullptr);
+	               PreparedShaders* prepared = nullptr);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, uint32_t index_count, uint32_t flags,
 	              uint32_t render_target_slice_offset = 0, uint32_t instance_count = 1,
 	              uint32_t first_vertex = 0, uint32_t first_instance = 0);
@@ -225,6 +225,9 @@ public:
 	// Runs the resource walk for an already-located pair. Safe on a worker: it reads guest memory
 	// and writes only into prepared, touching no command buffer, image or cache.
 	void ResolveQueuedShaders(PreparedShaders& prepared);
+	// Builds both stages' bindings for an already-resolved draw, on whatever thread calls it.
+	// Sets prepared.bindings_valid; the caller clears it if the draw bailed out.
+	void ResolveQueuedBindings(PreparedShaders& prepared);
 
 	// A layout transition a draw needs, recorded for later rather than emitted inline.
 	//
@@ -274,7 +277,8 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable, bool log_pipeline_phase,
-	                         bool set_bind_debug, bool set_auto_debug);
+	                         bool set_bind_debug, bool set_auto_debug,
+	                         PreparedShaders* prepared = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth);
 	[[nodiscard]] bool        ResolveColorTargets(uint64_t submit_id, CommandBuffer& buffer,
