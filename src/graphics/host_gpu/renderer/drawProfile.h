@@ -35,6 +35,8 @@ enum class DrawPhase : uint32_t {
 	BindFindBuffers,    // of which
 	BindClampRange,     // of which, inside FindBuffers
 	BindRebindBuffers,  // of which
+	BindNativeBuffers,  // of which, inside RebindBuffers: the per-buffer resolve loop
+	BindNativeUpload,   // of which, inside RebindBuffers: the two stream-buffer uploads
 	BindRebindImages,   // of which
 	VertexIndex,
 	RenderTargets,
@@ -69,6 +71,8 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::BindFindBuffers:
 		case DrawPhase::BindClampRange:
 		case DrawPhase::BindRebindBuffers:
+		case DrawPhase::BindNativeBuffers:
+		case DrawPhase::BindNativeUpload:
 		case DrawPhase::BindRebindImages: return true;
 		default: return false;
 	}
@@ -92,6 +96,8 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::BindFindBuffers: return "  of which FindBuffers";
 		case DrawPhase::BindClampRange: return "    of which ClampRangeSize";
 		case DrawPhase::BindRebindBuffers: return "  of which RebindBuffers";
+		case DrawPhase::BindNativeBuffers: return "    of which buffer loop";
+		case DrawPhase::BindNativeUpload: return "    of which NativeUpload x2";
 		case DrawPhase::BindRebindImages: return "  of which RebindImages";
 		case DrawPhase::VertexIndex: return "vertex+index buffers";
 		case DrawPhase::RenderTargets: return "AcquireRenderTargets";

@@ -1163,20 +1163,31 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	EXIT_IF(prepared.buffer_descriptors.size() != program.info.buffers.size() ||
 	        prepared.buffer_sizes.size() != program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		const ShaderBufferResource& descriptor = prepared.buffer_descriptors[i];
-		uint32_t buffer_offset = 0;
-		resources.buffers.push_back(NativeStorageBuffer(
-		    m_context, descriptor, program.info.buffers[i], program.stage, i, buffer_offset,
-		    prepared.buffer_ids[i], prepared.buffer_sizes[i]));
-		pack_memory_offset(i, buffer_offset);
+	{
+		// The per-buffer resolve. Deduped within a draw by FindDrawBufferCache, but the cache is
+		// cleared every draw, so a buffer bound by 4000 consecutive draws is resolved 4000 times.
+		DrawPhaseTimer native_buffers_timer(DrawPhase::BindNativeBuffers);
+		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+			const ShaderBufferResource& descriptor = prepared.buffer_descriptors[i];
+			uint32_t buffer_offset = 0;
+			resources.buffers.push_back(NativeStorageBuffer(
+			    m_context, descriptor, program.info.buffers[i], program.stage, i, buffer_offset,
+			    prepared.buffer_ids[i], prepared.buffer_sizes[i]));
+			pack_memory_offset(i, buffer_offset);
+		}
 	}
-	if (!prepared.flattened_srt.empty()) {
-		resources.flattened_srt = NativeUpload(m_context, prepared.flattened_srt);
-	}
-	if (ShaderRecompiler::IR::FindBinding(
-	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UserData) != nullptr) {
-		resources.user_data = NativeUpload(m_context, prepared.user_data);
+	{
+		// Two unconditional stream-buffer map+memcpy+commit per stage, 256-byte aligned, whether
+		// or not the payload changed since the last draw.
+		DrawPhaseTimer native_upload_timer(DrawPhase::BindNativeUpload);
+		if (!prepared.flattened_srt.empty()) {
+			resources.flattened_srt = NativeUpload(m_context, prepared.flattened_srt);
+		}
+		if (ShaderRecompiler::IR::FindBinding(
+		        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::UserData) !=
+		    nullptr) {
+			resources.user_data = NativeUpload(m_context, prepared.user_data);
+		}
 	}
 }
 
