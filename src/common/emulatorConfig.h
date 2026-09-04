@@ -72,6 +72,9 @@ struct ConfigOptions {
 	// let it run ahead of the GPU thread by at most pipeline_depth submissions instead of draining
 	// every frame. See CPU-UTILIZATION-MAP.md section 1.
 	bool                   frame_pipelining              = false;
+	// Dump viewport/scissor for small-index (UI quad) draws. Diagnostic for the oversized
+	// minimap: the icons render at the right size and the map does not, so their geometry differs.
+	bool                   log_ui_draws                  = false;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
@@ -177,6 +180,7 @@ bool     ParallelResolutionEnabled();
 // Smoke test: build both stages' resource bindings in phase 2 instead of serially per draw.
 bool     TestParallelBindingsEnabled();
 bool     FramePipeliningEnabled();
+bool     LogUiDrawsEnabled();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);

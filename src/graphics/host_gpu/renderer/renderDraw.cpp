@@ -564,6 +564,26 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		dyn.scissor = scissor;
 	}
 
+	// UI-draw dump, for the oversized minimap. The icons render at the right size and the map does
+	// not, so whatever differs between them is visible here: both are low-index quads drawn late in
+	// the frame. Viewport and scissor come straight from guest registers with no scaling anywhere
+	// in this path, so if the map's viewport is already ~4x too large the guest was told the wrong
+	// display size, and if it is correct the fault is downstream in the composite.
+	if (Config::LogUiDrawsEnabled() && index_count <= 64) {
+		static std::atomic<uint32_t> ui_log {0};
+		const auto                   n = ui_log.fetch_add(1, std::memory_order_relaxed);
+		if (n < 400) {
+			std::printf("UiDraw[%u]: idx=%" PRIu32 " vp=(%.1f,%.1f) %.1fx%.1f scissor=(%d,%d) %ux%u "
+			            "fb=%ux%u ps=0x%010" PRIx64 "\n",
+			            n, index_count, static_cast<double>(viewport.x),
+			            static_cast<double>(viewport.y), static_cast<double>(viewport.width),
+			            static_cast<double>(viewport.height), scissor.offset.x, scissor.offset.y,
+			            scissor.extent.width, scissor.extent.height, framebuffer_extent.width,
+			            framebuffer_extent.height, buffer.GetShaders().GetPs().ps_regs.data_addr);
+			std::fflush(stdout);
+		}
+	}
+
 	float line_width = ctx.GetLineWidth();
 	if (line_width != 1.0f) {
 		static bool logged = false;

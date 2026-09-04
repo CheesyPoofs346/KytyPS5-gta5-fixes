@@ -355,6 +355,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--log-ui-draws") {
+			if (!ParseBool(value, options.config.log_ui_draws)) {
+				::printf("invalid boolean for %s\n", arg.c_str());
+				return false;
+			}
 		} else if (arg == "--frame-pipelining") {
 			if (!ParseBool(value, options.config.frame_pipelining)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
