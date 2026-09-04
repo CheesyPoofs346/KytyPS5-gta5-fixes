@@ -68,6 +68,11 @@ struct ConfigOptions {
 	bool                   defer_transitions           = false;
 	bool                   parallel_resolution         = false;
 	bool                   test_parallel_bindings        = false;
+	// Copy the PM4 stream at Enqueue so the guest may reuse its command buffer immediately, and
+	// let it run ahead of the GPU thread by at most pipeline_depth submissions instead of draining
+	// every frame. See CPU-UTILIZATION-MAP.md section 1.
+	bool                   frame_pipelining              = false;
+	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
 	bool                   show_fps_overlay            = true;
@@ -171,6 +176,8 @@ bool     DeferTransitionsEnabled();
 bool     ParallelResolutionEnabled();
 // Smoke test: build both stages' resource bindings in phase 2 instead of serially per draw.
 bool     TestParallelBindingsEnabled();
+bool     FramePipeliningEnabled();
+uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();

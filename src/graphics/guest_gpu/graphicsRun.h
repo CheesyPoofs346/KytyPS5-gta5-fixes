@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_
 
+#include <vector>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/threads.h"
@@ -53,8 +54,16 @@ private:
 	struct Submission {
 		SubmissionType            type     = SubmissionType::Graphics;
 		uint32_t                  queue_id = 0;
+		// Views into GUEST memory by default. That is why Done() drains the GPU thread every
+		// frame: the guest may not reuse its command buffer while these are still being parsed.
 		std::span<const uint32_t> commands;
 		std::span<const uint32_t> constant_commands;
+		// Frame pipelining copies the stream here and repoints the spans above at it, so the
+		// guest is free immediately and the drain is no longer needed. shared_ptr rather than a
+		// vector member because a Submission is moved between queues and the span must stay
+		// valid: moving a shared_ptr cannot relocate the buffer it points at.
+		std::shared_ptr<const std::vector<uint32_t>> owned_commands;
+		std::shared_ptr<const std::vector<uint32_t>> owned_constant_commands;
 		Pm4Execution              command_execution;
 		Pm4Execution              constant_execution;
 		bool                      reset_processor   = false;
@@ -67,6 +76,10 @@ private:
 
 	void              Enqueue(Submission submission);
 	void              WaitForIdle();
+	// Blocks until at most `max_pending` submissions remain queued. Frame pipelining uses this
+	// instead of a full drain so the guest may run ahead, but only by a bounded amount - an
+	// unbounded queue is how host memory got exhausted before.
+	void              WaitForPipelineDepth(uint32_t max_pending);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);

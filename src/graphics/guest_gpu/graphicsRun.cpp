@@ -237,7 +237,13 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 void GuestGpu::Done() {
 	GpuMutexLock lock(m_submission_mutex);
 	if (!IsGpuThread()) {
-		WaitForIdle();
+		if (Config::FramePipeliningEnabled()) {
+			// The drain existed only to protect the guest's command buffer, which Enqueue now
+			// copies. What remains is backpressure: let the guest run ahead, but bounded.
+			WaitForPipelineDepth(Config::PipelineDepth());
+		} else {
+			WaitForIdle();
+		}
 	}
 	m_graphics_done = true;
 	const auto frame = ++m_done_num;
@@ -500,11 +506,41 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 
 void GuestGpu::Enqueue(Submission submission) {
 	EXIT_IF(submission.queue_id >= QueueCount);
+	if (Config::FramePipeliningEnabled()) {
+		// Take ownership of the PM4 stream so the guest may reuse its command buffer the moment
+		// this returns. ~640 KB a frame at typical draw counts, against the per-frame drain it
+		// replaces. Done once here because every submission path funnels through Enqueue.
+		if (!submission.commands.empty()) {
+			auto owned = std::make_shared<const std::vector<uint32_t>>(submission.commands.begin(),
+			                                                          submission.commands.end());
+			submission.commands       = *owned;
+			submission.owned_commands = std::move(owned);
+		}
+		if (!submission.constant_commands.empty()) {
+			auto owned = std::make_shared<const std::vector<uint32_t>>(
+			    submission.constant_commands.begin(), submission.constant_commands.end());
+			submission.constant_commands       = *owned;
+			submission.owned_constant_commands = std::move(owned);
+		}
+	}
 	Common::LockGuard lock(m_queue_mutex);
 	EXIT_IF(!m_accepting);
 	m_queues[submission.queue_id].push_back(std::move(submission));
 	m_submission_count++;
 	m_work_available.Signal();
+}
+
+void GuestGpu::WaitForPipelineDepth(uint32_t max_pending) {
+	const auto        start = std::chrono::steady_clock::now();
+	Common::LockGuard lock(m_queue_mutex);
+	while (m_submission_count > max_pending) {
+		m_idle.Wait(&m_queue_mutex);
+	}
+	g_guest_blocked_ns.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                              std::chrono::steady_clock::now() - start)
+	                              .count()),
+	    std::memory_order_relaxed);
 }
 
 void GuestGpu::WaitForIdle() {
@@ -617,9 +653,10 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		gpu->m_processing = false;
-		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
-			gpu->m_idle.SignalAll();
-		}
+		// Signalled unconditionally: WaitForIdle waits on full idle and WaitForPipelineDepth on a
+		// queue bound, and each re-checks its own predicate, so an extra wake is free but a
+		// missing one hangs the guest.
+		gpu->m_idle.SignalAll();
 	}
 }
 

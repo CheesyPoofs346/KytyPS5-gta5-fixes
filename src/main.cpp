@@ -355,6 +355,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--frame-pipelining") {
+			if (!ParseBool(value, options.config.frame_pipelining)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
+		} else if (arg == "--pipeline-depth") {
+			options.config.pipeline_depth =
+			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
+			if (options.config.pipeline_depth == 0) {
+				::printf("--pipeline-depth must be at least 1\n");
+				return false;
+			}
 		} else if (arg == "--test-parallel-bindings") {
 			if (!ParseBool(value, options.config.test_parallel_bindings)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
