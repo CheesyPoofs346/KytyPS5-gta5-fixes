@@ -118,9 +118,18 @@ public:
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] HW::Context&      GetRegisters() const noexcept {
+		const auto& view = ThreadView();
+		return view.context != nullptr ? *view.context : *m_registers;
+	}
+	[[nodiscard]] HW::UserConfig& GetUserConfig() const noexcept {
+		const auto& view = ThreadView();
+		return view.user_config != nullptr ? *view.user_config : *m_user_config;
+	}
+	[[nodiscard]] HW::Shader& GetShaders() const noexcept {
+		const auto& view = ThreadView();
+		return view.shaders != nullptr ? *view.shaders : *m_shaders;
+	}
 
 	// What the draw path reads its register state through. Swappable so a deferred draw can be
 	// translated against the snapshot taken when it was queued rather than against registers the
@@ -132,15 +141,30 @@ public:
 	};
 
 	// Returns the view that was installed, for the caller to restore.
-	RegisterView SwapRegisterView(const RegisterView& view) noexcept {
-		const RegisterView previous {m_registers, m_user_config, m_shaders};
-		m_registers   = view.context;
-		m_user_config = view.user_config;
-		m_shaders     = view.shaders;
+	//
+	// The installed view is per thread. It describes the translation in flight on the calling
+	// thread, not a property of the command buffer, and parallel chunk recording has two threads
+	// translating different draws through the same CommandBuffer - a shared view would let one
+	// chunk's swap retarget the other chunk's draw mid-translation, silently translating it
+	// against the wrong registers.
+	//
+	// An unset view falls back to the bound one, so any path that never swaps - every non-batched
+	// draw, dispatch and blit - reads exactly what it read before.
+	RegisterView SwapRegisterView(const RegisterView& view) const noexcept {
+		const RegisterView previous = ThreadView();
+		ThreadView()                = view;
 		return previous;
 	}
 
 private:
+	// One per thread, shared across CommandBuffer instances. That is correct rather than a
+	// compromise: at most one translation is in flight per thread, and it is the translation the
+	// view belongs to. Nested translation of two different buffers on one thread does not happen.
+	[[nodiscard]] static RegisterView& ThreadView() noexcept {
+		static thread_local RegisterView view;
+		return view;
+	}
+
 	explicit CommandBuffer(CommandScheduler& scheduler);
 	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
