@@ -255,11 +255,6 @@ public:
 	                    vk::CommandBuffer                  record_target = nullptr);
 
 private:
-	struct GraphicsBindings {
-		PreparedBindings                vertex;
-		std::optional<PreparedBindings> pixel;
-	};
-
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,

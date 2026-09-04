@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
+#include <optional>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -57,6 +58,16 @@ struct PreparedBindings {
 	std::vector<uint32_t>                         flattened_srt;
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;
+};
+
+// Both stages' bindings for one draw.
+//
+// Lives here rather than nested in RenderExecutor so PreparedShaders can carry it: render.h
+// includes drawBatchQueue.h, so a type declared inside RenderExecutor cannot be named by the
+// queue without a cycle. It is a pair of PreparedBindings and belongs beside them anyway.
+struct GraphicsBindings {
+	PreparedBindings                vertex;
+	std::optional<PreparedBindings> pixel;
 };
 
 // Recycles a PreparedBindings' heap buffers for reuse by the next draw. Safe because only the

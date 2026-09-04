@@ -270,6 +270,14 @@ thread_local uint64_t t_clamp_hits  = 0;
 // Time the two paths separately rather than infer either from the average again.
 thread_local uint64_t t_clamp_hit_cycles  = 0;
 thread_local uint64_t t_clamp_miss_cycles = 0;
+// A miss costs ~6900 cycles, far too much for a binary search over a small vector. Two candidates:
+// the mutex - VirtualRanges::Protect takes it too, and page-watcher re-arming calls Protect
+// constantly - or the search itself. An average cannot separate them, and guessing wrong here has
+// already cost two changes that measured zero, so time the acquisition apart from the work.
+thread_local uint64_t t_clamp_lock_cycles = 0;
+// Every generation bump resets the cache. If resets drive the misses the fix is upstream in what
+// bumps; if they are rare, the misses are genuinely cold addresses and the fix is the cache shape.
+thread_local uint64_t t_clamp_resets = 0;
 
 class VirtualRanges {
 public:
@@ -510,6 +518,7 @@ public:
 		const auto current   = m_generation.load(std::memory_order_acquire);
 		if (fast.generation != current) {
 			fast.Reset(current);
+			t_clamp_resets++;
 		}
 		const bool hit = fast.Contains(virtual_addr, size);
 		t_clamp_calls++;
@@ -519,7 +528,7 @@ public:
 		if (t_clamp_calls % 200000 == 0) {
 			const auto misses = t_clamp_calls - t_clamp_hits;
 			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu cached=%u "
-			            "hit=%.0f cyc miss=%.0f cyc\n",
+			            "hit=%.0f cyc miss=%.0f cyc (lock=%.0f work=%.0f) resets=%llu\n",
 			            static_cast<unsigned long long>(t_clamp_calls),
 			            static_cast<unsigned long long>(t_clamp_hits),
 			            100.0 * static_cast<double>(t_clamp_hits) /
@@ -530,14 +539,23 @@ public:
 			                              : 0.0,
 			            misses != 0 ? static_cast<double>(t_clamp_miss_cycles) /
 			                              static_cast<double>(misses)
-			                        : 0.0);
+			                        : 0.0,
+			            misses != 0 ? static_cast<double>(t_clamp_lock_cycles) /
+			                              static_cast<double>(misses)
+			                        : 0.0,
+			            misses != 0 ? static_cast<double>(t_clamp_miss_cycles - t_clamp_lock_cycles) /
+			                              static_cast<double>(misses)
+			                        : 0.0,
+			            static_cast<unsigned long long>(t_clamp_resets));
 			std::fflush(stdout);
 		}
 		if (hit) {
 			t_clamp_hit_cycles += __builtin_ia32_rdtsc() - entry_tsc;
 			return size;
 		}
+		const auto        lock_start = __builtin_ia32_rdtsc();
 		Common::LockGuard lock(m_mutex);
+		t_clamp_lock_cycles += __builtin_ia32_rdtsc() - lock_start;
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
 			return 0;
@@ -562,6 +580,7 @@ public:
 			const auto generation = m_generation.load(std::memory_order_relaxed);
 			if (t_clamp_fast_path.generation != generation) {
 				t_clamp_fast_path.Reset(generation);
+				t_clamp_resets++;
 			}
 			t_clamp_fast_path.Insert(vma->start, vma_end);
 		}

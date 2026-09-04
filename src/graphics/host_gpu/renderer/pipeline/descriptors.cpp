@@ -1228,7 +1228,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
-RenderExecutor::GraphicsBindings
+GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
 	// One draw's worth of buffer resolutions; see BeginDrawBufferScope.
