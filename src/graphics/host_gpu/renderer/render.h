@@ -75,10 +75,30 @@ struct SubmitInfo {
 	}
 };
 
-// Increments each time a command buffer begins recording. Pool-recycled handles make handle
-// comparison unsafe for per-command-buffer state caches (dynamic state, bind filtering) - a
-// fresh recording can reuse the previous handle. Compare this instead.
+// Identifies the recording a per-command-buffer state cache (dynamic state, bind filtering) is
+// currently feeding. Pool-recycled handles make handle comparison unsafe - a fresh recording can
+// reuse the previous handle - so compare this instead.
+//
+// It answers "which command buffer am I recording into", not "how many have begun". A secondary
+// is a separate recording that inherits no dynamic state, no pipeline and no index binding, so it
+// needs its own value or a cache built for the primary will skip re-emitting all of it and the
+// draws execute against state the buffer was never given.
 uint64_t CurrentCommandGeneration();
+
+// Claims a fresh generation for a secondary recording on the calling thread, and returns the
+// previous value for ScopedRecordingGeneration to restore.
+//
+// Per thread on purpose. Bumping a shared counter would work for one worker and fail for eight:
+// every worker's begin would invalidate every other worker's cache, so every draw would miss and
+// the 0.5-1 us/draw the cache exists to save would be lost precisely when parallel recording is
+// meant to be paying off.
+uint64_t BeginRecordingGeneration();
+void     RestoreRecordingGeneration(uint64_t previous);
+
+// Counts secondaries begun against dynamic-state cache invalidations, so "state leaked across a
+// secondary boundary" is observed rather than assumed. Fires < begins means leakage.
+void NoteStateRetarget();
+void ReportRecordingCensus();
 
 class CommandBuffer {
 public:
@@ -269,13 +289,16 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
-	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	// The per-draw descriptor-write and push-constant scratch used to live here, as shared
+	// members. They are thread_local in descriptors.cpp now: they are rebuilt from scratch every
+	// draw and never read across draws, so they were never shared state in intent - only in
+	// storage. Eight workers recording concurrently would have interleaved writes into one array
+	// and pushed a torn mix of two draws' constants.
 	std::vector<uint32_t>                 m_image_occurrences;
 	std::vector<PendingTransition> m_pending_transitions;
 	DrawBatchQueue      m_draw_queue;
 	bool                m_draining = false;
-	std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>
-	    m_push_constants {};
+
 
 	friend struct RenderExecutorTestAccess;
 };

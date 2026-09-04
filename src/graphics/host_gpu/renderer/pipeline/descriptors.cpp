@@ -46,6 +46,26 @@
 
 namespace Libs::Graphics {
 
+// Per-draw scratch, one copy per recording thread.
+//
+// Both are cleared and refilled from scratch on every draw and never read across draws, so making
+// them thread_local changes no semantics - it only stops eight workers recording into the same
+// buffer. Kept as function-local statics rather than RenderExecutor members because a member would
+// have to be indexed by worker at every use site; this matches DynState() in renderDraw.cpp.
+std::vector<vk::WriteDescriptorSet>& DescriptorWrites() {
+	static thread_local std::vector<vk::WriteDescriptorSet> writes;
+	return writes;
+}
+
+std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>&
+PushConstants() {
+	static thread_local
+	    std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>
+	        constants {};
+	return constants;
+}
+
+
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -1270,11 +1290,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
-	m_descriptor_writes.clear();
-	m_push_constants.fill(0);
+	DescriptorWrites().clear();
+	PushConstants().fill(0);
 	m_descriptor_buffers.reserve(descriptor_count);
 	m_descriptor_images.reserve(descriptor_count);
-	m_descriptor_writes.reserve(write_count);
+	DescriptorWrites().reserve(write_count);
 
 	for (auto* prepared: prepared_bindings) {
 		const auto& program       = *prepared->program;
@@ -1395,7 +1415,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (m_descriptor_images.size() != image_start) {
 				write.pImageInfo = m_descriptor_images.data() + image_start;
 			}
-			m_descriptor_writes.push_back(write);
+			DescriptorWrites().push_back(write);
 		}
 		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
 			const auto expected =
@@ -1413,25 +1433,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			        offset + program.bindings.push_constant_size >
 			            ShaderRecompiler::IR::NativePushConstantSize);
 			std::copy(prepared->user_data.begin(), prepared->user_data.end(),
-			          m_push_constants.begin() + offset / sizeof(uint32_t));
+			          PushConstants().begin() + offset / sizeof(uint32_t));
 		}
 	}
 	record.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
-	                     ShaderRecompiler::IR::NativePushConstantSize, m_push_constants.data());
+	                     ShaderRecompiler::IR::NativePushConstantSize, PushConstants().data());
 
-	if (!m_descriptor_writes.empty()) {
+	if (!DescriptorWrites().empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
 		if (pipeline.uses_push_descriptors) {
 			record.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                            static_cast<uint32_t>(m_descriptor_writes.size()),
-			                            m_descriptor_writes.data());
+			                            static_cast<uint32_t>(DescriptorWrites().size()),
+			                            DescriptorWrites().data());
 		} else {
 			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
+			for (auto& write: DescriptorWrites()) {
 				write.dstSet = set;
 			}
 			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
+			    static_cast<uint32_t>(DescriptorWrites().size()), DescriptorWrites().data(), 0,
 			    nullptr);
 			record.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set, 0,
 			                          nullptr);

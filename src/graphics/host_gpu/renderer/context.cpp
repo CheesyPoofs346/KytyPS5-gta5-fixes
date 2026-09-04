@@ -35,10 +35,61 @@ namespace {
 // RECYCLED, so comparing handles cannot tell a fresh recording from a continuing one - anything
 // caching per-command-buffer Vulkan state (dynamic state, bind filtering) must key on this.
 std::atomic<uint64_t> g_command_generation {0};
+
+// Which secondary the calling thread is recording into, or 0 for the primary.
+//
+// Thread-local rather than another shared counter: with eight workers a shared bump would make
+// every worker's BeginSecondary invalidate every other worker's dynamic-state cache, so every
+// draw would re-emit all 13 filtered calls. That trades the exact saving the cache exists for.
+thread_local uint64_t t_recording_generation = 0;
+
+// Secondaries are numbered from a distinct high range so a secondary generation can never collide
+// with a primary one, whatever order the two counters advance in.
+std::atomic<uint64_t> g_secondary_generation {1ull << 40};
+
+std::atomic<uint64_t> g_secondaries_begun {0};
+std::atomic<uint64_t> g_state_retargets {0};
 } // namespace
 
 uint64_t CurrentCommandGeneration() {
+	// A secondary inherits no dynamic state, no pipeline and no index binding, so while one is
+	// being recorded its own id is the answer. Falling through to the primary's counter here is
+	// the bug this exists to fix: the primary's value does not change when a secondary begins, so
+	// a cache keyed on it would report "same recording" and skip re-emitting everything.
+	if (t_recording_generation != 0) {
+		return t_recording_generation;
+	}
 	return g_command_generation.load(std::memory_order_relaxed);
+}
+
+uint64_t BeginRecordingGeneration() {
+	const auto previous = t_recording_generation;
+	t_recording_generation =
+	    g_secondary_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+	g_secondaries_begun.fetch_add(1, std::memory_order_relaxed);
+	return previous;
+}
+
+void RestoreRecordingGeneration(uint64_t previous) {
+	t_recording_generation = previous;
+}
+
+void NoteStateRetarget() {
+	g_state_retargets.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ReportRecordingCensus() {
+	const auto begun     = g_secondaries_begun.load(std::memory_order_relaxed);
+	const auto retargets = g_state_retargets.load(std::memory_order_relaxed);
+	// retargets < begun means at least one secondary was recorded without its state being
+	// re-emitted, which is the silent-corruption case. Above 1.0 is expected and fine: the primary
+	// retargets too, and a bypassed cache retargets on every draw.
+	std::printf("RecordCensus: secondaries_begun=%llu state_retargets=%llu ratio=%.2f%s\n",
+	            static_cast<unsigned long long>(begun),
+	            static_cast<unsigned long long>(retargets),
+	            begun > 0 ? static_cast<double>(retargets) / static_cast<double>(begun) : 0.0,
+	            (begun > 0 && retargets < begun) ? "  <-- STATE LEAKED ACROSS A SECONDARY" : "");
+	std::fflush(stdout);
 }
 
 void CommandBuffer::Begin() {

@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/drawWorkerPool.h"
 
+#include "graphics/host_gpu/renderer/render.h"
+
 #include "common/assert.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -56,6 +58,9 @@ struct DrawWorkerPool::Worker {
 	std::vector<uint64_t>          m_ticks;
 	size_t                         m_next_free = 0;
 	vk::CommandBuffer              m_recording = nullptr;
+	// Restored on EndSecondary so a nested or re-entered recording cannot strand the thread on a
+	// stale generation.
+	uint64_t                       m_previous_generation = 0;
 };
 
 DrawWorkerPool::DrawWorkerPool(GraphicContext& graphics, MasterSemaphore& master,
@@ -256,6 +261,10 @@ vk::CommandBuffer DrawWorkerPool::BeginSecondary(uint32_t                       
 	EXIT_NOT_IMPLEMENTED(buffer.begin(&begin) != vk::Result::eSuccess);
 
 	worker.m_recording = buffer;
+	// Claim a generation for this recording so the dynamic-state cache re-emits pipeline, index
+	// and every vkCmdSet* at draw 0 of the secondary. Without this the cache still holds the
+	// primary's generation and skips all of it, and the secondary inherits none of it.
+	worker.m_previous_generation = BeginRecordingGeneration();
 	return buffer;
 }
 
@@ -265,6 +274,8 @@ void DrawWorkerPool::EndSecondary(uint32_t worker_index) {
 	EXIT_IF(worker.m_recording == nullptr);
 	worker.m_recording.end();
 	worker.m_recording = nullptr;
+	RestoreRecordingGeneration(worker.m_previous_generation);
+	worker.m_previous_generation = 0;
 }
 
 void DrawWorkerPool::RecycleRetired() {

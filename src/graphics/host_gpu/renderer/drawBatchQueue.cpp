@@ -168,6 +168,7 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	ReportDrainCensus();
 	if (t_drain.drains % 2000 == 0) {
 		ReportHashCensus();
+		ReportRecordingCensus();
 	}
 }
 

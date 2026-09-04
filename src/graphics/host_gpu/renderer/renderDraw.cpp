@@ -417,6 +417,7 @@ struct DynamicStateCache {
 			return false;
 		}
 		*this = {};
+		NoteStateRetarget();
 		if (!Config::DynStateCacheEnabled()) {
 			// Bypassed for A/B: every later comparison must miss. A zeroed viewport would
 			// compare equal to a genuinely zero one, so use values that cannot match -
@@ -1866,10 +1867,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			batch.rendering = state.rendering;
 			batch.formats   = formats;
 			batch.open      = true;
-			// The dynamic-state cache keys on the primary's recording generation, which does not
-			// change when a secondary does. Reset per batch - within one, state does persist, so
-			// the cache is still worth having.
-			DynState() = {};
+			// The cache used to be reset by hand here, because it keyed on the primary's recording
+			// generation and that does not change when a secondary begins. BeginSecondary now
+			// claims a generation of its own, so Retarget() fires on the secondary's first draw
+			// and re-emits pipeline, index and every vkCmdSet* without help. Resetting here as well
+			// would only hide whether that is working from RecordCensus.
 		}
 		batch.draws++;
 		record = batch.buffer;
