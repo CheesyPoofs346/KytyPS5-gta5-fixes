@@ -26,12 +26,32 @@ struct CachedImageView {
 	vk::ImageView view = nullptr;
 };
 
+// Sticky, set-only flags: resolution turns them on and nothing turns them off while it runs.
+//
+// Atomic rather than deferred. A deferred list is the right tool for a value that accumulates -
+// the LRU touch - but these only ever go false to true, so two workers setting the same one race
+// benignly in intent and identically in outcome. Making the store atomic gives that intent
+// defined behaviour without a merge step or any ordering to get wrong. Relaxed is sufficient:
+// nothing is published through these, they are read after the batch by the main thread.
 struct ImageUsage {
-	bool texture       = false;
-	bool storage       = false;
-	bool render_target = false;
-	bool depth_target  = false;
-	bool video_out     = false;
+	std::atomic<bool> texture       = false;
+	std::atomic<bool> storage       = false;
+	std::atomic<bool> render_target = false;
+	std::atomic<bool> depth_target  = false;
+	std::atomic<bool> video_out     = false;
+
+	ImageUsage() = default;
+	ImageUsage(const ImageUsage& other) noexcept { *this = other; }
+	ImageUsage& operator=(const ImageUsage& other) noexcept {
+		texture.store(other.texture.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		storage.store(other.storage.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		render_target.store(other.render_target.load(std::memory_order_relaxed),
+		                    std::memory_order_relaxed);
+		depth_target.store(other.depth_target.load(std::memory_order_relaxed),
+		                   std::memory_order_relaxed);
+		video_out.store(other.video_out.load(std::memory_order_relaxed), std::memory_order_relaxed);
+		return *this;
+	}
 };
 
 struct ImageBinding {
@@ -114,9 +134,13 @@ public:
 		m_maybe_hash_valid = false;
 	}
 
-	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	[[nodiscard]] bool IsGpuModified() const noexcept {
+		return m_gpu_modified.load(std::memory_order_relaxed);
+	}
+	// Set from resolution, which will run on workers; cleared only by the main thread outside a
+	// batch, so a set can never race a clear.
+	void MarkGpuModified() noexcept { m_gpu_modified.store(true, std::memory_order_relaxed); }
+	void ClearGpuModified() noexcept { m_gpu_modified.store(false, std::memory_order_relaxed); }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
@@ -168,7 +192,7 @@ private:
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;
-	bool              m_gpu_modified     = false;
+	std::atomic<bool> m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
 };
 

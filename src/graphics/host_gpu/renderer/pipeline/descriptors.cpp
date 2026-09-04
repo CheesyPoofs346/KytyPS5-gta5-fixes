@@ -1199,8 +1199,12 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		image.usage.storage |= storage;
-		image.usage.texture |= !storage;
+		// Sticky set-only flags: only ever raised, so a plain store is the whole operation.
+		if (storage) {
+			image.usage.storage.store(true, std::memory_order_relaxed);
+		} else {
+			image.usage.texture.store(true, std::memory_order_relaxed);
+		}
 	}
 }
 
