@@ -905,9 +905,19 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 			}
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		} else {
+			// IT_INDIRECT_BUFFER recurses into a nested command buffer, so this handler can
+			// contain draws - and did: PM4 non-draw read 44.6 ms/frame alongside DrawIndex's
+			// 39.9 ms inside a 57.2 ms frame, which is impossible. Subtracting the DrawIndex time
+			// that accumulated inside the handler leaves the actual non-draw packet cost.
+			const auto total_before =
+			    g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)];
 			DrawPhaseTimer packet_timer(DrawPhase::Pm4NonDraw);
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 			packet_timer.Stop();
+			auto& non_draw = g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Pm4NonDraw)];
+			const auto nested =
+			    g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)] - total_before;
+			non_draw -= std::min(nested, non_draw);
 			g_draw_profile.pm4_packets++;
 		}
 		if (packet_writes_registers) {
