@@ -1,3 +1,7 @@
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/drawWorkerPool.h"
 
 #include "common/assert.h"
@@ -6,6 +10,36 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 namespace Libs::Graphics {
+
+namespace {
+
+// Two theories about why an 8-worker pool only reached ~2.5x have now been wrong. This counts
+// what each runner actually processes instead: if the caller takes most items the workers are
+// waking too slowly, if the split is even the walk simply is not the cost it was thought to be.
+std::array<std::atomic<uint64_t>, kMaxDrawWorkers + 1> g_items_by_runner {};
+std::atomic<uint64_t>                                  g_parallel_batches {0};
+std::atomic<uint64_t>                                  g_inline_batches {0};
+
+void ReportRunnerCensus(uint32_t thread_count) {
+	const auto batches = g_parallel_batches.load(std::memory_order_relaxed);
+	if (batches == 0 || batches % 20000 != 0) {
+		return;
+	}
+	std::printf("RunnerCensus: threads=%u parallel_batches=%llu inline_batches=%llu items:",
+	            thread_count, static_cast<unsigned long long>(batches),
+	            static_cast<unsigned long long>(g_inline_batches.load(std::memory_order_relaxed)));
+	for (uint32_t i = 0; i < kMaxDrawWorkers + 1; i++) {
+		const auto items = g_items_by_runner[i].load(std::memory_order_relaxed);
+		if (items != 0) {
+			std::printf(" %s%u:%llu", i == 0 ? "caller" : "w", i,
+			            static_cast<unsigned long long>(items));
+		}
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
+} // namespace
 
 namespace {
 
@@ -96,6 +130,7 @@ void DrawWorkerPool::WorkerLoop(uint32_t index, std::stop_token stop) {
 			if (item >= m_count) {
 				break;
 			}
+			g_items_by_runner[index].fetch_add(1, std::memory_order_relaxed);
 			(*body)(item, index);
 		}
 		if (m_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
@@ -104,6 +139,7 @@ void DrawWorkerPool::WorkerLoop(uint32_t index, std::stop_token stop) {
 		}
 	}
 }
+
 
 void DrawWorkerPool::ParallelFor(uint32_t                                       count,
                                  const std::function<void(uint32_t, uint32_t)>& body) {
@@ -120,11 +156,13 @@ void DrawWorkerPool::ParallelFor(uint32_t                                       
 	// 2.5x on the walk.
 	static constexpr uint32_t kInlineThreshold = 16;
 	if (count <= kInlineThreshold || m_threads.empty()) {
+		g_inline_batches.fetch_add(1, std::memory_order_relaxed);
 		for (uint32_t i = 0; i < count; i++) {
 			body(i, 0);
 		}
 		return;
 	}
+	g_parallel_batches.fetch_add(1, std::memory_order_relaxed);
 
 	{
 		std::lock_guard lock(m_mutex);
@@ -143,8 +181,10 @@ void DrawWorkerPool::ParallelFor(uint32_t                                       
 		if (item >= count) {
 			break;
 		}
+		g_items_by_runner[0].fetch_add(1, std::memory_order_relaxed);
 		body(item, 0);
 	}
+	ReportRunnerCensus(static_cast<uint32_t>(m_threads.size()));
 	if (m_outstanding.fetch_sub(1, std::memory_order_acq_rel) != 1) {
 		std::unique_lock lock(m_mutex);
 		m_work_done.wait(lock,
