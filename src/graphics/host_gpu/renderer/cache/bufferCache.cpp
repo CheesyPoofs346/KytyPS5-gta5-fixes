@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
@@ -626,9 +627,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		return {nullptr, 0};
 	}
 
-	if (!is_written && size <= CACHING_PAGESIZE &&
-	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+	bool tracker_fast_path = false;
+	{
+		// These query the region bitmaps and can take the region tracking lock, so they are timed
+		// apart from the lookup and the sync they gate.
+		DrawPhaseTimer tracker_timer(DrawPhase::ObtTracker);
+		tracker_fast_path = !is_written && size <= CACHING_PAGESIZE &&
+		                    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
+		                    m_memory_tracker.IsRegionCpuModified(vaddr, size);
+	}
+	if (tracker_fast_path) {
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		// Through the selector, not m_stream_buffer directly. A StreamBuffer is bump-allocated
@@ -645,12 +653,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	auto* buffer = m_slot_buffers.try_get(id);
-	if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
-		id     = FindBuffer(vaddr, size);
-		buffer = &m_slot_buffers[id];
+	{
+		DrawPhaseTimer find_timer(DrawPhase::ObtFindBuffer);
+		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
+			id     = FindBuffer(vaddr, size);
+			buffer = &m_slot_buffers[id];
+		}
 	}
 	TouchBuffer(*buffer);
-	(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	{
+		DrawPhaseTimer sync_timer(DrawPhase::ObtSynchronize);
+		(void)SynchronizeBuffer(*buffer, vaddr, size, is_written, is_texel_buffer);
+	}
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
