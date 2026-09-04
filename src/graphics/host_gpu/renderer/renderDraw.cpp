@@ -1694,6 +1694,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          bool primitive_restart_enable, bool log_pipeline_phase,
                                          bool set_bind_debug, bool set_auto_debug,
                                          PreparedShaders* prepared) {
+	DrawPhaseTimer exec_entry_timer(DrawPhase::ExecEntry);
 	m_context.GetHdrProbe().NoteDrawShader(buffer.GetShaders().GetPs().ps_regs.data_addr, 0);
 	{
 		const auto& dc_probe  = buffer.GetRegisters().GetDepthControl();
@@ -1760,6 +1761,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto& ucfg = buffer.GetUserConfig();
 
 	LogDrawPhase(draw.name, "PrepareBindings");
+	exec_entry_timer.Stop();
 	DrawPhaseTimer bindings_timer(DrawPhase::Bindings);
 	// Phase 2 builds these on a worker when --test-parallel-bindings is on. Moved rather than
 	// copied: they own six heap vectors per stage, and the prepared entry is dead once its draw is
@@ -1777,6 +1779,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
 	auto index_binding   = PrepareIndexBuffer(buffer, index_source);
 	vertex_index_timer.Stop();
+	DrawPhaseTimer probes_timer(DrawPhase::Probes);
 	// GTA's missing world models all arrive here with the same pixel shader and reversed-Z
 	// GEQUAL. Capture the target immediately before that test; AcquireRenderTargets restores the
 	// attachment layout after this diagnostic copy.
@@ -1788,6 +1791,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    depth_image, static_cast<uint32_t>(m_context.GetGpu().GetFrameNum()),
 		    state.depth_info.desc.view_info.base_layer, state.depth_info.depth_buffer_vaddr);
 	}
+	probes_timer.Stop();
 	DrawPhaseTimer render_target_timer(DrawPhase::RenderTargets);
 	state.rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info);
@@ -1828,6 +1832,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.vertex_program, state.pixel_program, draw.index_count);
 	pipeline_timer.Stop();
+	DrawPhaseTimer batch_open_timer(DrawPhase::BatchOpen);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1888,6 +1893,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		batch_recording.emplace();
 	}
 
+	batch_open_timer.Stop();
 	DrawPhaseTimer commit_timer(DrawPhase::Commit);
 	CommitVertexBuffers(record, vertex_bindings);
 	if (bindings.pixel.has_value()) {
@@ -2016,6 +2022,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
 	}
 
+	// Runs to the end of the function: barrier derivation and the trailing debug phases.
+	DrawPhaseTimer teardown_timer(DrawPhase::Teardown);
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);
 	}

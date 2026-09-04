@@ -43,6 +43,12 @@ enum class DrawPhase : uint32_t {
 	DynState,
 	BeginRendering,
 	Emit,
+	// The five regions inside DrawIndex that no timer covered. Together they were UNACCOUNTED:
+	// 2.135 us/draw, 29% of TOTAL DrawIndex - larger than any single named phase.
+	ExecEntry,           // ExecutePreparedDraw entry -> Bindings: probes, logging, user config
+	Probes,              // between VertexIndex and Pipeline: HDR + depth diagnostic blocks
+	BatchOpen,           // the secondary batch open/flush region - CONTAINS FlushSecondaryBatch
+	Teardown,            // after Emit: ReturnPooledBindingStorage, ResetBindings
 	Pm4NonDraw,          // outside DrawIndex entirely: every other PM4 packet
 	Snapshot,            // outside DrawIndex: per-draw register snapshot for workers
 	Total,
@@ -94,6 +100,10 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::DynState: return "SetGraphicsDynamicParams";
 		case DrawPhase::BeginRendering: return "BeginRendering+bind";
 		case DrawPhase::Emit: return "EmitDrawPrimitives";
+		case DrawPhase::ExecEntry: return "exec entry (probes+log)";
+		case DrawPhase::Probes: return "HDR/depth probe blocks";
+		case DrawPhase::BatchOpen: return "batch open + FlushSecondaryBatch";
+		case DrawPhase::Teardown: return "teardown (ResetBindings)";
 		case DrawPhase::Pm4NonDraw: return "PM4 non-draw packets";
 		case DrawPhase::Snapshot: return "register snapshot";
 		case DrawPhase::Total: return "TOTAL DrawIndex";
