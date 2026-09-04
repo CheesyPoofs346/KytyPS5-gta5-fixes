@@ -43,7 +43,6 @@ struct PreparedShaders {
 
 struct QueuedDraw {
 	std::shared_ptr<const DrawStateSnapshot> snapshot;
-	PreparedShaders                          prepared;
 	uint64_t                                 submit_id                  = 0;
 	uint32_t                                 index_type_and_size        = 0;
 	uint32_t                                 index_count                = 0;
@@ -71,6 +70,13 @@ public:
 	[[nodiscard]] bool   Full() const noexcept { return m_draws.size() >= kMaxBatchDraws; }
 
 	void Push(QueuedDraw&& draw) { m_draws.push_back(std::move(draw)); }
+
+	// PreparedShaders is ~10 KB - two input-info structs - and is only needed when the resolve
+	// runs on workers, so it is held alongside the queue rather than inside QueuedDraw. Embedded,
+	// it made every queued draw 10496 bytes: collecting a 256-draw batch zeroed and moved 2.7 MB
+	// through L2 and cost ~3.2 us/draw, more than the parallel walk it exists to enable can ever
+	// return.
+	std::vector<PreparedShaders> m_prepared;
 
 	// Translates every queued draw and clears the queue. Each draw is translated against its own
 	// snapshot: the command buffer's register view is repointed for the duration and restored

@@ -10,6 +10,10 @@
 
 namespace Libs::Graphics {
 
+// This type is constructed, moved and stored once per draw, so its size is load-bearing: it was
+// 10496 bytes when PreparedShaders was embedded, which cost ~3.2 us/draw on its own.
+static_assert(sizeof(QueuedDraw) <= 128, "QueuedDraw must stay small - see m_prepared");
+
 namespace {
 
 // ParallelFor pays a fixed dispatch cost per batch, so its value depends entirely on how many
@@ -91,10 +95,16 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	if (workers > 1) {
 		// Phase 1, serial: locate both permutations per draw. The lookup takes the program-cache
 		// mutex, so it cannot be part of the parallel phase.
+		// Sized only on the parallel path, and kept across drains so the ~10 KB entries are
+		// allocated once rather than per batch.
+		if (m_prepared.size() < draws.size()) {
+			m_prepared.resize(draws.size());
+		}
 		const auto prepare_start = __builtin_ia32_rdtsc();
-		for (auto& draw: draws) {
-			const auto previous = bind(draw);
-			executor.PrepareQueuedShaders(buffer, draw.prepared);
+		for (size_t i = 0; i < draws.size(); i++) {
+			const auto previous = bind(draws[i]);
+			m_prepared[i] = PreparedShaders {};
+			executor.PrepareQueuedShaders(buffer, m_prepared[i]);
 			buffer.SwapRegisterView(previous);
 		}
 		t_drain.prepare_cyc += __builtin_ia32_rdtsc() - prepare_start;
@@ -108,10 +118,11 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 		// the serial phases swap.
 		const auto parallel_start = __builtin_ia32_rdtsc();
 		auto& pool = buffer.GetContext().GetDrawWorkerPool();
+		auto& prepared = m_prepared;
 		pool.ParallelFor(static_cast<uint32_t>(draws.size()),
-		                 [&draws, &executor](uint32_t index, uint32_t worker) {
+		                 [&prepared, &executor](uint32_t index, uint32_t worker) {
 			                 ScopedDrawWorker slot(worker);
-			                 executor.ResolveQueuedShaders(draws[index].prepared);
+			                 executor.ResolveQueuedShaders(prepared[index]);
 		                 });
 		t_drain.parallel_cyc += __builtin_ia32_rdtsc() - parallel_start;
 	}
@@ -119,12 +130,16 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 	// Phase 3, serial: record, in guest order. A draw whose permutation needed compiling arrives
 	// with prepared.valid false and resolves inline, exactly as it did before.
 	const auto record_start = __builtin_ia32_rdtsc();
-	for (auto& draw: draws) {
+	const bool have_prepared = workers > 1 && m_prepared.size() >= draws.size();
+	for (size_t i = 0; i < draws.size(); i++) {
+		auto&      draw     = draws[i];
 		const auto previous = bind(draw);
+		const auto* prepared =
+		    have_prepared && m_prepared[i].valid ? &m_prepared[i] : nullptr;
 		executor.DrawIndex(draw.submit_id, buffer, draw.index_type_and_size, draw.index_count,
 		                   draw.index_addr, draw.flags, draw.type, draw.instance_count,
 		                   draw.render_target_slice_offset, draw.vertex_offset_add,
-		                   draw.first_instance, draw.prepared.valid ? &draw.prepared : nullptr);
+		                   draw.first_instance, prepared);
 		buffer.SwapRegisterView(previous);
 	}
 	t_drain.record_cyc += __builtin_ia32_rdtsc() - record_start;
