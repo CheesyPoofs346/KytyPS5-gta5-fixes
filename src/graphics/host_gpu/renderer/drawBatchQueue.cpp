@@ -2,6 +2,7 @@
 
 #include "common/emulatorConfig.h"
 
+#include <atomic>
 #include <cstdio>
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/drawWorkerPool.h"
@@ -33,6 +34,10 @@ struct DrainCensus {
 
 thread_local DrainCensus t_drain;
 
+// Not part of DrainCensus: that is thread_local and the increments happen on worker threads,
+// whose copies the main thread's report would never see.
+std::atomic<uint64_t> g_bailouts {0};
+
 void NoteBatchSize(size_t size) {
 	const auto bucket = size <= 1     ? 0
 	                    : size <= 4   ? 1
@@ -53,7 +58,7 @@ void ReportDrainCensus() {
                                            t_drain.record_cyc);
 	std::printf("DrainCensus: drains=%llu draws/batch=%.1f | phase1_prepare=%.1f%% "
 	            "phase2_walk=%.1f%% phase3_record=%.1f%% | sizes 1:%llu 2-4:%llu 5-16:%llu "
-	            "17-64:%llu 65-255:%llu 256:%llu\n",
+	            "17-64:%llu 65-255:%llu 256:%llu | bailouts=%llu\n",
 	            static_cast<unsigned long long>(t_drain.drains),
 	            static_cast<double>(t_drain.draws) / drains,
 	            total > 0 ? 100.0 * static_cast<double>(t_drain.prepare_cyc) / total : 0.0,
@@ -64,7 +69,8 @@ void ReportDrainCensus() {
 	            static_cast<unsigned long long>(t_drain.buckets[2]),
 	            static_cast<unsigned long long>(t_drain.buckets[3]),
 	            static_cast<unsigned long long>(t_drain.buckets[4]),
-	            static_cast<unsigned long long>(t_drain.buckets[5]));
+	            static_cast<unsigned long long>(t_drain.buckets[5]),
+	            static_cast<unsigned long long>(g_bailouts.load(std::memory_order_relaxed)));
 	std::fflush(stdout);
 }
 
@@ -126,7 +132,19 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 		pool.ParallelFor(static_cast<uint32_t>(draws.size()),
 		                 [&prepared, &executor](uint32_t index, uint32_t worker) {
 			                 ScopedDrawWorker slot(worker);
+			                 // Cleared first: the flag is per-thread and a slot resolves many
+			                 // draws, so a bail-out left set by an earlier item would silently
+			                 // invalidate this one.
+			                 (void)TakeWorkerBailout();
 			                 executor.ResolveQueuedShaders(prepared[index]);
+			                 if (TakeWorkerBailout()) {
+				                 // The walk reached work only the main thread may do. Whatever it
+				                 // produced is discarded rather than patched up - phase 3 resolves
+				                 // this draw inline, which is the same path an uncompiled
+				                 // permutation already takes.
+				                 prepared[index].valid = false;
+				                 g_bailouts.fetch_add(1, std::memory_order_relaxed);
+			                 }
 		                 });
 		t_drain.parallel_cyc += __builtin_ia32_rdtsc() - parallel_start;
 	}

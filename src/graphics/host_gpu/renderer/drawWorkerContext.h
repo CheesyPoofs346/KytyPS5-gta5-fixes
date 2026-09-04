@@ -36,6 +36,31 @@ inline thread_local uint32_t t_draw_worker_index = 0;
 	return t_draw_worker_index != 0;
 }
 
+// Raised when a worker reaches work only the main thread may do, so the draw it was resolving can
+// be abandoned and re-resolved serially in phase 3.
+//
+// This is a bail-out rather than a deferral, and the difference is deliberate. Deferring suits
+// work that is a pure state change replayable at the flush - an LRU touch, a page-watcher re-arm.
+// It does not suit work that uploads guest memory and records transfer commands mid-resolve:
+// replaying that away from its call site means reconstructing the descriptor it was feeding, which
+// is far more machinery than the case deserves. The census settles which it deserves - 59 hashes
+// in 5.2M refreshes across a city drive - so the draws that hit this are rare enough that losing
+// their parallelism costs nothing measurable, and phase 3's inline resolve is a path that already
+// exists and is already exercised by every uncompiled permutation.
+inline thread_local bool t_draw_worker_bailed = false;
+
+inline void RequestWorkerBailout() noexcept {
+	t_draw_worker_bailed = true;
+}
+
+// Reads and clears, so the caller must treat the result as the answer for exactly one item. A flag
+// left set would silently invalidate the next draw the slot resolves.
+[[nodiscard]] inline bool TakeWorkerBailout() noexcept {
+	const bool bailed    = t_draw_worker_bailed;
+	t_draw_worker_bailed = false;
+	return bailed;
+}
+
 // Scoped so a worker slot cannot leak past the batch that set it - a stale index would silently
 // point a later main-thread draw at a worker's pool.
 class ScopedDrawWorker {

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 
 namespace Libs::Graphics {
 
@@ -359,6 +360,16 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		if (cached.info == normalized) {
 			return cached.view;
 		}
+	}
+
+	// The scan above is a pure read, and it is the case that matters: a view is created once per
+	// (image, view_info) pair and hit forever after. Creation is not a pure read - it push_backs
+	// into views, and a reallocation under another thread's scan is a use-after-free, not a lost
+	// update. So a worker that misses abandons the draw and phase 3 creates the view inline, after
+	// which every later draw binding that view hits the scan on any thread.
+	if (MustStageForWorker()) {
+		RequestWorkerBailout();
+		return nullptr;
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};

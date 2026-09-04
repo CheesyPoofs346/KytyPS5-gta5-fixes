@@ -1277,6 +1277,21 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	TrackImage(id);
 	auto& image = m_slot_images[id];
 	g_hash_refreshes.fetch_add(1, std::memory_order_relaxed);
+	// Everything below either leaves the image untouched or mutates it, with nothing in between:
+	// the hash branch flips the dirty flags, and InitializeImage uploads guest memory and records
+	// transfer commands. If none of these three flags is set the whole function is a no-op past
+	// TrackImage, so this condition is not a conservative approximation of "might mutate" - it is
+	// exactly the set of states that do.
+	//
+	// A worker therefore abandons the draw instead of mutating, and phase 3 re-resolves it inline
+	// on the main thread where this runs unchanged. The census is what makes that affordable: 59
+	// hashes in 5.2M refreshes over a city drive, so these branches are near-dormant and the
+	// draws that lose their parallelism here are too few to measure.
+	if (MustStageForWorker() &&
+	    (image.IsMaybeCpuDirty() || image.IsBufferModified() || image.IsDefinitelyCpuDirty())) {
+		RequestWorkerBailout();
+		return;
+	}
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = HashAndCount(image);
 		if (image.NeedsMaybeCpuHash()) {
@@ -1478,6 +1493,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	if (Config::DccClearOnSample()) {
 		(void)MaterializeDccMetaClear(id, image, desc);
 	}
+	// A storage binding commits a GPU write and enrolls the image for readback, which between them
+	// clear the dirty flags, insert into m_download_images and re-arm host page protections. None
+	// of that survives being made concurrent, and storage bindings are a small minority of a
+	// graphics draw's resources, so a worker abandons rather than the cache growing a second
+	// deferral path for a rare case. Sampled bindings - the overwhelming majority - continue.
+	if (desc.type == BindingType::Storage && MustStageForWorker()) {
+		RequestWorkerBailout();
+		return nullptr;
+	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
@@ -1493,6 +1517,12 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
 	const auto view = image.FindView(desc.view_info);
+	if (view == nullptr) {
+		// FindView EXITs on every genuine failure, so the only way back here with no view is the
+		// worker bail-out it takes on a cache miss. Returning before naming keeps the debug-label
+		// call off a null handle; the caller's prepared entry is discarded either way.
+		return nullptr;
+	}
 	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
 	return view;
 }
@@ -2296,25 +2326,30 @@ bool TextureCache::MaterializeDccMetaClear(ImageId id, Image& image, const Image
 	                               desc.view_info.layer_count, clear_value, false)) {
 		return false;
 	}
+	// The peek above found a clear that really has to be materialized, and everything below this
+	// point mutates: it consumes the metadata entry, records the clear, commits a GPU write and
+	// re-arms download tracking.
+	//
+	// Staging only the clear was not enough. The other three touch m_surface_metas, the image's
+	// dirty flags, m_download_images and the host page protections - shared cache state that a
+	// shared lock would not protect, which is the whole reason this path is being made
+	// main-thread-only. So a worker abandons the draw and phase 3 redoes it here with nothing
+	// skipped and nothing replayed out of order. FlushPendingClears stays for its other producer.
+	if (MustStageForWorker()) {
+		RequestWorkerBailout();
+		return false;
+	}
 	const vk::ImageSubresourceRange range {
 	    vk::ImageAspectFlagBits::eColor, desc.view_info.base_level, desc.view_info.level_count,
 	    desc.view_info.base_layer, desc.view_info.layer_count};
-	if (MustStageForWorker()) {
-		PendingClear pending {};
-		pending.image_id = id;
-		pending.range    = range;
-		pending.color    = clear_value;
-		m_pending_clears.push_back(pending);
-	} else {
-		auto& command = m_scheduler.Current();
-		command.EndRendering();
-		image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
-		              ImageSubresourceRange {desc.view_info.base_level, desc.view_info.level_count,
-		                                     desc.view_info.base_layer, desc.view_info.layer_count},
-		              command.Handle());
-		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
-		                                 &clear_value, 1, &range);
-	}
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	              ImageSubresourceRange {desc.view_info.base_level, desc.view_info.level_count,
+	                                     desc.view_info.base_layer, desc.view_info.layer_count},
+	              command.Handle());
+	command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                                 &clear_value, 1, &range);
 	if (!ResolveDccMetaClearLocked(metadata.range.address, desc.view_info.base_layer,
 	                               desc.view_info.layer_count, clear_value, true)) {
 		EXIT("TextureCache: failed to consume materialized DCC clear\n");
