@@ -278,10 +278,6 @@ thread_local uint64_t t_clamp_lock_cycles = 0;
 // Every generation bump resets the cache. If resets drive the misses the fix is upstream in what
 // bumps; if they are rare, the misses are genuinely cold addresses and the fix is the cache shape.
 thread_local uint64_t t_clamp_resets = 0;
-// Whether the no-op elision in Protect actually fires. If elided stays near zero the mutations are
-// real, the fast-path churn is not self-inflicted, and only the RCU rewrite can help.
-std::atomic<uint64_t> g_protect_calls {0};
-std::atomic<uint64_t> g_protect_elided {0};
 
 class VirtualRanges {
 public:
@@ -437,39 +433,8 @@ public:
 		EditUnlocked(start, size, [name](Range* r) { CopyVirtualRangeName(r->name, name); });
 	}
 
-	// True when every range overlapping [start, start+size) already satisfies `holds`.
-	//
-	// This is an exact test for "EditUnlocked would change nothing", not an approximation.
-	// EditUnlocked splits every overlapped range, applies the mutation to the middle piece and
-	// then MergeUnlocked re-merges neighbours whose attributes match - so when the mutation is a
-	// no-op the pieces merge straight back and the table ends up byte-identical. Uncovered gaps in
-	// the span do not matter: EditUnlocked leaves them alone either way.
-	template <typename Holds>
-	[[nodiscard]] bool SpanAlreadyHasUnlocked(uint64_t start, uint64_t size, Holds holds) const {
-		if (size == 0) {
-			return true;
-		}
-		for (const auto& r: m_ranges) {
-			if (VirtualRangesOverlap(start, size, r.start, r.size) && !holds(r)) {
-				return false;
-			}
-		}
-		return true;
-	}
-
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
-		// Page-watcher re-arming calls this constantly, usually asking for the protection the
-		// range already carries. A no-op write is not free: every generation bump clears every
-		// thread's ClampRangeSize fast path, and one drive bumped it 159178 times while the clamp
-		// miss rate climbed from 7% to 14.7% as workers were added. The cost of a redundant write
-		// here is paid by every other thread's next lookup.
-		g_protect_calls.fetch_add(1, std::memory_order_relaxed);
-		if (SpanAlreadyHasUnlocked(
-		        start, size, [protection](const Range& r) { return r.protection == protection; })) {
-			g_protect_elided.fetch_add(1, std::memory_order_relaxed);
-			return;
-		}
 		m_generation.fetch_add(1, std::memory_order_release);
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
@@ -563,7 +528,7 @@ public:
 		if (t_clamp_calls % 200000 == 0) {
 			const auto misses = t_clamp_calls - t_clamp_hits;
 			std::printf("ClampCensus: calls=%llu hits=%llu (%.1f%%) generation=%llu cached=%u "
-			            "hit=%.0f cyc miss=%.0f cyc (lock=%.0f work=%.0f) resets=%llu protect=%llu elided=%llu (%.1f%%)\n",
+			            "hit=%.0f cyc miss=%.0f cyc (lock=%.0f work=%.0f) resets=%llu\n",
 			            static_cast<unsigned long long>(t_clamp_calls),
 			            static_cast<unsigned long long>(t_clamp_hits),
 			            100.0 * static_cast<double>(t_clamp_hits) /
@@ -581,14 +546,7 @@ public:
 			            misses != 0 ? static_cast<double>(t_clamp_miss_cycles - t_clamp_lock_cycles) /
 			                              static_cast<double>(misses)
 			                        : 0.0,
-			            static_cast<unsigned long long>(t_clamp_resets),
-			            static_cast<unsigned long long>(g_protect_calls.load(std::memory_order_relaxed)),
-			            static_cast<unsigned long long>(g_protect_elided.load(std::memory_order_relaxed)),
-			            g_protect_calls.load(std::memory_order_relaxed) > 0
-			                ? 100.0 *
-			                      static_cast<double>(g_protect_elided.load(std::memory_order_relaxed)) /
-			                      static_cast<double>(g_protect_calls.load(std::memory_order_relaxed))
-			                : 0.0);
+			            static_cast<unsigned long long>(t_clamp_resets));
 			std::fflush(stdout);
 		}
 		if (hit) {
