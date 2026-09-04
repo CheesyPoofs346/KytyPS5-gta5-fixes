@@ -1442,7 +1442,7 @@ private:
 } // namespace
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw, bool log_phases,
-                           DrawRenderState& state, const PreparedShaders* prepared = nullptr) {
+                           DrawRenderState& state, PreparedShaders* prepared = nullptr) {
 	// Already resolved on a worker: the walk is the expensive half and it is done, so take the
 	// result rather than repeat it. Only a permutation that needed compiling arrives unprepared.
 	if (prepared != nullptr && prepared->valid) {
@@ -1692,7 +1692,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
                                          bool primitive_restart_enable, bool log_pipeline_phase,
-                                         bool set_bind_debug, bool set_auto_debug) {
+                                         bool set_bind_debug, bool set_auto_debug,
+                                         PreparedShaders* prepared) {
 	m_context.GetHdrProbe().NoteDrawShader(buffer.GetShaders().GetPs().ps_regs.data_addr, 0);
 	{
 		const auto& dc_probe  = buffer.GetRegisters().GetDepthControl();
@@ -1760,8 +1761,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	LogDrawPhase(draw.name, "PrepareBindings");
 	DrawPhaseTimer bindings_timer(DrawPhase::Bindings);
-	auto bindings = PrepareGraphicsBindings(state.vs_input_info.stage, state.ps_input_info.stage,
-	                                        state.ps_active);
+	// Phase 2 builds these on a worker when --test-parallel-bindings is on. Moved rather than
+	// copied: they own six heap vectors per stage, and the prepared entry is dead once its draw is
+	// recorded. A draw that bailed out arrives with bindings_valid false and rebuilds here, which
+	// is byte-for-byte the path every draw took before.
+	auto bindings = (prepared != nullptr && prepared->bindings_valid)
+	                    ? std::move(prepared->bindings)
+	                    : PrepareGraphicsBindings(state.vs_input_info.stage,
+	                                              state.ps_input_info.stage, state.ps_active);
+	if (prepared != nullptr) {
+		prepared->bindings_valid = false;
+	}
 	bindings_timer.Stop();
 	DrawPhaseTimer vertex_index_timer(DrawPhase::VertexIndex);
 	auto vertex_bindings = PrepareVertexBuffers(submit_id, buffer, draw, state.vs_input_info);
@@ -2031,7 +2041,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const void* index_addr, uint32_t flags, uint32_t type,
                                uint32_t instance_count, uint32_t render_target_slice_offset,
                                int32_t vertex_offset_add, uint32_t first_instance,
-                               const PreparedShaders* prepared) {
+                               PreparedShaders* prepared) {
 	KYTY_PROFILER_FUNCTION();
 
 	DrawProfileBeginDraw();
@@ -2231,7 +2241,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	emit.vertex_offset = vertex_offset;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
-	                    primitive_restart, true, true, false);
+	                    primitive_restart, true, true, false, prepared);
 	ResetBindings();
 }
 
@@ -2460,6 +2470,22 @@ void RenderExecutor::ResolveQueuedShaders(PreparedShaders& prepared) {
 	                                          prepared.ps_input_info)) {
 		prepared.valid = false;
 	}
+}
+
+void RenderExecutor::ResolveQueuedBindings(PreparedShaders& prepared) {
+	prepared.bindings_valid = false;
+	if (!prepared.valid) {
+		return;
+	}
+	// The 40.5% of a draw this whole exercise is aimed at. Everything it reaches is already
+	// worker-safe: DrawBufferCache is thread_local so BeginDrawBufferScope scopes per thread,
+	// RebindImages goes through a FindTexture whose mutating paths all bail out, and FindBuffers /
+	// RebindBuffers run under the buffer cache's concurrent mode. The one exception is PrepareBda,
+	// which bails out inside PrepareGraphicsBindings.
+	prepared.bindings =
+	    PrepareGraphicsBindings(prepared.vs_input_info.stage, prepared.ps_input_info.stage,
+	                            prepared.ps_active);
+	prepared.bindings_valid = true;
 }
 
 bool RenderExecutor::EnqueueDrawIndex(QueuedDraw&& draw) {

@@ -27,7 +27,7 @@ static std::atomic<bool> g_draw_queue {false};
 static std::atomic<bool> g_defer_uploads {false};
 static std::atomic<bool> g_defer_transitions {false};
 static std::atomic<bool> g_parallel_resolution {false};
-static std::atomic<bool> g_test_parallel_record {false};
+static std::atomic<bool> g_test_parallel_bindings {false};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
@@ -58,7 +58,7 @@ void Load(const ConfigOptions& cfg) {
 	g_defer_uploads.store(cfg.defer_uploads, std::memory_order_relaxed);
 	g_defer_transitions.store(cfg.defer_transitions, std::memory_order_relaxed);
 	g_parallel_resolution.store(cfg.parallel_resolution, std::memory_order_relaxed);
-	g_test_parallel_record.store(cfg.test_parallel_record, std::memory_order_relaxed);
+	g_test_parallel_bindings.store(cfg.test_parallel_bindings, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
@@ -169,8 +169,8 @@ bool ParallelResolutionEnabled() {
 	return g_parallel_resolution.load(std::memory_order_relaxed);
 }
 
-bool TestParallelRecordEnabled() {
-	return g_test_parallel_record.load(std::memory_order_relaxed);
+bool TestParallelBindingsEnabled() {
+	return g_test_parallel_bindings.load(std::memory_order_relaxed);
 }
 
 void SetHwCheck(bool enabled) {
