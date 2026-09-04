@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -68,6 +69,76 @@ private:
 };
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
+
+// Exclusive/shared lock that keeps TrackingSpinLock's re-entrancy diagnostics.
+//
+// std::shared_mutex rather than a hand-rolled shared spinlock on purpose. A shared spinlock has to
+// solve writer starvation - eight workers continuously holding read access can keep an exclusive
+// acquirer spinning indefinitely - and getting that wrong is a hang in the user's game rather than
+// a slow path. The platform implementation already deals with it.
+//
+// The recursion checks are kept because this codebase has already crashed on re-entrancy: a drain
+// re-entering buffer resolution produced "recursive region tracking lock". std::shared_mutex makes
+// recursive acquisition undefined and says nothing, which would turn that loud, immediate failure
+// into a silent deadlock.
+//
+// The held-depth counter is per thread and shared across instances, so it detects re-entry through
+// any instance rather than only the same one. That is the conservative direction, and there is one
+// TextureCache; a second instance would report a false recursion rather than miss a real one.
+class TrackingSharedLock final {
+public:
+	void lock() noexcept {
+		if (HeldByCurrentThread()) {
+			EXIT("recursive texture cache lock\n");
+		}
+		m_mutex.lock();
+		m_owner.store(CurrentThread(), std::memory_order_relaxed);
+		t_held++;
+	}
+
+	void unlock() noexcept {
+		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
+			EXIT("texture cache lock released by non-owner\n");
+		}
+		m_owner.store(0, std::memory_order_relaxed);
+		t_held--;
+		m_mutex.unlock();
+	}
+
+	void lock_shared() noexcept {
+		if (HeldByCurrentThread()) {
+			EXIT("recursive texture cache lock (shared)\n");
+		}
+		m_mutex.lock_shared();
+		t_held++;
+	}
+
+	void unlock_shared() noexcept {
+		t_held--;
+		m_mutex.unlock_shared();
+	}
+
+private:
+	[[nodiscard]] static bool HeldByCurrentThread() noexcept { return t_held != 0; }
+
+	static uint32_t CurrentThread() noexcept {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		return GetCurrentThreadId();
+#elif defined(__APPLE__)
+		return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+#elif defined(__linux__)
+		static thread_local const uint32_t tid = static_cast<uint32_t>(::syscall(SYS_gettid));
+		return tid;
+#else
+		EXIT("texture cache thread identity is unsupported on this platform\n");
+#endif
+	}
+
+	static inline thread_local uint32_t t_held = 0;
+
+	std::shared_mutex    m_mutex;
+	std::atomic_uint32_t m_owner {0};
+};
 
 class RegionManager final {
 public:

@@ -1476,8 +1476,30 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	// The lock mode follows who is calling, not what the image turns out to need, because only the
+	// caller's identity is known before the state is read.
+	//
+	// On a worker the body is read-only by construction: every mutation it could reach - the LRU
+	// touch, the page-watcher re-arm, RefreshImage's dirty work, the DCC clear, the storage commit
+	// and view creation - either defers to a per-worker list or bails the draw out. So workers can
+	// share.
+	//
+	// The main thread takes it exclusively, and that is the half that is easy to get wrong: the
+	// main thread runs the same function with none of those guards active, so it really does
+	// mutate - it push_backs into image.views, touches the LRU, uploads. A shared lock there would
+	// let a worker scan image.views while the main thread reallocates it, which is a
+	// use-after-free rather than a lost update. Exclusive on the main thread is what makes the
+	// workers' shared access safe.
+	if (MustStageForWorker()) {
+		std::shared_lock lock {m_lock};
+		return FindTextureLocked(id, desc);
+	}
 	std::scoped_lock lock {m_lock};
-	auto&            image = m_slot_images[id];
+	return FindTextureLocked(id, desc);
+}
+
+vk::ImageView TextureCache::FindTextureLocked(ImageId id, const ImageDesc& desc) {
+	auto& image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {

@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -154,6 +155,9 @@ private:
 	                                                    vk::ClearColorValue& clear_value,
 	                                                    bool consume);
 	[[nodiscard]] bool MaterializeDccMetaClear(ImageId id, Image& image, const ImageDesc& desc);
+	// FindTexture's body. The caller picks the lock mode - shared on a worker, exclusive on the
+	// main thread - so the body itself must never assume it holds exclusive access.
+	[[nodiscard]] vk::ImageView FindTextureLocked(ImageId id, const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -205,7 +209,7 @@ private:
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
-	TrackingSpinLock                                  m_lock;
+	TrackingSharedLock                                m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
