@@ -110,8 +110,16 @@ void DrawWorkerPool::ParallelFor(uint32_t                                       
 	if (count == 0) {
 		return;
 	}
-	// One item is not worth waking anything: the handoff costs more than the work.
-	if (count == 1 || m_threads.empty()) {
+	// Waking the pool costs a lock, a notify_all and a condvar round trip per batch - tens of
+	// microseconds. An item of work here is the shader resource walk at roughly 3.4 us, so a batch
+	// has to carry enough items for the split to return more than the wake-up costs.
+	//
+	// This matters because batches are not uniformly large: the drain census measured 24% of
+	// drains carrying 1-4 draws and 43% carrying 16 or fewer. Dispatching those was paying the
+	// full wake-up to split ~14 us of work, which is why an 8-worker pool was only reaching about
+	// 2.5x on the walk.
+	static constexpr uint32_t kInlineThreshold = 16;
+	if (count <= kInlineThreshold || m_threads.empty()) {
 		for (uint32_t i = 0; i < count; i++) {
 			body(i, 0);
 		}
