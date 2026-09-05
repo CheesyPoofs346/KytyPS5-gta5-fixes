@@ -2272,6 +2272,7 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEos) {
 }
 
 KYTY_CP_OP_PARSER(CpOpFlip) {
+	g_guest_flips.fetch_add(1, std::memory_order_relaxed);
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc004105c);

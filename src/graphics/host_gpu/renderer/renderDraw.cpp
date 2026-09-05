@@ -41,6 +41,8 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
+#include <filesystem>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1723,60 +1725,94 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 //
 // Read-only. Keyed on the target signature, which is what actually distinguishes a pass.
 
+
 // Section A of the performance audit.
 //
-// FRAME DEFINITION: one sample per call to GuestGpu::Done(), which is the guest declaring its
-// frame submission complete (agc.cpp submitDone -> Done() -> ++m_done_num), taken after
-// WaitForIdle()/WaitForPipelineDepth(). So an interval is GUEST SUBMISSION BOUNDARY to GUEST
-// SUBMISSION BOUNDARY.
-//   - It is NOT a presentation interval and NOT a displayed-frame interval: no vkQueuePresent is
-//     involved, so with Mailbox these numbers say nothing about what reached the monitor.
-//   - It is NOT a host submission count; many host submissions occur per guest frame.
-//   - Queued work: with frame pipelining enabled the guest runs ahead by up to PipelineDepth,
-//     so GPU execution for frame N may still be in flight when frame N+1 is sampled. The
-//     interval then measures guest-side pacing, not GPU completion.
-//   - Sampling in Done() rather than on a draw means frames with zero draws still produce a
-//     sample, so an interval can never silently span several frames.
+// WHAT A SAMPLE IS: a GUEST SUBMISSION INTERVAL. One sample per GuestGpu::Done(), the guest
+// declaring its frame submission complete, taken after WaitForIdle/WaitForPipelineDepth.
+// These are NOT presentation intervals and NOT displayed frames. R_FLIP occurrences are counted
+// separately and the flips-per-boundary ratio is reported: until that ratio is 1.00 these
+// intervals are not frame times, and even at 1.00 they say nothing about what the display
+// actually showed. Never quote a locked displayed FPS from them.
 //
-// Every individual sample is retained for the whole route and written to a CSV, so percentiles
-// are computed once over the entire measured region. Percentiles of 300-frame windows are never
-// averaged together - that is not a percentile of anything.
-//
-// Nothing here is normalised per draw. Dividing a windowed time by a windowed draw count is what
-// produced the retracted claim that PM4 non-draw work exceeded the draw path.
+// Percentiles are computed once over every retained route sample. Percentiles of windows are
+// never averaged. The route is delimited by explicit markers so the measured region is chosen,
+// not assumed: warmup-frames is only an optional initial guard.
 class FrameStats {
 public:
 	void Note(double ms, uint64_t draws) {
 		if (ms <= 0.0 || ms > 10000.0) {   // ignore breakpoints and window drags
 			return;
 		}
-		m_samples.push_back({ms, draws});
-		if (m_csv == nullptr) {
-			m_csv = std::fopen("frametimes.csv", "w");
-			if (m_csv != nullptr) {
-				std::fprintf(m_csv, "index,ms,draws,phase\n");
-			}
-		}
-		const bool warm = m_samples.size() > Config::WarmupFrames();
+		OpenCsv();
+		PollMarkers();
+		const bool warm = m_samples.size() >= Config::WarmupFrames();
+		const bool in_route = m_route_started && !m_route_ended && warm;
+		m_samples.push_back({ms, draws, in_route});
 		if (m_csv != nullptr) {
 			std::fprintf(m_csv, "%zu,%.4f,%llu,%s\n", m_samples.size() - 1, ms,
-			             static_cast<unsigned long long>(draws), warm ? "route" : "warmup");
-			std::fflush(m_csv);
+			             static_cast<unsigned long long>(draws),
+			             in_route ? "route" : (m_route_ended ? "after" : "warmup"));
 		}
-		if ((m_samples.size() % kReportEvery) == 0) {
+		if (in_route && (++m_route_samples % kReportEvery) == 0) {
 			Report("progress");
 		}
 	}
 
-	// Whole-route statistics over every retained sample, warmup excluded.
 	void ReportFinal() { Report("FINAL"); }
 
 private:
 	struct Sample {
 		double   ms;
 		uint64_t draws;
+		bool     route;
 	};
 	static constexpr size_t kReportEvery = 300;
+
+	void OpenCsv() {
+		if (m_csv != nullptr) {
+			return;
+		}
+		// Unique per capture so a second route can never silently overwrite the first.
+		const auto now = std::time(nullptr);
+		std::tm    tm {};
+#ifdef _WIN32
+		localtime_s(&tm, &now);
+#else
+		localtime_r(&now, &tm);
+#endif
+		char name[64] = {};
+		std::strftime(name, sizeof(name), "capture-%Y%m%d-%H%M%S.csv", &tm);
+		m_csv = std::fopen(name, "w");
+		if (m_csv != nullptr) {
+			// Buffered; flushed at each report and at route end.
+			std::fprintf(m_csv, "index,ms,draws,phase\n");
+			std::printf("FrameStats: capture file %s\n", name);
+			std::fflush(stdout);
+		}
+	}
+
+	// Explicit measured-route boundaries, triggered externally by creating a sentinel file, so
+	// the route starts when the operator is at the landmark rather than at an assumed frame index.
+	void PollMarkers() {
+		if ((m_samples.size() % 8) != 0) {   // a stat every 8 frames is far below frame cost
+			return;
+		}
+		if (!m_route_started && std::filesystem::exists("ROUTE_START")) {
+			m_route_started = true;
+			m_route_begin   = m_samples.size();
+			std::printf("FrameStats: ROUTE START at sample %zu\n", m_route_begin);
+			std::fflush(stdout);
+		}
+		if (m_route_started && !m_route_ended && std::filesystem::exists("ROUTE_END")) {
+			m_route_ended = true;
+			std::printf("FrameStats: ROUTE END at sample %zu\n", m_samples.size());
+			Report("FINAL");
+			if (m_csv != nullptr) {
+				std::fflush(m_csv);
+			}
+		}
+	}
 
 	static double Percentile(const std::vector<double>& sorted, double p) {
 		if (sorted.empty()) {
@@ -1787,17 +1823,16 @@ private:
 	}
 
 	void Report(const char* tag) const {
-		const auto warmup = std::min<size_t>(Config::WarmupFrames(), m_samples.size());
-		if (m_samples.size() - warmup < 2) {
-			return;
-		}
 		std::vector<double>   ms;
 		std::vector<uint64_t> draws;
-		ms.reserve(m_samples.size() - warmup);
-		draws.reserve(m_samples.size() - warmup);
-		for (size_t i = warmup; i < m_samples.size(); ++i) {
-			ms.push_back(m_samples[i].ms);
-			draws.push_back(m_samples[i].draws);
+		for (const auto& sample: m_samples) {
+			if (sample.route) {
+				ms.push_back(sample.ms);
+				draws.push_back(sample.draws);
+			}
+		}
+		if (ms.size() < 2) {
+			return;
 		}
 		std::sort(ms.begin(), ms.end());
 		std::sort(draws.begin(), draws.end());
@@ -1816,24 +1851,50 @@ private:
 		const auto med = Percentile(ms, 0.50);
 		const auto p95 = Percentile(ms, 0.95);
 		const auto p99 = Percentile(ms, 0.99);
-		// Milliseconds are authoritative. The bracketed figures are FPS EQUIVALENTS of the tail
-		// latencies (1000/p95ms), i.e. the rate a p95-slow frame corresponds to - NOT the 95th
-		// percentile of FPS, which would describe the fast end.
-		std::printf("FrameStats[%s]: n=%zu warmup=%zu | ms med=%.2f p95=%.2f p99=%.2f "
-		            "min=%.2f max=%.2f mean=%.2f | fps-equiv med=%.1f p95ms=%.1f p99ms=%.1f | "
-		            "draws med=%llu max=%llu | over16.667ms=%zu (%.1f%%) over33.333ms=%zu (%.1f%%)\n",
-		            tag, n, warmup, med, p95, p99, ms.front(), ms.back(), mean,
+		// Milliseconds are authoritative. fps-equiv figures are the rate a tail-SLOW frame
+		// corresponds to (1000/p95ms), not the 95th percentile of FPS.
+		std::printf("FrameStats[%s]: guest-submission-intervals n=%zu | ms med=%.2f p95=%.2f "
+		            "p99=%.2f min=%.2f max=%.2f mean=%.2f | fps-equiv med=%.1f p95ms=%.1f "
+		            "p99ms=%.1f | draws med=%llu max=%llu | over16.667ms=%zu (%.1f%%) "
+		            "over33.333ms=%zu (%.1f%%)\n",
+		            tag, n, med, p95, p99, ms.front(), ms.back(), mean,
 		            med > 0 ? 1000.0 / med : 0.0, p95 > 0 ? 1000.0 / p95 : 0.0,
 		            p99 > 0 ? 1000.0 / p99 : 0.0,
 		            static_cast<unsigned long long>(draws[draws.size() / 2]),
 		            static_cast<unsigned long long>(draws.back()), over60,
 		            100.0 * static_cast<double>(over60) / static_cast<double>(n), over30,
 		            100.0 * static_cast<double>(over30) / static_cast<double>(n));
+		const auto flips = g_guest_flips.load(std::memory_order_relaxed);
+		std::printf("FrameStats[%s]: guest flips=%llu over %zu boundaries, ratio=%.3f "
+		            "(1.000 means one flip per submission; anything else means these intervals "
+		            "are not frame times)\n",
+		            tag, static_cast<unsigned long long>(flips), m_samples.size(),
+		            m_samples.empty() ? 0.0
+		                              : static_cast<double>(flips) /
+		                                    static_cast<double>(m_samples.size()));
+		// Execution vs blocking, process-wide wall nanoseconds. These are directly comparable to
+		// each other and to the route duration; they are NOT the thread_local draw phases.
+		for (size_t i = 0; i < static_cast<size_t>(CaptureBucket::Count); ++i) {
+			const auto ns    = g_capture_ns[i].load(std::memory_order_relaxed);
+			const auto calls = g_capture_calls[i].load(std::memory_order_relaxed);
+			if (calls == 0) {
+				continue;
+			}
+			std::printf("  %-14s total=%8.1f ms  calls=%-10llu  avg=%8.3f us\n",
+			            CaptureBucketName(static_cast<CaptureBucket>(i)),
+			            static_cast<double>(ns) / 1e6,
+			            static_cast<unsigned long long>(calls),
+			            static_cast<double>(ns) / static_cast<double>(calls) / 1e3);
+		}
 		std::fflush(stdout);
 	}
 
 	std::vector<Sample> m_samples;
-	std::FILE*          m_csv = nullptr;
+	std::FILE*          m_csv           = nullptr;
+	bool                m_route_started = false;
+	bool                m_route_ended   = false;
+	size_t              m_route_begin   = 0;
+	size_t              m_route_samples = 0;
 };
 
 FrameStats            g_frame_stats;

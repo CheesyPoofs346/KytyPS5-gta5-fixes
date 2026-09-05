@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -192,6 +193,7 @@ void DrawWorkerPool::ParallelFor(uint32_t                                       
 	ReportRunnerCensus(static_cast<uint32_t>(m_threads.size()));
 	if (m_outstanding.fetch_sub(1, std::memory_order_acq_rel) != 1) {
 		std::unique_lock lock(m_mutex);
+		CaptureTimer capture_timer {CaptureBucket::WaitWorkers};
 		m_work_done.wait(lock,
 		                 [this] { return m_outstanding.load(std::memory_order_acquire) == 0; });
 	}

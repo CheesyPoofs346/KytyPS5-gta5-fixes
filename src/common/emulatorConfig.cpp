@@ -1,3 +1,4 @@
+#include <cstdio>
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
@@ -78,6 +79,7 @@ void Load(const ConfigOptions& cfg) {
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
+	LogEffectiveSettings();
 }
 
 uint32_t GetScreenWidth() {
@@ -459,6 +461,34 @@ bool RedZoneProtectionEnabled() {
 
 const Keymap& GetKeymap() {
 	return g_config->keymap;
+}
+
+
+void LogEffectiveSettings() {
+	std::printf("EffectiveSettings:\n");
+	std::printf("  %-28s %s\n", "draw_profile", g_draw_profile.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "secondary_record", g_secondary_record.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "draw_queue", g_draw_queue.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "parallel_resolution", g_parallel_resolution.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "test_parallel_bindings", g_test_parallel_bindings.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "frame_pipelining", g_frame_pipelining.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "coalesce_eop_flush", g_coalesce_eop_flush.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "light_partial_flush", g_light_partial_flush.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "pipeline_memo", g_pipeline_memo.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "buffer_dedup", g_buffer_dedup.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "dyn_state_cache", g_dyn_state_cache.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "hw_check", g_hw_check.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "defer_uploads", g_defer_uploads.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "defer_transitions", g_defer_transitions.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "cache_descriptors", g_cache_descriptors.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "log_ui_draws", g_log_ui_draws.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "show_fps_overlay", g_show_fps_overlay.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %u\n", "draw_workers", g_draw_workers.load(std::memory_order_relaxed));
+	std::printf("  %-28s %u\n", "pipeline_depth", g_pipeline_depth.load(std::memory_order_relaxed));
+	std::printf("  %-28s %u\n", "eop_flush_interval", g_eop_flush_interval.load(std::memory_order_relaxed));
+	std::printf("  %-28s %u\n", "stream_repeat_threshold", g_stream_repeat_threshold.load(std::memory_order_relaxed));
+	std::printf("  %-28s %u\n", "warmup_frames", g_warmup_frames.load(std::memory_order_relaxed));
+	std::fflush(stdout);
 }
 
 } // namespace Config

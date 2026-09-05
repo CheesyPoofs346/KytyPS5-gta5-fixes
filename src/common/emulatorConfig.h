@@ -212,6 +212,8 @@ bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
 uint32_t StreamRepeatThreshold();
 uint32_t WarmupFrames();
+// Every performance-relevant setting actually in effect, not just CLI overrides.
+void LogEffectiveSettings();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);

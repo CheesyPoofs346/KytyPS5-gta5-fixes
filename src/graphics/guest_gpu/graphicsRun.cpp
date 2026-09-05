@@ -689,6 +689,7 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForPipelineDepth(uint32_t max_pending) {
+	CaptureTimer capture_timer {CaptureBucket::WaitPipeline};
 	const auto        start = std::chrono::steady_clock::now();
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_submission_count > max_pending) {
@@ -702,6 +703,7 @@ void GuestGpu::WaitForPipelineDepth(uint32_t max_pending) {
 }
 
 void GuestGpu::WaitForIdle() {
+	CaptureTimer capture_timer {CaptureBucket::WaitIdle};
 	const auto        start = std::chrono::steady_clock::now();
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {

@@ -3,6 +3,7 @@
 
 #include "common/emulatorConfig.h"
 
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -174,6 +175,69 @@ struct DrawProfileState {
 };
 
 inline thread_local DrawProfileState g_draw_profile;
+
+// Section A diagnostic: separate execution from blocking, per role.
+//
+// The draw phase profile is thread_local and reported per thread on that thread's own draw
+// count, so phases from different threads can never be added and a block is a cumulative mean
+// since process start (it starts huge during boot and decays - do not compare two runs at
+// different cumulative draw counts). These counters are deliberately different: process-wide
+// relaxed atomics in nanoseconds, so PM4 execution, worker execution and explicit waits can be
+// compared against one wall-clock route.
+enum class CaptureBucket : size_t {
+	Pm4Exec,          // inside PM4 packet handlers, excluding nested waits
+	WorkerExec,       // inside draw-worker job execution
+	WaitIdle,         // GuestGpu::WaitForIdle
+	WaitPipeline,     // GuestGpu::WaitForPipelineDepth
+	WaitWorkers,      // caller blocked on the worker pool
+	WaitStream,       // stream ring waiting on GPU completion
+	Count
+};
+
+inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Count)>    g_capture_ns {};
+inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Count)>    g_capture_calls {};
+
+// Guest flips (R_FLIP). A submission boundary is not a flip: correlate the two before
+// calling a submission interval a frame time, and never claim displayed FPS from either.
+inline std::atomic<uint64_t> g_guest_flips {0};
+
+inline void CaptureAccount(CaptureBucket bucket, uint64_t ns) {
+	g_capture_ns[static_cast<size_t>(bucket)].fetch_add(ns, std::memory_order_relaxed);
+	g_capture_calls[static_cast<size_t>(bucket)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// Always on: one steady_clock pair per event, and the events are per-frame or per-packet, not
+// per-draw-phase. Measured cost is far below the wait durations being recorded.
+class CaptureTimer {
+public:
+	explicit CaptureTimer(CaptureBucket bucket)
+	    : m_bucket(bucket), m_start(std::chrono::steady_clock::now()) {}
+	~CaptureTimer() {
+		CaptureAccount(m_bucket, static_cast<uint64_t>(std::chrono::duration_cast<
+		                             std::chrono::nanoseconds>(
+		                             std::chrono::steady_clock::now() - m_start)
+		                             .count()));
+	}
+	CaptureTimer(const CaptureTimer&)            = delete;
+	CaptureTimer& operator=(const CaptureTimer&) = delete;
+
+private:
+	CaptureBucket                         m_bucket;
+	std::chrono::steady_clock::time_point m_start;
+};
+
+inline const char* CaptureBucketName(CaptureBucket bucket) {
+	switch (bucket) {
+		case CaptureBucket::Pm4Exec: return "pm4-exec";
+		case CaptureBucket::WorkerExec: return "worker-exec";
+		case CaptureBucket::WaitIdle: return "wait-idle";
+		case CaptureBucket::WaitPipeline: return "wait-pipeline";
+		case CaptureBucket::WaitWorkers: return "wait-workers";
+		case CaptureBucket::WaitStream: return "wait-stream";
+		default: return "?";
+	}
+}
+
 
 inline uint64_t DrawProfileReadCycles() {
 	return __builtin_ia32_rdtsc();
