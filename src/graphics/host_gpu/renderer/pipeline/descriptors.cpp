@@ -1269,67 +1269,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
-// Would a per-draw binding cache actually hit?
-//
-// "50.2% of draws reuse the previous shader pair" does NOT mean the bindings repeat: the same
-// shader drawn with different per-object constants resolves different buffer addresses, so a cache
-// keyed on the shader alone would bind the wrong data. This hashes what the resolve actually
-// produced - every buffer handle/offset/range, image view and sampler - and compares it with the
-// previous draw. That number, not the shader-reuse number, is the ceiling on what a cache could
-// skip, and it decides whether the cache is worth building at all.
-namespace {
-
-uint64_t HashBindingSet(const GraphicsBindings& bindings) {
-	uint64_t   h   = 1469598103934665603ull;
-	const auto mix = [&h](uint64_t v) {
-		h ^= v;
-		h *= 1099511628211ull;
-	};
-	const auto hash_stage = [&](const PreparedBindings& stage) {
-		mix(reinterpret_cast<uint64_t>(stage.program));
-		for (const auto& b: stage.resources.buffers) {
-			mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-			    static_cast<VkBuffer>(b.buffer))));
-			mix(static_cast<uint64_t>(b.offset));
-			mix(static_cast<uint64_t>(b.range));
-		}
-		for (const auto& i: stage.resources.images) {
-			mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-			    static_cast<VkImageView>(i.image_view))));
-		}
-		for (const auto& sampler: stage.resources.samplers) {
-			mix(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
-			    static_cast<VkSampler>(sampler))));
-		}
-	};
-	hash_stage(bindings.vertex);
-	if (bindings.pixel) {
-		hash_stage(*bindings.pixel);
-	}
-	return h;
-}
-
-void NoteBindingReuse(const GraphicsBindings& bindings) {
-	static thread_local uint64_t previous = 0;
-	static std::atomic<uint64_t> total {0};
-	static std::atomic<uint64_t> repeats {0};
-	const auto                   hash = HashBindingSet(bindings);
-	const auto                   n    = total.fetch_add(1, std::memory_order_relaxed) + 1;
-	if (hash == previous) {
-		repeats.fetch_add(1, std::memory_order_relaxed);
-	}
-	previous = hash;
-	if (n % 500000 == 0) {
-		const auto r = repeats.load(std::memory_order_relaxed);
-		std::printf("BindingReuse: draws=%llu identical_to_previous=%llu (%.1f%%)\n",
-		            static_cast<unsigned long long>(n), static_cast<unsigned long long>(r),
-		            100.0 * static_cast<double>(r) / static_cast<double>(n));
-		std::fflush(stdout);
-	}
-}
-
-} // namespace
-
 GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
@@ -1387,7 +1326,6 @@ void RenderExecutor::BindGraphicsResources(GraphicsBindings& bindings) {
 	if (bindings.pixel) {
 		RebindImages(*bindings.pixel);
 	}
-	NoteBindingReuse(bindings);
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,

@@ -73,26 +73,6 @@ private:
 
 namespace {
 
-// Does the tracker fast path pay for itself? It costs two region traversals per buffer - measured
-// 0.670 us/draw over ~11 queries - to decide whether a small read-only buffer can be served from
-// the stream ring instead of the normal path. If it rarely fires, the fix is not to make the
-// queries cheaper but to stop making them.
-std::atomic<uint64_t> g_tracker_gate_reached {0};
-std::atomic<uint64_t> g_tracker_gate_taken {0};
-
-void ReportTrackerGate() {
-	const auto reached = g_tracker_gate_reached.load(std::memory_order_relaxed);
-	if (reached % 500000 != 0) {
-		return;
-	}
-	const auto taken = g_tracker_gate_taken.load(std::memory_order_relaxed);
-	std::printf("TrackerGate: reached=%llu taken=%llu (%.1f%%)\n",
-	            static_cast<unsigned long long>(reached), static_cast<unsigned long long>(taken),
-	            reached > 0 ? 100.0 * static_cast<double>(taken) / static_cast<double>(reached)
-	                        : 0.0);
-	std::fflush(stdout);
-}
-
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
@@ -658,13 +638,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		// apart from the lookup and the sync they gate.
 		DrawPhaseTimer tracker_timer(DrawPhase::ObtTracker);
 		if (!is_written && size <= CACHING_PAGESIZE) {
-			g_tracker_gate_reached.fetch_add(1, std::memory_order_relaxed);
 			tracker_fast_path = !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 			                    m_memory_tracker.IsRegionCpuModified(vaddr, size);
-			if (tracker_fast_path) {
-				g_tracker_gate_taken.fetch_add(1, std::memory_order_relaxed);
-			}
-			ReportTrackerGate();
 		}
 	}
 	if (tracker_fast_path) {

@@ -36,26 +36,6 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
-// HashGuestEdges census.
-//
-// The maybe-dirty hash reads the first and last guest page of an image and XXH3s up to 8 KiB.
-// RefreshImage runs it on every hit whose image is maybe-dirty, and MarkAsMaybeDirty runs it
-// again on every guest write that lands in a tracked page, so an image sharing a page with hot
-// guest memory can pay it twice per draw. Whether that is actually happening is a measurement,
-// not a guess - hoisting it out of the hit path is only worth the correctness risk if it is hot.
-std::atomic<uint64_t> g_hash_calls {0};
-std::atomic<uint64_t> g_hash_cycles {0};
-std::atomic<uint64_t> g_hash_refreshes {0};   // RefreshImage entries, hashed or not
-std::atomic<uint64_t> g_hash_changed {0};     // resolves where the bytes had actually changed
-
-[[nodiscard]] uint64_t HashAndCount(const Image& image) {
-	const auto start = __builtin_ia32_rdtsc();
-	const auto hash  = image.HashGuestEdges();
-	g_hash_cycles.fetch_add(__builtin_ia32_rdtsc() - start, std::memory_order_relaxed);
-	g_hash_calls.fetch_add(1, std::memory_order_relaxed);
-	return hash;
-}
-
 [[nodiscard]] const char* BindingTypeName(TextureCache::BindingType type) {
 	switch (type) {
 		case TextureCache::BindingType::Texture: return "Texture";
@@ -118,22 +98,6 @@ void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view
 }
 
 } // namespace
-
-// Reported from the drain census so the hash cost lands next to the phase percentages it would
-// have to come out of. Counters are read-and-reset so each line covers one census window.
-void ReportHashCensus() {
-	const auto calls     = g_hash_calls.exchange(0, std::memory_order_relaxed);
-	const auto cycles    = g_hash_cycles.exchange(0, std::memory_order_relaxed);
-	const auto refreshes = g_hash_refreshes.exchange(0, std::memory_order_relaxed);
-	const auto changed   = g_hash_changed.exchange(0, std::memory_order_relaxed);
-	std::printf("HashCensus: refreshes=%" PRIu64 " hashes=%" PRIu64 " (%.1f%% of refreshes) "
-	            "cycles/hash=%.0f total_cycles=%" PRIu64 " changed=%" PRIu64 "\n",
-	            refreshes, calls,
-	            refreshes > 0 ? 100.0 * static_cast<double>(calls) / static_cast<double>(refreshes)
-	                          : 0.0,
-	            calls > 0 ? static_cast<double>(cycles) / static_cast<double>(calls) : 0.0, cycles,
-	            changed);
-}
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
@@ -354,7 +318,7 @@ void TextureCache::FlushDeferredTracks() {
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	image.MarkMaybeCpuDirty();
 	if (image.NeedsMaybeCpuHash()) {
-		image.SetMaybeCpuHash(HashAndCount(image));
+		image.SetMaybeCpuHash(image.HashGuestEdges());
 	}
 	UntrackImage(id);
 }
@@ -1284,7 +1248,6 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc& desc) {
 void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 	TrackImage(id);
 	auto& image = m_slot_images[id];
-	g_hash_refreshes.fetch_add(1, std::memory_order_relaxed);
 	// Everything below either leaves the image untouched or mutates it, with nothing in between:
 	// the hash branch flips the dirty flags, and InitializeImage uploads guest memory and records
 	// transfer commands. If none of these three flags is set the whole function is a no-op past
@@ -1301,14 +1264,12 @@ void TextureCache::RefreshImage(ImageId id, const ImageDesc& desc) {
 		return;
 	}
 	if (image.IsMaybeCpuDirty()) {
-		const auto hash = HashAndCount(image);
+		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
 			image.SetMaybeCpuHash(hash);
 			return;
 		}
-		if (image.ResolveMaybeCpuHash(hash)) {
-			g_hash_changed.fetch_add(1, std::memory_order_relaxed);
-		}
+		(void)image.ResolveMaybeCpuHash(hash);
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
