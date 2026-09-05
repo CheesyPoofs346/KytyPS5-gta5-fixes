@@ -55,6 +55,9 @@ enum class DrawPhase : uint32_t {
 	// ACQUIRE only, not the work under the lock.
 	TexLockAcquire,     // of which, FindTexture's shared_lock on the texture cache
 	BufLockAcquire,     // of which, FindBuffer's shared_lock on the page table
+	// The caller thread participates in ParallelFor as runner 0, so MustStageForWorker() is false
+	// for it and it takes the EXCLUSIVE branch - a writer among readers, blocking every worker.
+	TexLockExclusive,   // of which, FindTexture's exclusive lock (main thread / caller)
 	BindRebindImages,   // of which
 	VertexIndex,
 	RenderTargets,
@@ -98,6 +101,7 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::BindDedupScan:
 		case DrawPhase::TexLockAcquire:
 		case DrawPhase::BufLockAcquire:
+		case DrawPhase::TexLockExclusive:
 		case DrawPhase::BindRebindImages: return true;
 		default: return false;
 	}
@@ -130,6 +134,7 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::BindDedupScan: return "      of which dedup scan";
 		case DrawPhase::TexLockAcquire: return "      of which texture lock acquire";
 		case DrawPhase::BufLockAcquire: return "      of which buffer lock acquire";
+		case DrawPhase::TexLockExclusive: return "      of which texture lock EXCLUSIVE";
 		case DrawPhase::BindRebindImages: return "  of which RebindImages";
 		case DrawPhase::VertexIndex: return "vertex+index buffers";
 		case DrawPhase::RenderTargets: return "AcquireRenderTargets";

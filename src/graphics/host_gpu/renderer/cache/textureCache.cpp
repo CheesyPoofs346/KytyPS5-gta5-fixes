@@ -1486,7 +1486,15 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 		return FindTextureLocked(id, desc);
 	}
-	std::scoped_lock lock {m_lock};
+	// The caller thread runs phase 2c items too, as ParallelFor runner 0, so MustStageForWorker()
+	// is false for it and it lands here - taking an EXCLUSIVE lock while seven workers hold shared
+	// ones. A writer among readers blocks all of them and then waits for them to drain, and it gets
+	// worse with every worker added. Timed to size that.
+	std::unique_lock lock {m_lock, std::defer_lock};
+	{
+		DrawPhaseTimer exclusive_timer(DrawPhase::TexLockExclusive);
+		lock.lock();
+	}
 	return FindTextureLocked(id, desc);
 }
 
