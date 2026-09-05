@@ -32,6 +32,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <numeric>
 #include <array>
 #include <atomic>
 #include <functional>
@@ -1721,6 +1722,79 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 // about which lighting feature to drop.
 //
 // Read-only. Keyed on the target signature, which is what actually distinguishes a pass.
+
+// Section A of the performance audit: the existing Frame: line averages 60 frames, so it reports
+// a mean and hides every spike. Tail latency is what a 30 fps floor actually depends on, and a
+// mean cannot express it. Records each frame individually and reports order statistics with the
+// denominators printed, so no derived number can be quoted without its sample count.
+//
+// Deliberately NOT normalised per draw: dividing a windowed time by a windowed draw count is what
+// produced the retracted "PM4 non-draw exceeds the draw path" claim, where the same quantity
+// measured 6.875 and 20.623 us/draw across two runs at identical fps.
+class FrameStats {
+public:
+	void Note(double ms, uint64_t draws) {
+		if (ms <= 0.0 || ms > 10000.0) {   // ignore breakpoints and window drags
+			return;
+		}
+		m_ms.push_back(ms);
+		m_draws.push_back(draws);
+		if (m_ms.size() >= kWindow) {
+			Report();
+			m_ms.clear();
+			m_draws.clear();
+		}
+	}
+
+private:
+	static constexpr size_t kWindow = 300;
+
+	static double Percentile(const std::vector<double>& sorted, double p) {
+		if (sorted.empty()) {
+			return 0.0;
+		}
+		const auto idx = static_cast<size_t>(p * static_cast<double>(sorted.size() - 1) + 0.5);
+		return sorted[std::min(idx, sorted.size() - 1)];
+	}
+
+	void Report() const {
+		auto ms = m_ms;
+		std::sort(ms.begin(), ms.end());
+		auto draws = m_draws;
+		std::sort(draws.begin(), draws.end());
+		const auto   n    = ms.size();
+		const double mean = std::accumulate(ms.begin(), ms.end(), 0.0) / static_cast<double>(n);
+		size_t       over30 = 0;
+		size_t       over60 = 0;
+		for (const auto v: ms) {
+			if (v > 33.33) {
+				over30++;
+			}
+			if (v > 16.67) {
+				over60++;
+			}
+		}
+		const auto med = Percentile(ms, 0.50);
+		const auto p95 = Percentile(ms, 0.95);
+		std::printf("FrameStats: n=%zu | ms med=%.1f p95=%.1f p99=%.1f min=%.1f max=%.1f "
+		            "mean=%.1f | fps med=%.1f p95=%.1f | draws med=%llu max=%llu | "
+		            "over33.3ms=%zu (%.1f%%) over16.7ms=%zu (%.1f%%)\n",
+		            n, med, p95, Percentile(ms, 0.99), ms.front(), ms.back(), mean,
+		            med > 0 ? 1000.0 / med : 0.0, p95 > 0 ? 1000.0 / p95 : 0.0,
+		            static_cast<unsigned long long>(draws[draws.size() / 2]),
+		            static_cast<unsigned long long>(draws.back()), over30,
+		            100.0 * static_cast<double>(over30) / static_cast<double>(n), over60,
+		            100.0 * static_cast<double>(over60) / static_cast<double>(n));
+		std::fflush(stdout);
+	}
+
+	std::vector<double>   m_ms;
+	std::vector<uint64_t> m_draws;
+};
+
+FrameStats                g_frame_stats;
+std::atomic<uint64_t>     g_frame_draw_sample {0};
+
 struct PassCensus {
 	struct Entry {
 		uint64_t key    = 0;
@@ -2119,6 +2193,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		static std::atomic<uint32_t> s_last_frame {UINT32_MAX};
 		static std::atomic<uint64_t> s_draws {0};
 		s_draws.fetch_add(1, std::memory_order_relaxed);
+		g_frame_draw_sample.fetch_add(1, std::memory_order_relaxed);
 		const auto frame_now = m_context.HasGpu()
 		                           ? static_cast<uint32_t>(m_context.GetGpu().GetFrameNum())
 		                           : 0u;
@@ -2132,6 +2207,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			// Once per frame, alongside ShaderCensus. Reports on its own 300-frame cadence.
 			ReportPassCensus();
+			// Per-frame sample for the order statistics. The 60-frame mean below stays for
+			// continuity with older logs; this is the number to quote.
+			{
+				static std::chrono::steady_clock::time_point s_prev {};
+				const auto sample_now = std::chrono::steady_clock::now();
+				if (s_prev.time_since_epoch().count() != 0) {
+					const auto delta_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                          sample_now - s_prev)
+					                          .count() /
+					                      1e6;
+					g_frame_stats.Note(delta_ms, g_frame_draw_sample.exchange(
+					                                 0, std::memory_order_relaxed));
+				}
+				s_prev = sample_now;
+			}
 			if (++s_frames % 60 == 0) {
 				const auto now = std::chrono::steady_clock::now();
 				if (s_t0.time_since_epoch().count() != 0) {
