@@ -131,6 +131,8 @@ void DrawWorkerPool::WorkerLoop(uint32_t index, std::stop_token stop) {
 		if (body == nullptr) {
 			continue;
 		}
+		{
+		CaptureTimer capture_timer {CaptureBucket::WorkerExec};
 		for (;;) {
 			const auto item = m_next.fetch_add(1, std::memory_order_relaxed);
 			if (item >= m_count) {
@@ -138,6 +140,7 @@ void DrawWorkerPool::WorkerLoop(uint32_t index, std::stop_token stop) {
 			}
 			g_items_by_runner[index].fetch_add(1, std::memory_order_relaxed);
 			(*body)(item, index);
+		}
 		}
 		if (m_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
 			std::lock_guard lock(m_mutex);

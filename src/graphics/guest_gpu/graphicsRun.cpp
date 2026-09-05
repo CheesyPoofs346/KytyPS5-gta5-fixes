@@ -967,6 +967,8 @@ void CommandProcessor::SuspendPm4() {
 }
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
+	// Inclusive of any blocking a handler does; the wait-* buckets below break that out.
+	CaptureTimer capture_timer {CaptureBucket::Pm4Exec};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
