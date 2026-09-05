@@ -347,6 +347,12 @@ private:
                                                     ShaderBufferResource& destination,
                                                     ShaderBufferResource& constants);
 
+
+// Section A frame-time capture. NoteBoundary is called once per guest frame from
+// GuestGpu::Done(); ReportFinal emits whole-route percentiles at shutdown.
+void FrameStatsNoteBoundary();
+void FrameStatsReportFinal();
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_ */

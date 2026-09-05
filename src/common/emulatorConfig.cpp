@@ -35,6 +35,7 @@ static std::atomic<bool>     g_coalesce_eop_flush {false};
 static std::atomic<bool>     g_light_partial_flush {false};
 static std::atomic<uint32_t> g_eop_flush_interval {1};
 static std::atomic<uint32_t> g_stream_repeat_threshold {0};
+static std::atomic<uint32_t> g_warmup_frames {0};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
@@ -73,6 +74,7 @@ void Load(const ConfigOptions& cfg) {
 	g_light_partial_flush.store(cfg.light_partial_flush, std::memory_order_relaxed);
 	g_eop_flush_interval.store(cfg.eop_flush_interval, std::memory_order_relaxed);
 	g_stream_repeat_threshold.store(cfg.stream_repeat_threshold, std::memory_order_relaxed);
+	g_warmup_frames.store(cfg.warmup_frames, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
@@ -205,6 +207,10 @@ bool CoalesceEopFlushEnabled() {
 
 uint32_t EopFlushInterval() {
 	return g_eop_flush_interval.load(std::memory_order_relaxed);
+}
+
+uint32_t WarmupFrames() {
+	return g_warmup_frames.load(std::memory_order_relaxed);
 }
 
 uint32_t StreamRepeatThreshold() {

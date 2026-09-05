@@ -1723,31 +1723,60 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 //
 // Read-only. Keyed on the target signature, which is what actually distinguishes a pass.
 
-// Section A of the performance audit: the existing Frame: line averages 60 frames, so it reports
-// a mean and hides every spike. Tail latency is what a 30 fps floor actually depends on, and a
-// mean cannot express it. Records each frame individually and reports order statistics with the
-// denominators printed, so no derived number can be quoted without its sample count.
+// Section A of the performance audit.
 //
-// Deliberately NOT normalised per draw: dividing a windowed time by a windowed draw count is what
-// produced the retracted "PM4 non-draw exceeds the draw path" claim, where the same quantity
-// measured 6.875 and 20.623 us/draw across two runs at identical fps.
+// FRAME DEFINITION: one sample per call to GuestGpu::Done(), which is the guest declaring its
+// frame submission complete (agc.cpp submitDone -> Done() -> ++m_done_num), taken after
+// WaitForIdle()/WaitForPipelineDepth(). So an interval is GUEST SUBMISSION BOUNDARY to GUEST
+// SUBMISSION BOUNDARY.
+//   - It is NOT a presentation interval and NOT a displayed-frame interval: no vkQueuePresent is
+//     involved, so with Mailbox these numbers say nothing about what reached the monitor.
+//   - It is NOT a host submission count; many host submissions occur per guest frame.
+//   - Queued work: with frame pipelining enabled the guest runs ahead by up to PipelineDepth,
+//     so GPU execution for frame N may still be in flight when frame N+1 is sampled. The
+//     interval then measures guest-side pacing, not GPU completion.
+//   - Sampling in Done() rather than on a draw means frames with zero draws still produce a
+//     sample, so an interval can never silently span several frames.
+//
+// Every individual sample is retained for the whole route and written to a CSV, so percentiles
+// are computed once over the entire measured region. Percentiles of 300-frame windows are never
+// averaged together - that is not a percentile of anything.
+//
+// Nothing here is normalised per draw. Dividing a windowed time by a windowed draw count is what
+// produced the retracted claim that PM4 non-draw work exceeded the draw path.
 class FrameStats {
 public:
 	void Note(double ms, uint64_t draws) {
 		if (ms <= 0.0 || ms > 10000.0) {   // ignore breakpoints and window drags
 			return;
 		}
-		m_ms.push_back(ms);
-		m_draws.push_back(draws);
-		if (m_ms.size() >= kWindow) {
-			Report();
-			m_ms.clear();
-			m_draws.clear();
+		m_samples.push_back({ms, draws});
+		if (m_csv == nullptr) {
+			m_csv = std::fopen("frametimes.csv", "w");
+			if (m_csv != nullptr) {
+				std::fprintf(m_csv, "index,ms,draws,phase\n");
+			}
+		}
+		const bool warm = m_samples.size() > Config::WarmupFrames();
+		if (m_csv != nullptr) {
+			std::fprintf(m_csv, "%zu,%.4f,%llu,%s\n", m_samples.size() - 1, ms,
+			             static_cast<unsigned long long>(draws), warm ? "route" : "warmup");
+			std::fflush(m_csv);
+		}
+		if ((m_samples.size() % kReportEvery) == 0) {
+			Report("progress");
 		}
 	}
 
+	// Whole-route statistics over every retained sample, warmup excluded.
+	void ReportFinal() { Report("FINAL"); }
+
 private:
-	static constexpr size_t kWindow = 300;
+	struct Sample {
+		double   ms;
+		uint64_t draws;
+	};
+	static constexpr size_t kReportEvery = 300;
 
 	static double Percentile(const std::vector<double>& sorted, double p) {
 		if (sorted.empty()) {
@@ -1757,43 +1786,58 @@ private:
 		return sorted[std::min(idx, sorted.size() - 1)];
 	}
 
-	void Report() const {
-		auto ms = m_ms;
+	void Report(const char* tag) const {
+		const auto warmup = std::min<size_t>(Config::WarmupFrames(), m_samples.size());
+		if (m_samples.size() - warmup < 2) {
+			return;
+		}
+		std::vector<double>   ms;
+		std::vector<uint64_t> draws;
+		ms.reserve(m_samples.size() - warmup);
+		draws.reserve(m_samples.size() - warmup);
+		for (size_t i = warmup; i < m_samples.size(); ++i) {
+			ms.push_back(m_samples[i].ms);
+			draws.push_back(m_samples[i].draws);
+		}
 		std::sort(ms.begin(), ms.end());
-		auto draws = m_draws;
 		std::sort(draws.begin(), draws.end());
 		const auto   n    = ms.size();
 		const double mean = std::accumulate(ms.begin(), ms.end(), 0.0) / static_cast<double>(n);
-		size_t       over30 = 0;
 		size_t       over60 = 0;
+		size_t       over30 = 0;
 		for (const auto v: ms) {
-			if (v > 33.33) {
-				over30++;
-			}
-			if (v > 16.67) {
+			if (v > 16.667) {
 				over60++;
+			}
+			if (v > 33.333) {
+				over30++;
 			}
 		}
 		const auto med = Percentile(ms, 0.50);
 		const auto p95 = Percentile(ms, 0.95);
-		std::printf("FrameStats: n=%zu | ms med=%.1f p95=%.1f p99=%.1f min=%.1f max=%.1f "
-		            "mean=%.1f | fps med=%.1f p95=%.1f | draws med=%llu max=%llu | "
-		            "over33.3ms=%zu (%.1f%%) over16.7ms=%zu (%.1f%%)\n",
-		            n, med, p95, Percentile(ms, 0.99), ms.front(), ms.back(), mean,
+		const auto p99 = Percentile(ms, 0.99);
+		// Milliseconds are authoritative. The bracketed figures are FPS EQUIVALENTS of the tail
+		// latencies (1000/p95ms), i.e. the rate a p95-slow frame corresponds to - NOT the 95th
+		// percentile of FPS, which would describe the fast end.
+		std::printf("FrameStats[%s]: n=%zu warmup=%zu | ms med=%.2f p95=%.2f p99=%.2f "
+		            "min=%.2f max=%.2f mean=%.2f | fps-equiv med=%.1f p95ms=%.1f p99ms=%.1f | "
+		            "draws med=%llu max=%llu | over16.667ms=%zu (%.1f%%) over33.333ms=%zu (%.1f%%)\n",
+		            tag, n, warmup, med, p95, p99, ms.front(), ms.back(), mean,
 		            med > 0 ? 1000.0 / med : 0.0, p95 > 0 ? 1000.0 / p95 : 0.0,
+		            p99 > 0 ? 1000.0 / p99 : 0.0,
 		            static_cast<unsigned long long>(draws[draws.size() / 2]),
-		            static_cast<unsigned long long>(draws.back()), over30,
-		            100.0 * static_cast<double>(over30) / static_cast<double>(n), over60,
-		            100.0 * static_cast<double>(over60) / static_cast<double>(n));
+		            static_cast<unsigned long long>(draws.back()), over60,
+		            100.0 * static_cast<double>(over60) / static_cast<double>(n), over30,
+		            100.0 * static_cast<double>(over30) / static_cast<double>(n));
 		std::fflush(stdout);
 	}
 
-	std::vector<double>   m_ms;
-	std::vector<uint64_t> m_draws;
+	std::vector<Sample> m_samples;
+	std::FILE*          m_csv = nullptr;
 };
 
-FrameStats                g_frame_stats;
-std::atomic<uint64_t>     g_frame_draw_sample {0};
+FrameStats            g_frame_stats;
+std::atomic<uint64_t> g_frame_draw_sample {0};
 
 struct PassCensus {
 	struct Entry {
@@ -2207,21 +2251,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			}
 			// Once per frame, alongside ShaderCensus. Reports on its own 300-frame cadence.
 			ReportPassCensus();
-			// Per-frame sample for the order statistics. The 60-frame mean below stays for
-			// continuity with older logs; this is the number to quote.
-			{
-				static std::chrono::steady_clock::time_point s_prev {};
-				const auto sample_now = std::chrono::steady_clock::now();
-				if (s_prev.time_since_epoch().count() != 0) {
-					const auto delta_ms = std::chrono::duration_cast<std::chrono::nanoseconds>(
-					                          sample_now - s_prev)
-					                          .count() /
-					                      1e6;
-					g_frame_stats.Note(delta_ms, g_frame_draw_sample.exchange(
-					                                 0, std::memory_order_relaxed));
-				}
-				s_prev = sample_now;
-			}
 			if (++s_frames % 60 == 0) {
 				const auto now = std::chrono::steady_clock::now();
 				if (s_t0.time_since_epoch().count() != 0) {
@@ -2799,6 +2828,24 @@ void FlushSecondaryBatch(RenderContext& context) {
 	batch.draws    = 0;
 	batch.buffer   = nullptr;
 	batch.flushing = false;
+}
+
+
+// Called from GuestGpu::Done(): the authoritative guest frame boundary.
+void FrameStatsNoteBoundary() {
+	static std::chrono::steady_clock::time_point s_prev {};
+	const auto now   = std::chrono::steady_clock::now();
+	const auto draws = g_frame_draw_sample.exchange(0, std::memory_order_relaxed);
+	if (s_prev.time_since_epoch().count() != 0) {
+		g_frame_stats.Note(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - s_prev).count() / 1e6,
+		    draws);
+	}
+	s_prev = now;
+}
+
+void FrameStatsReportFinal() {
+	g_frame_stats.ReportFinal();
 }
 
 } // namespace Libs::Graphics

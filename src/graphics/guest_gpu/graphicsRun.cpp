@@ -402,6 +402,7 @@ void GuestGpu::Done() {
 	}
 	m_graphics_done = true;
 	const auto frame = ++m_done_num;
+	FrameStatsNoteBoundary();
 	g_census_frames.fetch_add(1, std::memory_order_relaxed);
 	ReportFrameThreadCensus(frame);
 }

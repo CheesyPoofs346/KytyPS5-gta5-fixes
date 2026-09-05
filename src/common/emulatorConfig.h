@@ -97,6 +97,9 @@ struct ConfigOptions {
 	// through to the persistent FindBuffer/SynchronizeBuffer path, which uploads only
 	// dirty sub-ranges and clears them. 0 disables (original behaviour).
 	uint32_t               stream_repeat_threshold       = 0;
+	// Frames excluded from the measured route so cold streaming is not counted as steady
+	// state. Samples are still recorded and marked "warmup" in frametimes.csv.
+	uint32_t               warmup_frames                 = 0;
 	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
@@ -208,6 +211,7 @@ bool     CoalesceEopFlushEnabled();
 bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
 uint32_t StreamRepeatThreshold();
+uint32_t WarmupFrames();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
