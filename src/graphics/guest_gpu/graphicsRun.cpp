@@ -1940,6 +1940,13 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 			EmitGlobalBarrier();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
+		//
+		// CbMetadataWritebackInvalidate alone is 42.8% of every IT_EVENT_WRITE, and these three
+		// together are 59%. They write back GCN's colour/depth METADATA caches - DCC and CMask -
+		// which a Vulkan driver owns and manages itself; there is no guest-visible metadata cache
+		// on this side to flush. The memory barrier still goes out, because the guest is expressing
+		// a real dependency, but ending the render pass for it is not justified and is what breaks
+		// draw batching.
 		case 0x0000002a:
 		case 0x0000002c:
 		case 0x0000002e:
@@ -1947,7 +1954,11 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type,
 				     event_index);
 			}
-			EmitGlobalBarrier();
+			if (Config::LightPartialFlushEnabled()) {
+				EmitInPassBarrier();
+			} else {
+				EmitGlobalBarrier();
+			}
 			break;
 		case 0x0000000d:
 		case 0x0000000e:
