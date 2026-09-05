@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
 #include "common/assert.h"
@@ -1475,7 +1476,14 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	// use-after-free rather than a lost update. Exclusive on the main thread is what makes the
 	// workers' shared access safe.
 	if (MustStageForWorker()) {
-		std::shared_lock lock {m_lock};
+		// Deferred so the acquire itself can be timed apart from the work under it. This is the
+		// suspect for phase 2c's negative scaling: one shared_mutex, eight workers, one atomic
+		// reader counter per acquire.
+		std::shared_lock lock {m_lock, std::defer_lock};
+		{
+			DrawPhaseTimer acquire_timer(DrawPhase::TexLockAcquire);
+			lock.lock();
+		}
 		return FindTextureLocked(id, desc);
 	}
 	std::scoped_lock lock {m_lock};

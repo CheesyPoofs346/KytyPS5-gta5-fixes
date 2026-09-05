@@ -34,6 +34,10 @@ class MaybeSharedLock {
 public:
 	MaybeSharedLock(std::shared_mutex& lock, bool engaged): m_lock(lock), m_engaged(engaged) {
 		if (m_engaged) {
+			// Timed separately from the work under the lock. A shared_mutex reader acquire is an
+			// atomic RMW on one counter shared by every worker, so its cost should rise with
+			// worker count if this is what stops phase 2c scaling.
+			DrawPhaseTimer acquire_timer(DrawPhase::BufLockAcquire);
 			m_lock.lock_shared();
 		}
 	}

@@ -48,6 +48,13 @@ enum class DrawPhase : uint32_t {
 	// memcpy that no timer covered. The dedup scan in front of it was untimed too.
 	ObtStreamCopy,      // of which, the stream fast path (guest -> stream memcpy)
 	BindDedupScan,      // of which, FindDrawBufferCache
+	// Phase 2c is the only parallel phase that scales negatively (16.1 -> 18.0 -> 22.8% at 2/4/8
+	// workers) while phase 2a scales cleanly (16.7 -> 11.5 -> 9.0). The difference is that 2c takes
+	// a shared_mutex per resource and 2a takes no lock at all. A shared_mutex reader acquire is an
+	// atomic RMW on one counter, so it ping-pongs a cache line between cores. These time the
+	// ACQUIRE only, not the work under the lock.
+	TexLockAcquire,     // of which, FindTexture's shared_lock on the texture cache
+	BufLockAcquire,     // of which, FindBuffer's shared_lock on the page table
 	BindRebindImages,   // of which
 	VertexIndex,
 	RenderTargets,
@@ -89,6 +96,8 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::ObtSynchronize:
 		case DrawPhase::ObtStreamCopy:
 		case DrawPhase::BindDedupScan:
+		case DrawPhase::TexLockAcquire:
+		case DrawPhase::BufLockAcquire:
 		case DrawPhase::BindRebindImages: return true;
 		default: return false;
 	}
@@ -119,6 +128,8 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::ObtSynchronize: return "      of which SynchronizeBuffer";
 		case DrawPhase::ObtStreamCopy: return "      of which stream copy (memcpy)";
 		case DrawPhase::BindDedupScan: return "      of which dedup scan";
+		case DrawPhase::TexLockAcquire: return "      of which texture lock acquire";
+		case DrawPhase::BufLockAcquire: return "      of which buffer lock acquire";
 		case DrawPhase::BindRebindImages: return "  of which RebindImages";
 		case DrawPhase::VertexIndex: return "vertex+index buffers";
 		case DrawPhase::RenderTargets: return "AcquireRenderTargets";
