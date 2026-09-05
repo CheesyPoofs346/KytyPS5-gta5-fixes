@@ -2092,19 +2092,29 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	// index count means low-poly geometry, which is what GTA V's distant LOD models and small props
 	// are. So this drops far-away detail first, which is the pop-in tradeoff rather than a random
 	// one.
-	if (const auto cull = Config::CullSmallDraws();
-	    cull != 0 && index_count > kCullQuadGuard && index_count < cull) {
-		static std::atomic<uint64_t> s_seen {0};
+	{
+		// Counted for EVERY draw, not just culled ones - the first version incremented both
+		// counters inside the cull branch and reported 100% by construction, which is worse than
+		// no counter at all because it looks like an answer.
+		static std::atomic<uint64_t> s_total {0};
 		static std::atomic<uint64_t> s_culled {0};
-		const auto seen   = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
-		const auto culled = s_culled.fetch_add(1, std::memory_order_relaxed) + 1;
-		if (seen % 200000 == 0) {
-			std::printf("CullCensus: culled=%llu of %llu draws reaching the cull (threshold=%u)\n",
+		const auto total = s_total.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto cull  = Config::CullSmallDraws();
+		const bool drop  = cull != 0 && index_count > kCullQuadGuard && index_count < cull;
+		if (drop) {
+			s_culled.fetch_add(1, std::memory_order_relaxed);
+		}
+		if (total % 500000 == 0) {
+			const auto culled = s_culled.load(std::memory_order_relaxed);
+			std::printf("CullCensus: %llu of %llu draws culled (%.1f%%) threshold=%u\n",
 			            static_cast<unsigned long long>(culled),
-			            static_cast<unsigned long long>(seen), cull);
+			            static_cast<unsigned long long>(total),
+			            100.0 * static_cast<double>(culled) / static_cast<double>(total), cull);
 			std::fflush(stdout);
 		}
-		return;
+		if (drop) {
+			return;
+		}
 	}
 
 	DrawProfileBeginDraw();
