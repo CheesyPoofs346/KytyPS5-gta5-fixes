@@ -2069,6 +2069,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
+// Index counts at or below this are fullscreen and UI quads - sky, post-processing, HUD. They are
+// few, cheap, and dropping them blanks the screen, so the cull never touches them. Matches the
+// existing FullscreenQuadIndexLimit used by the viewport-Z fix for the same reason.
+constexpr uint32_t kCullQuadGuard = 32;
+
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                uint32_t index_type_and_size, uint32_t index_count,
                                const void* index_addr, uint32_t flags, uint32_t type,
@@ -2076,6 +2081,31 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                int32_t vertex_offset_add, uint32_t first_instance,
                                PreparedShaders* prepared) {
 	KYTY_PROFILER_FUNCTION();
+
+	// Draw-count reduction. Deliberately the FIRST thing in the function, before any translation:
+	// frame time is linear in draw count because the cost is per-draw CPU translation, so a cull
+	// that runs after the bindings are built saves only the GPU draw - which we measured as free.
+	// Skipping here saves the whole ~14 us.
+	//
+	// The band is what makes it usable. At or below kCullQuadGuard are fullscreen and UI quads -
+	// sky, post-processing, HUD - which are few, cheap, and catastrophic to drop. Above it, a low
+	// index count means low-poly geometry, which is what GTA V's distant LOD models and small props
+	// are. So this drops far-away detail first, which is the pop-in tradeoff rather than a random
+	// one.
+	if (const auto cull = Config::CullSmallDraws();
+	    cull != 0 && index_count > kCullQuadGuard && index_count < cull) {
+		static std::atomic<uint64_t> s_seen {0};
+		static std::atomic<uint64_t> s_culled {0};
+		const auto seen   = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+		const auto culled = s_culled.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (seen % 200000 == 0) {
+			std::printf("CullCensus: culled=%llu of %llu draws reaching the cull (threshold=%u)\n",
+			            static_cast<unsigned long long>(culled),
+			            static_cast<unsigned long long>(seen), cull);
+			std::fflush(stdout);
+		}
+		return;
+	}
 
 	DrawProfileBeginDraw();
 	struct DrawProfileEndGuard {
