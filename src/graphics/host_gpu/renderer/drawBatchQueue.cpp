@@ -27,7 +27,9 @@ struct DrainCensus {
 	uint64_t drains        = 0;
 	uint64_t draws         = 0;
 	uint64_t prepare_cyc   = 0;   // phase 1, serial lookup
-	uint64_t parallel_cyc  = 0;   // phase 2, the walk across workers
+	uint64_t parallel_cyc  = 0;   // phase 2a, the SRT walk across workers
+	uint64_t acquire_cyc   = 0;   // phase 2b, serial acquisition (creates what is missing)
+	uint64_t bind_cyc      = 0;   // phase 2c, parallel binding (every lookup hits)
 	uint64_t record_cyc    = 0;   // phase 3, serial recording
 	uint64_t buckets[6]    = {};  // 1, 2-4, 5-16, 17-64, 65-255, 256
 };
@@ -55,14 +57,18 @@ void ReportDrainCensus() {
 	}
 	const auto drains = static_cast<double>(t_drain.drains);
 	const auto total  = static_cast<double>(t_drain.prepare_cyc + t_drain.parallel_cyc +
+                                           t_drain.acquire_cyc + t_drain.bind_cyc +
                                            t_drain.record_cyc);
 	std::printf("DrainCensus: drains=%llu draws/batch=%.1f | phase1_prepare=%.1f%% "
-	            "phase2_walk=%.1f%% phase3_record=%.1f%% | sizes 1:%llu 2-4:%llu 5-16:%llu "
+	            "phase2a_walk=%.1f%% phase2b_acquire=%.1f%% phase2c_bind=%.1f%% "
+	            "phase3_record=%.1f%% | sizes 1:%llu 2-4:%llu 5-16:%llu "
 	            "17-64:%llu 65-255:%llu 256:%llu | bailouts=%llu\n",
 	            static_cast<unsigned long long>(t_drain.drains),
 	            static_cast<double>(t_drain.draws) / drains,
 	            total > 0 ? 100.0 * static_cast<double>(t_drain.prepare_cyc) / total : 0.0,
 	            total > 0 ? 100.0 * static_cast<double>(t_drain.parallel_cyc) / total : 0.0,
+	            total > 0 ? 100.0 * static_cast<double>(t_drain.acquire_cyc) / total : 0.0,
+	            total > 0 ? 100.0 * static_cast<double>(t_drain.bind_cyc) / total : 0.0,
 	            total > 0 ? 100.0 * static_cast<double>(t_drain.record_cyc) / total : 0.0,
 	            static_cast<unsigned long long>(t_drain.buckets[0]),
 	            static_cast<unsigned long long>(t_drain.buckets[1]),
@@ -137,9 +143,6 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 			                 // invalidate this one.
 			                 (void)TakeWorkerBailout();
 			                 executor.ResolveQueuedShaders(prepared[index]);
-			                 if (Config::TestParallelBindingsEnabled()) {
-			                 	 executor.ResolveQueuedBindings(prepared[index]);
-			                 }
 			                 if (TakeWorkerBailout()) {
 				                 // The walk reached work only the main thread may do. Whatever it
 				                 // produced is discarded rather than patched up - phase 3 resolves
@@ -151,6 +154,36 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 			                 }
 		                 });
 		t_drain.parallel_cyc += __builtin_ia32_rdtsc() - parallel_start;
+
+		if (Config::TestParallelBindingsEnabled()) {
+			// Phase 2b, SERIAL: acquisition. Creates every buffer and image the batch needs.
+			// PrepareBindings reaches FindImage and FindBuffers reaches CreateBuffer, both of which
+			// allocate and record into the primary - which is what aborted three earlier attempts
+			// to run the whole resolve on workers.
+			const auto acquire_start = __builtin_ia32_rdtsc();
+			for (size_t i = 0; i < draws.size(); i++) {
+				const auto previous = bind(draws[i]);
+				executor.AcquireQueuedBindings(m_prepared[i]);
+				buffer.SwapRegisterView(previous);
+			}
+			t_drain.acquire_cyc += __builtin_ia32_rdtsc() - acquire_start;
+
+			// Phase 2c, PARALLEL: binding. Every lookup now hits, so nothing here can allocate.
+			// The creation tripwires stay armed: one firing means acquisition missed a route.
+			const auto bind_start = __builtin_ia32_rdtsc();
+			pool.ParallelFor(static_cast<uint32_t>(draws.size()),
+			                 [&prepared, &executor](uint32_t index, uint32_t worker) {
+				                 ScopedDrawWorker slot(worker);
+				                 (void)TakeWorkerBailout();
+				                 executor.BindQueuedResources(prepared[index]);
+				                 if (TakeWorkerBailout()) {
+					                 prepared[index].valid          = false;
+					                 prepared[index].bindings_valid = false;
+					                 g_bailouts.fetch_add(1, std::memory_order_relaxed);
+				                 }
+			                 });
+			t_drain.bind_cyc += __builtin_ia32_rdtsc() - bind_start;
+		}
 	}
 
 	// Phase 3, serial: record, in guest order. A draw whose permutation needed compiling arrives

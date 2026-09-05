@@ -2505,20 +2505,26 @@ void RenderExecutor::ResolveQueuedShaders(PreparedShaders& prepared) {
 	}
 }
 
-void RenderExecutor::ResolveQueuedBindings(PreparedShaders& prepared) {
+void RenderExecutor::AcquireQueuedBindings(PreparedShaders& prepared) {
+	// Phase 2b. Serial, main thread. Creates every buffer and image the draw needs so that the
+	// parallel pass that follows can only ever hit.
 	prepared.bindings_valid = false;
 	if (!prepared.valid) {
 		return;
 	}
-	// The 40.5% of a draw this whole exercise is aimed at. Everything it reaches is already
-	// worker-safe: DrawBufferCache is thread_local so BeginDrawBufferScope scopes per thread,
-	// RebindImages goes through a FindTexture whose mutating paths all bail out, and FindBuffers /
-	// RebindBuffers run under the buffer cache's concurrent mode. The one exception is PrepareBda,
-	// which bails out inside PrepareGraphicsBindings.
 	prepared.bindings =
-	    PrepareGraphicsBindings(prepared.vs_input_info.stage, prepared.ps_input_info.stage,
+	    AcquireGraphicsBindings(prepared.vs_input_info.stage, prepared.ps_input_info.stage,
 	                            prepared.ps_active);
 	prepared.bindings_valid = true;
+}
+
+void RenderExecutor::BindQueuedResources(PreparedShaders& prepared) {
+	// Phase 2c. Parallel. Acquisition guaranteed every lookup below resolves to something that
+	// already exists, so nothing here can allocate.
+	if (!prepared.valid || !prepared.bindings_valid) {
+		return;
+	}
+	BindGraphicsResources(prepared.bindings);
 }
 
 bool RenderExecutor::EnqueueDrawIndex(QueuedDraw&& draw) {

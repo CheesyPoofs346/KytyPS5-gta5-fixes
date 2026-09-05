@@ -227,7 +227,10 @@ public:
 	void ResolveQueuedShaders(PreparedShaders& prepared);
 	// Builds both stages' bindings for an already-resolved draw, on whatever thread calls it.
 	// Sets prepared.bindings_valid; the caller clears it if the draw bailed out.
-	void ResolveQueuedBindings(PreparedShaders& prepared);
+	// Phase 2b: acquisition, main thread only - creates any missing buffer or image.
+	void AcquireQueuedBindings(PreparedShaders& prepared);
+	// Phase 2c: binding only, safe on a worker.
+	void BindQueuedResources(PreparedShaders& prepared);
 
 	// A layout transition a draw needs, recorded for later rather than emitted inline.
 	//
@@ -263,6 +266,12 @@ private:
 	[[nodiscard]] GraphicsBindings PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
+	// Phase 2b: acquisition. Creates any missing buffer or image. Main thread only.
+	[[nodiscard]] GraphicsBindings AcquireGraphicsBindings(const ShaderStageRuntime& vertex,
+	                                                       const ShaderStageRuntime& pixel,
+	                                                       bool                      pixel_active);
+	// Phase 2c: binding only, every lookup guaranteed to hit. Safe on a worker.
+	void                           BindGraphicsResources(GraphicsBindings& bindings);
 	void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,
 	                              RenderColorInfo& target, uint32_t render_target_slice_offset = 0,
 	                              uint32_t render_target_slot = UINT32_MAX,

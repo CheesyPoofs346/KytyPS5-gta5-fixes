@@ -1330,6 +1330,24 @@ void NoteBindingReuse(const GraphicsBindings& bindings) {
 GraphicsBindings
 RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
                                         const ShaderStageRuntime& pixel, bool pixel_active) {
+	auto bindings = AcquireGraphicsBindings(vertex, pixel, pixel_active);
+	BindGraphicsResources(bindings);
+	return bindings;
+}
+
+// Phase 2b - ACQUISITION. Main thread only.
+//
+// Everything here can create. PrepareBindings reaches ResolveTexture -> FindImage, which inserts
+// and expands images and uploads them; FindBuffers calls FindBuffer -> CreateBuffer, which records
+// a CopyFrom into the primary. That is what aborted every earlier attempt to run the whole resolve
+// on workers - three times, each on a different route.
+//
+// The split is not arbitrary: PrepareBindings and FindBuffers ARE the acquisition half, and
+// RebindBuffers/RebindImages ARE the binding half, so the existing boundaries already drew the line.
+GraphicsBindings RenderExecutor::AcquireGraphicsBindings(const ShaderStageRuntime& vertex,
+                                                        const ShaderStageRuntime& pixel,
+                                                        bool                      pixel_active) {
+	EXIT_IF(MustStageForWorker());
 	// One draw's worth of buffer resolutions; see BeginDrawBufferScope.
 	BeginDrawBufferScope();
 	GraphicsBindings bindings {
@@ -1342,17 +1360,22 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 	if (bindings.pixel) {
 		FindBuffers(*bindings.pixel);
 	}
+	// PrepareBda mutates shared GPU resource state, so it belongs on this side too. It used to bail
+	// a worker out; now it simply runs where it is safe.
 	if (bindings.vertex.program->info.uses_dma ||
 	    (bindings.pixel && bindings.pixel->program->info.uses_dma)) {
-		// PrepareBda mutates shared GPU resource state, so a worker abandons the draw and phase 3
-		// rebuilds its bindings inline - the same bail-out the texture cache paths use. Returning
-		// the half-built bindings is safe because the caller drops them on a bail-out.
-		if (MustStageForWorker()) {
-			RequestWorkerBailout();
-			return bindings;
-		}
 		m_context.GetGpuResources().PrepareBda();
 	}
+	return bindings;
+}
+
+// Phase 2c - BINDING. Safe on a worker.
+//
+// Every lookup below is guaranteed to hit because acquisition already created what was missing. The
+// creation bail-outs inside FindImage, ExpandImage, CreateBuffer and ObtainBuffer stay as
+// tripwires: if one fires now, acquisition missed something, and a loud abort naming the line is
+// how the three previous routes were found.
+void RenderExecutor::BindGraphicsResources(GraphicsBindings& bindings) {
 	RebindBuffers(bindings.vertex);
 	if (bindings.pixel) {
 		RebindBuffers(*bindings.pixel);
@@ -1362,7 +1385,6 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 		RebindImages(*bindings.pixel);
 	}
 	NoteBindingReuse(bindings);
-	return bindings;
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
