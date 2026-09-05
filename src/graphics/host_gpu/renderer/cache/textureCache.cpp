@@ -1343,8 +1343,11 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
-	auto& command = m_scheduler.Current();
-	if (command.IsInvalid()) {
+	// Assertion only for the common path. A worker resolving between submissions, where Current()
+	// is legitimately invalid, is not an error - enforcing it here is what aborted the first
+	// parallel-bindings run. The heavy paths below (TryDownloadImage, image copies) assert on
+	// their own, so a worker that reaches one fails loudly instead of recording into the primary.
+	if (!MustStageForWorker() && m_scheduler.Current().IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
 	}
 	ValidateImageDesc(desc);
@@ -2069,6 +2072,11 @@ void TextureCache::ReadMemory(uint64_t address, uint64_t size) {
 }
 
 bool TextureCache::TryDownloadImage(ImageId id) {
+	// Records a pipeline barrier into the primary and can call m_scheduler.Finish(). Reached from
+	// FindImage's format-reinterpretation path, from CPU readback and from the GC. A worker here
+	// would record into whatever command buffer happens to be current, corrupting silently rather
+	// than failing - so this is an assert, not a branch.
+	EXIT_IF(MustStageForWorker());
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
 		return false;

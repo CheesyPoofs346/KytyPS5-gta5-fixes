@@ -508,7 +508,12 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	MaybeUniqueLock lock(m_page_table_lock, m_concurrent);
-	auto&           command = m_scheduler.Current();
+	// NOT assertion-only: the overlap loop below does buffer.CopyFrom(command, ...), recording
+	// into the primary. A worker reaching here would record into whatever command buffer happens
+	// to be current, corrupting silently rather than failing - so this is an assert, and
+	// ObtainBuffer bails out before it can get here.
+	EXIT_IF(MustStageForWorker());
+	auto& command = m_scheduler.Current();
 	EXIT_IF(command.IsInvalid());
 	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
 	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
@@ -682,6 +687,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	{
 		DrawPhaseTimer find_timer(DrawPhase::ObtFindBuffer);
 		if (buffer == nullptr || buffer->is_deleted || !buffer->IsInBounds(vaddr, size)) {
+			// FindBuffer can reach CreateBuffer, which records a CopyFrom into the primary. Bail
+			// conservatively whenever the cached id misses, rather than trying to predict whether
+			// this particular lookup would create one - a wrong prediction is silent corruption,
+			// and the bailout census measured these well under 1% of draws.
+			if (MustStageForWorker()) {
+				RequestWorkerBailout();
+				return {nullptr, 0};
+			}
 			id     = FindBuffer(vaddr, size);
 			buffer = &m_slot_buffers[id];
 		}

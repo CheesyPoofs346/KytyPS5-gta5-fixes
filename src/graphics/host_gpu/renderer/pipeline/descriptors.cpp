@@ -941,8 +941,10 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
 
 static BufferView NativeUpload(RenderContext& context, std::span<const uint32_t> data) {
 	EXIT_IF(data.empty());
-	auto& command_buffer = context.GetCommandScheduler().Current();
-	EXIT_IF(command_buffer.IsInvalid());
+	// Assertion only - nothing is recorded into the primary here, and the stream ring this writes
+	// to is already per worker. A worker resolving between submissions, where Current() is
+	// legitimately invalid, is not an error. Same class as the ObtainBuffer precondition.
+	EXIT_IF(!MustStageForWorker() && context.GetCommandScheduler().Current().IsInvalid());
 	auto&      buffer = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 	const auto offset = buffer.Copy(data.data(), data.size_bytes(), 256);
 	return {.buffer = buffer.Handle(), .offset = offset, .range = data.size_bytes()};
