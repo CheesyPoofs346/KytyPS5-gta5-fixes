@@ -72,7 +72,7 @@ def main():
     print()
     print("== run-to-run spread (the variance floor a real gain must clear) ==")
     for key, label in (("med", "median ms"), ("p95", "p95 ms"), ("p99", "p99 ms"),
-                       ("over60", "%% over 16.667ms")):
+                       ("over60", "% over 16.667ms")):
         values = [r[key] for r in runs]
         lo, hi = min(values), max(values)
         span = hi - lo
