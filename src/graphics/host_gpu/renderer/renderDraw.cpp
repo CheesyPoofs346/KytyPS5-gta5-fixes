@@ -1712,6 +1712,100 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 	}
 }
 
+// Which RENDER PASS does each draw belong to?
+//
+// ShaderCensus already says the top three pixel shaders are 41% of draws, but not what those draws
+// are FOR. A 1024x1024 depth-only target with no colour is a shadow cascade; a 1920x1080 multi-MRT
+// target is the main G-buffer; a small square colour target is a reflection probe. Knowing that
+// turns "skip 41% of draws" from the blind shader-hash guess that broke the image into a choice
+// about which lighting feature to drop.
+//
+// Read-only. Keyed on the target signature, which is what actually distinguishes a pass.
+struct PassCensus {
+	struct Entry {
+		uint64_t key    = 0;
+		uint64_t draws  = 0;
+		uint32_t width  = 0;
+		uint32_t height = 0;
+		uint32_t colors = 0;
+		uint32_t color_format = 0;
+		uint32_t depth_format = 0;
+		bool     depth_write  = false;
+		bool     depth_test   = false;
+	};
+	static constexpr size_t kSlots = 64;
+	std::array<Entry, kSlots> entries {};
+	uint64_t                  frames = 0;
+};
+
+PassCensus g_pass_census;
+
+void NotePass(const DrawRenderState& state) {
+	const auto  color_format = state.color_count > 0
+	                               ? static_cast<uint32_t>(state.color_info[0].format)
+	                               : 0u;
+	const auto  width  = state.color_count > 0 ? state.color_info[0].extent.width
+	                                           : state.depth_info.width;
+	const auto  height = state.color_count > 0 ? state.color_info[0].extent.height
+	                                           : state.depth_info.height;
+	const uint64_t key = (static_cast<uint64_t>(width) << 40u) ^
+	                     (static_cast<uint64_t>(height) << 20u) ^
+	                     (static_cast<uint64_t>(state.color_count) << 48u) ^
+	                     (static_cast<uint64_t>(color_format) << 8u) ^
+	                     static_cast<uint64_t>(state.depth_info.format);
+
+	for (auto& e: g_pass_census.entries) {
+		if (e.key == key) {
+			e.draws++;
+			return;
+		}
+		if (e.key == 0) {
+			e.key          = key;
+			e.draws        = 1;
+			e.width        = width;
+			e.height       = height;
+			e.colors       = state.color_count;
+			e.color_format = color_format;
+			e.depth_format = static_cast<uint32_t>(state.depth_info.format);
+			e.depth_write  = state.depth_info.depth_write_enable;
+			e.depth_test   = state.depth_info.depth_test_enable;
+			return;
+		}
+	}
+}
+
+void ReportPassCensus() {
+	auto& c = g_pass_census;
+	if (++c.frames % 300 != 0) {
+		return;
+	}
+	std::array<const PassCensus::Entry*, PassCensus::kSlots> rows {};
+	size_t n = 0;
+	uint64_t total = 0;
+	for (const auto& e: c.entries) {
+		if (e.key != 0) {
+			rows[n++] = &e;
+			total += e.draws;
+		}
+	}
+	std::sort(rows.begin(), rows.begin() + n,
+	          [](const PassCensus::Entry* a, const PassCensus::Entry* b) {
+		          return a->draws > b->draws;
+	          });
+	std::printf("PassCensus: %llu passes over %llu frames, %.0f draws/frame total\n",
+	            static_cast<unsigned long long>(n), static_cast<unsigned long long>(c.frames),
+	            static_cast<double>(total) / static_cast<double>(c.frames));
+	for (size_t i = 0; i < n && i < 12; i++) {
+		const auto* e = rows[i];
+		std::printf("  %5ux%-5u mrt=%u cfmt=%-3u dfmt=%-3u %s%s  %7.0f draws/frame (%.1f%%)\n",
+		            e->width, e->height, e->colors, e->color_format, e->depth_format,
+		            e->depth_write ? "Zw" : "  ", e->depth_test ? "Zt" : "  ",
+		            static_cast<double>(e->draws) / static_cast<double>(c.frames),
+		            100.0 * static_cast<double>(e->draws) / static_cast<double>(total));
+	}
+	std::fflush(stdout);
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -1851,6 +1945,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (log_pipeline_phase) {
 		LogDrawPhase(draw.name, "CreatePipeline");
 	}
+	NotePass(state);
 	DrawPhaseTimer pipeline_timer(DrawPhase::Pipeline);
 	auto& pipeline = m_context.GetPipelineCache().CreateGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, state.vs_input_info, buffer,
@@ -2023,6 +2118,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			if (s_frames % 300 == 299) {
 				ReportCensus();
 			}
+			// Once per frame, alongside ShaderCensus. Reports on its own 300-frame cadence.
+			ReportPassCensus();
 			if (++s_frames % 60 == 0) {
 				const auto now = std::chrono::steady_clock::now();
 				if (s_t0.time_since_epoch().count() != 0) {
