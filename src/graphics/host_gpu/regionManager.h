@@ -156,10 +156,17 @@ public:
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
 	template <DirtySource source>
+	// Lock-free. See BitArray::AnyInRangeRelaxed for why relaxed atomics are correct here rather
+	// than merely convenient: the exclusive lock this replaces never prevented a guest write from
+	// landing immediately after the check, because those arrive asynchronously through the fault
+	// handler. It also stops copying the whole 512-byte bitmap just to test one range.
+	//
+	// Callers may hold no lock at all, and that is the point. A reader lock of any kind on this
+	// path can starve the guest allocator - that is what froze the game at boot when VirtualRanges
+	// was given a shared_mutex.
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return GetBits<source>().AnyInRangeRelaxed(start, end);
 	}
 
 	template <DirtySource source, bool enable>
@@ -176,10 +183,12 @@ public:
 			}
 		}
 		auto& bits = GetBits<source>();
+		// Atomic stores so the lock-free IsModified readers are not a data race. The region lock is
+		// still held here; this only makes each word store visible without tearing.
 		if constexpr (enable) {
-			bits.SetRange(start, end);
+			bits.SetRangeAtomic(start, end);
 		} else {
-			bits.UnsetRange(start, end);
+			bits.UnsetRangeAtomic(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateCpuProtection<!enable>();
@@ -193,7 +202,7 @@ public:
 		const auto [start, end] = GetPageRange(vaddr, size);
 		RegionBits mask(GetBits<source>(), start, end);
 		if constexpr (clear) {
-			GetBits<source>().UnsetRange(start, end);
+			GetBits<source>().UnsetRangeAtomic(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu && clear) {
 			UpdateCpuProtection<true>();

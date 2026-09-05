@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_COMMON_BITARRAY_H_
 
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -52,6 +53,60 @@ public:
 	};
 
 	using const_iterator = Iterator;
+
+	// Lock-free "is any bit set in [start, end)".
+	//
+	// Two things beyond avoiding a lock. It scans in place instead of the
+	// BitArray(other, start, end).Any() idiom, which copies all 512 bytes of the bitmap to test a
+	// range. And it loads each word atomically, so a reader can run while a writer holds the
+	// region lock and flips bits.
+	//
+	// Relaxed is the correct ordering here, not a shortcut. Guest writes arrive asynchronously
+	// through the page-fault handler, so a write can land immediately after this returns whether or
+	// not a lock is held - the exclusive lock this replaces never prevented that race either. What
+	// matters is the direction of error: a stale SET bit costs a redundant re-upload, which is slow
+	// but correct. Missing a newly set bit is the dangerous direction, and that possibility is
+	// unchanged from the locked version.
+	[[nodiscard]] bool AnyInRangeRelaxed(size_t start, size_t end) const noexcept {
+		if (start >= end || end > N) {
+			return false;
+		}
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_bit  = start % BITS_PER_WORD;
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << start_bit;
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+
+		if (first_word == last_word) {
+			return (LoadRelaxed(first_word) & start_mask & end_mask) != 0;
+		}
+		if ((LoadRelaxed(first_word) & start_mask) != 0) {
+			return true;
+		}
+		for (auto word = first_word + 1; word < last_word; word++) {
+			if (LoadRelaxed(word) != 0) {
+				return true;
+			}
+		}
+		return (LoadRelaxed(last_word) & end_mask) != 0;
+	}
+
+	// Paired with AnyInRangeRelaxed: writers must store atomically or the lock-free reads above are
+	// a data race. Every writer still holds the region lock - this only makes the individual word
+	// stores visible without tearing.
+	void SetRangeAtomic(size_t start, size_t end) noexcept {
+		ForEachWordInRange(start, end, [this](size_t word, uint64_t mask) {
+			StoreRelaxed(word, LoadRelaxed(word) | mask);
+		});
+	}
+
+	void UnsetRangeAtomic(size_t start, size_t end) noexcept {
+		ForEachWordInRange(start, end, [this](size_t word, uint64_t mask) {
+			StoreRelaxed(word, LoadRelaxed(word) & ~mask);
+		});
+	}
 
 	constexpr BitArray() = default;
 
@@ -252,6 +307,39 @@ public:
 	}
 
 private:
+	[[nodiscard]] uint64_t LoadRelaxed(size_t word) const noexcept {
+		return std::atomic_ref<uint64_t>(const_cast<uint64_t&>(m_data[word]))
+		    .load(std::memory_order_relaxed);
+	}
+
+	void StoreRelaxed(size_t word, uint64_t value) noexcept {
+		std::atomic_ref<uint64_t>(m_data[word]).store(value, std::memory_order_relaxed);
+	}
+
+	// Shared masking walk for the atomic range writers.
+	template <typename Apply>
+	void ForEachWordInRange(size_t start, size_t end, Apply&& apply) noexcept {
+		if (start >= end || end > N) {
+			return;
+		}
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_bit  = start % BITS_PER_WORD;
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << start_bit;
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+		if (first_word == last_word) {
+			apply(first_word, start_mask & end_mask);
+			return;
+		}
+		apply(first_word, start_mask);
+		for (auto word = first_word + 1; word < last_word; word++) {
+			apply(word, ~uint64_t {0});
+		}
+		apply(last_word, end_mask);
+	}
+
 	std::array<uint64_t, WORD_COUNT> m_data {};
 };
 
