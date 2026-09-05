@@ -2069,11 +2069,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 }
 
-// Index counts at or below this are fullscreen and UI quads - sky, post-processing, HUD. They are
-// few, cheap, and dropping them blanks the screen, so the cull never touches them. Matches the
-// existing FullscreenQuadIndexLimit used by the viewport-Z fix for the same reason.
-constexpr uint32_t kCullQuadGuard = 32;
-
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                uint32_t index_type_and_size, uint32_t index_count,
                                const void* index_addr, uint32_t flags, uint32_t type,
@@ -2081,41 +2076,6 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                int32_t vertex_offset_add, uint32_t first_instance,
                                PreparedShaders* prepared) {
 	KYTY_PROFILER_FUNCTION();
-
-	// Draw-count reduction. Deliberately the FIRST thing in the function, before any translation:
-	// frame time is linear in draw count because the cost is per-draw CPU translation, so a cull
-	// that runs after the bindings are built saves only the GPU draw - which we measured as free.
-	// Skipping here saves the whole ~14 us.
-	//
-	// The band is what makes it usable. At or below kCullQuadGuard are fullscreen and UI quads -
-	// sky, post-processing, HUD - which are few, cheap, and catastrophic to drop. Above it, a low
-	// index count means low-poly geometry, which is what GTA V's distant LOD models and small props
-	// are. So this drops far-away detail first, which is the pop-in tradeoff rather than a random
-	// one.
-	{
-		// Counted for EVERY draw, not just culled ones - the first version incremented both
-		// counters inside the cull branch and reported 100% by construction, which is worse than
-		// no counter at all because it looks like an answer.
-		static std::atomic<uint64_t> s_total {0};
-		static std::atomic<uint64_t> s_culled {0};
-		const auto total = s_total.fetch_add(1, std::memory_order_relaxed) + 1;
-		const auto cull  = Config::CullSmallDraws();
-		const bool drop  = cull != 0 && index_count > kCullQuadGuard && index_count < cull;
-		if (drop) {
-			s_culled.fetch_add(1, std::memory_order_relaxed);
-		}
-		if (total % 500000 == 0) {
-			const auto culled = s_culled.load(std::memory_order_relaxed);
-			std::printf("CullCensus: %llu of %llu draws culled (%.1f%%) threshold=%u\n",
-			            static_cast<unsigned long long>(culled),
-			            static_cast<unsigned long long>(total),
-			            100.0 * static_cast<double>(culled) / static_cast<double>(total), cull);
-			std::fflush(stdout);
-		}
-		if (drop) {
-			return;
-		}
-	}
 
 	DrawProfileBeginDraw();
 	struct DrawProfileEndGuard {

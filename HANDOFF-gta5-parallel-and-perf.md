@@ -129,20 +129,25 @@ hit the same wall — recording is `vkCmd*` calls writing into command buffer me
 
 ---
 
-## §3 The only lever left
+## §3 Draw-count culling — tried and REMOVED
 
-Frame time is **linear in draw count**, measured repeatedly. `4,200 draws × ~14 µs = ~59 ms = 17 fps`.
+Frame time is linear in draw count, so cutting draws is arithmetically the only remaining lever.
+It was implemented (`--cull-small-draws N`, skipping draws with an index count between a
+fullscreen-quad guard of 32 and N) and **removed after testing.**
 
-- **~2,500 draws would be ~35 ms ≈ 28 fps.**
-- Deleting 41% of draws (`--skip-ps-chksum`) proved the game stays stable with far fewer draws; it
-  only looked wrong because shaders were picked blindly rather than by size or distance.
+```
+threshold 96 -> 13.5% of draws culled -> UNPLAYABLE
+```
 
-`--cull-small-draws N` (added alongside this handoff) skips draws whose index count falls in a band
-above the fullscreen-quad guard and below `N`. Low index count correlates with distant LOD geometry
-and small props, which is what you want to drop first. It skips **before any translation work**, so
-the saving is the full per-draw cost, not just the GPU draw.
+Roads, pavements and building floors disappeared. **Index count is a proxy for triangle count, not
+for screen area, and the two are inversely related for exactly the geometry that matters.** A road
+surface or building floor is an enormous flat mesh made of very few triangles, so a
+"cull small draws" band targets the largest, most structural surfaces in the scene first. The
+premise was backwards.
 
----
+Any future attempt at draw reduction needs a real size signal - projected bounding-box area, or a
+distance derived from the draw's transform - not the index count. That data is not currently
+available at the point where a draw could be cheaply skipped.
 
 ## §4 Useful flags
 
@@ -150,7 +155,6 @@ the saving is the full per-draw cost, not just the GPU draw.
 --draw-profile true            per-phase breakdown, FrameThreads, ClampCensus, DrainCensus
 --draw-workers N               worker pool size
 --test-parallel-bindings true  the 2b/2c split (works, does not scale)
---cull-small-draws N           skip small-index draws; 0 = off
 --log-ui-draws true            UI quad geometry (samples into gameplay)
 --skip-ps-chksum 0xHASH        drop draws by pixel-shader CHECKSUM
 ```

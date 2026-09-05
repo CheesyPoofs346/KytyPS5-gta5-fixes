@@ -80,11 +80,6 @@ struct ConfigOptions {
 	// observe those labels mid-frame because it is blocked in WaitForIdle 96% of the frame, so
 	// the flush at submission end delivers them in time. See HANDOFF-gta5-cpu-and-perf.md.
 	bool                   coalesce_eop_flush            = false;
-	// Skip draws whose index count sits above the fullscreen-quad guard and below this value.
-	// Low index count correlates with distant LOD geometry and small props - the things worth
-	// dropping first. 0 disables. Frame time is linear in draw count, so this is the one lever
-	// with a guaranteed effect; it costs draw distance.
-	uint32_t               cull_small_draws              = 0;
 	// IT_EVENT_WRITE partial-flush events (CsPartialFlush/GsPartialFlush/PsPartialFlush) currently
 	// end the render pass and emit a full AllCommands barrier, once every ~3 draws. On GCN those
 	// are waits for shader completion, not global cache invalidations. Skipping the render-pass
@@ -203,7 +198,6 @@ bool     TestParallelBindingsEnabled();
 bool     FramePipeliningEnabled();
 bool     LogUiDrawsEnabled();
 bool     CoalesceEopFlushEnabled();
-uint32_t CullSmallDraws();
 bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
 uint32_t PipelineDepth();

@@ -355,9 +355,6 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
-		} else if (arg == "--cull-small-draws") {
-			options.config.cull_small_draws =
-			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
 		} else if (arg == "--eop-flush-interval") {
 			options.config.eop_flush_interval =
 			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
