@@ -296,6 +296,7 @@ public:
 	         VirtualRangeType type, const char* name, bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		if (start == 0 || size == 0) {
 			return false;
@@ -327,6 +328,7 @@ public:
 	bool Remove(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -339,16 +341,18 @@ public:
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
-		Common::LockGuard lock(m_mutex);
+		// Lock-free: immutable snapshot, kept alive for the whole scan. See ClampRangeSize.
+		const auto snapshot_ = Snapshot();
 
-		return FindOverlap(start, size) != nullptr;
+		return FindOverlapIn(*snapshot_, start, size) != nullptr;
 	}
 
 	bool QueryOverlap(uint64_t start, uint64_t size, Range* out) {
 		EXIT_IF(out == nullptr);
-		Common::LockGuard lock(m_mutex);
+		// Lock-free: immutable snapshot, kept alive for the whole scan. See ClampRangeSize.
+		const auto  snapshot_ = Snapshot();
 
-		const auto* overlap = FindOverlap(start, size);
+		const auto* overlap = FindOverlapIn(*snapshot_, start, size);
 		if (overlap == nullptr) {
 			return false;
 		}
@@ -359,6 +363,7 @@ public:
 	bool ReleaseReserved(uint64_t start, uint64_t size) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		for (size_t index = 0; index < m_ranges.size(); index++) {
 			auto& r = m_ranges[index];
@@ -374,6 +379,7 @@ public:
 	                     VirtualRangeType type = VirtualRangeType::Reserved) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		auto end = End(start, size);
 		for (const auto& r: m_ranges) {
@@ -391,6 +397,7 @@ public:
 	                         VirtualRangeType type = VirtualRangeType::Reserved) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		if (size == 0) {
 			return false;
@@ -423,6 +430,7 @@ public:
 	void Rename(uint64_t start, uint64_t size, const char* name) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() && position->start == start && position->size == size) {
@@ -436,6 +444,7 @@ public:
 	void Protect(uint64_t start, uint64_t size, int protection) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		EditUnlocked(start, size, [protection](Range* r) { r->protection = protection; });
 	}
@@ -443,6 +452,7 @@ public:
 	void SetMemoryType(uint64_t start, uint64_t size, int memory_type) {
 		Common::LockGuard lock(m_mutex);
 		m_generation.fetch_add(1, std::memory_order_release);
+		PublishGuard publish {*this};
 
 		EditUnlocked(start, size, [memory_type](Range* r) { r->memory_type = memory_type; });
 	}
@@ -450,7 +460,9 @@ public:
 	bool Query(uint64_t addr, int flags, Range* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		// Lock-free: immutable snapshot, kept alive for the whole scan. See ClampRangeSize.
+		const auto  snapshot_ = Snapshot();
+		const auto& m_ranges  = *snapshot_;
 
 		auto next = std::upper_bound(
 		    m_ranges.begin(), m_ranges.end(), addr,
@@ -473,7 +485,9 @@ public:
 	bool QuerySpan(uint64_t start, uint64_t size, std::vector<Range>* out) {
 		EXIT_IF(out == nullptr);
 
-		Common::LockGuard lock(m_mutex);
+		// Lock-free: immutable snapshot, kept alive for the whole scan. See ClampRangeSize.
+		const auto  snapshot_ = Snapshot();
+		const auto& m_ranges  = *snapshot_;
 		out->clear();
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
@@ -553,8 +567,12 @@ public:
 			t_clamp_hit_cycles += __builtin_ia32_rdtsc() - entry_tsc;
 			return size;
 		}
-		const auto        lock_start = __builtin_ia32_rdtsc();
-		Common::LockGuard lock(m_mutex);
+		// No lock. The snapshot is immutable once published and the shared_ptr keeps it alive for
+		// the whole search, so a writer publishing mid-search cannot pull the vector out from under
+		// the binary search. The lock_cycles counter is kept so the next run shows this at zero.
+		const auto lock_start = __builtin_ia32_rdtsc();
+		const auto snapshot   = Snapshot();
+		const auto& ranges    = *snapshot;
 		t_clamp_lock_cycles += __builtin_ia32_rdtsc() - lock_start;
 
 		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
@@ -562,9 +580,9 @@ public:
 		}
 
 		auto vma = std::upper_bound(
-		    m_ranges.begin(), m_ranges.end(), virtual_addr,
+		    ranges.begin(), ranges.end(), virtual_addr,
 		    [](uint64_t value, const Range& range) { return value < range.start; });
-		if (vma == m_ranges.begin()) {
+		if (vma == ranges.begin()) {
 			return 0;
 		}
 		--vma;
@@ -591,7 +609,7 @@ public:
 		uint64_t expected     = virtual_addr + clamped_size;
 		++vma;
 
-		while (vma != m_ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
+		while (vma != ranges.end() && vma->start == expected && IsCommittedRangeType(vma->type) &&
 		       clamped_size < size) {
 			const auto chunk = std::min(size - clamped_size, vma->size);
 			clamped_size += chunk;
@@ -603,7 +621,9 @@ public:
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
-		Common::LockGuard lock(m_mutex);
+		// Lock-free: immutable snapshot, kept alive for the whole scan. See ClampRangeSize.
+		const auto  snapshot_ = Snapshot();
+		const auto& m_ranges  = *snapshot_;
 
 		uint64_t used = 0;
 		for (const auto& r: m_ranges) {
@@ -797,6 +817,26 @@ private:
 		m_ranges = merged;
 	}
 
+	// Snapshot overload for the lock-free readers. The member FindOverlap below scans m_ranges and
+	// must only be used by writers holding m_mutex - a lock-free caller reaching it would race.
+	static const Range* FindOverlapIn(const std::vector<Range>& ranges, uint64_t start,
+	                                  uint64_t size) {
+		auto position = std::lower_bound(
+		    ranges.begin(), ranges.end(), start,
+		    [](const Range& range, uint64_t value) { return range.start < value; });
+		if (position != ranges.end() &&
+		    VirtualRangesOverlap(start, size, position->start, position->size)) {
+			return &*position;
+		}
+		if (position != ranges.begin()) {
+			auto previous = std::prev(position);
+			if (VirtualRangesOverlap(start, size, previous->start, previous->size)) {
+				return &*previous;
+			}
+		}
+		return nullptr;
+	}
+
 	Range* FindOverlap(uint64_t start, uint64_t size) {
 		auto position = LowerBound(start);
 		if (position != m_ranges.end() &&
@@ -817,6 +857,42 @@ private:
 	// can tell whether its cached range is still valid.
 	std::atomic<uint64_t> m_generation {0};
 	Common::Mutex      m_mutex;
+
+	// RCU. Readers take this snapshot and never touch m_ranges or m_mutex, so they cannot block
+	// and - the part that actually matters - cannot starve a writer. The writer here is the guest's
+	// memory allocator: giving the readers a shared_mutex instead froze the game at boot, because
+	// Windows shared_mutex is SRWLock and is not starvation-free.
+	//
+	// Writers keep mutating m_ranges in place under m_mutex exactly as before and publish a copy
+	// afterwards. That leaves all 47 existing mutation sites untouched, which is the whole reason
+	// for this shape. The cost is one vector copy per mutation, paid on the guest thread.
+	std::atomic<std::shared_ptr<const std::vector<Range>>> m_snapshot {
+	    std::make_shared<const std::vector<Range>>()};
+
+public:
+	// Call while holding m_mutex, immediately after any change to m_ranges.
+	void PublishSnapshot() {
+		m_snapshot.store(std::make_shared<const std::vector<Range>>(m_ranges),
+		                 std::memory_order_release);
+	}
+
+	[[nodiscard]] std::shared_ptr<const std::vector<Range>> Snapshot() const {
+		return m_snapshot.load(std::memory_order_acquire);
+	}
+
+	// Publishes on scope exit, so a writer with several early returns cannot leave the snapshot
+	// stale on one of them. Declared after the LockGuard at each site, so it destructs first and
+	// still runs while m_mutex is held.
+	class PublishGuard final {
+	public:
+		explicit PublishGuard(VirtualRanges& owner): m_owner(owner) {}
+		~PublishGuard() { m_owner.PublishSnapshot(); }
+		PublishGuard(const PublishGuard&)            = delete;
+		PublishGuard& operator=(const PublishGuard&) = delete;
+
+	private:
+		VirtualRanges& m_owner;
+	};
 };
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
