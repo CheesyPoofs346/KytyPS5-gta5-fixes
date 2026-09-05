@@ -60,7 +60,7 @@ struct Pm4OpcodeProfile {
 		uint64_t calls = 0;
 	};
 	std::array<Bucket, 256 + Pm4::R_NUM> buckets {};
-	std::array<Bucket, 8> work {};
+	std::array<Bucket, 10> work {};
 	uint64_t packets = 0;
 	uint64_t start_draws = 0;
 	uint64_t start_tsc = 0;
@@ -108,7 +108,8 @@ struct Pm4OpcodeProfile {
 		constexpr const char* names[] = {"drain-minus-draws", "barrier-record",
 		                                 "scheduler-flush",   "label-write",
 		                                 "relmem-total",      "relmem-eop-write",
-		                                 "relmem-interrupt",  "relmem-decode"};
+		                                 "relmem-interrupt",  "relmem-decode",
+		                                 "relmem-eopwrite64", "relmem-flush"};
 		for (size_t i = 0; i < work.size(); ++i) {
 			const auto& b = work[i];
 			std::printf("Pm4Work: %s calls=%llu ms=%.3f us/draw=%.3f\n", names[i],

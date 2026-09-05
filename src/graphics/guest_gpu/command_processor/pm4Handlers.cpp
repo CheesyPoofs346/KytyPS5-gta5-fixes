@@ -2718,6 +2718,8 @@ constexpr uint32_t kRelMemTotal     = 4;
 constexpr uint32_t kRelMemEopWrite  = 5;
 constexpr uint32_t kRelMemInterrupt = 6;
 constexpr uint32_t kRelMemDecode    = 7;
+constexpr uint32_t kRelMemEopWrite64 = 8;
+constexpr uint32_t kRelMemFlush      = 9;
 } // namespace
 
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
@@ -2812,6 +2814,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			                      interrupt_context_id);
 		}
 		if (EopShouldFlush(g_eop_flush_data1)) {
+			RelMemTimer flush_timer {kRelMemFlush};
 			cp.BufferFlush();
 		}
 
@@ -2835,6 +2838,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			                      interrupt_context_id);
 		}
 		if (interrupt_selector == 0x01 && EopShouldFlush(g_eop_flush_data5)) {
+			RelMemTimer flush_timer {kRelMemFlush};
 			cp.BufferFlush();
 		}
 
@@ -2857,8 +2861,12 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		data_sel = 4;
 	}
 
-	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
-	                      data_sel, dst_gpu_addr, value, interrupt_selector, interrupt_context_id);
+	{
+		RelMemTimer eop64_timer {kRelMemEopWrite64};
+		cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action,
+		                      event_index, data_sel, dst_gpu_addr, value, interrupt_selector,
+		                      interrupt_context_id);
+	}
 
 	return 7;
 }
