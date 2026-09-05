@@ -570,9 +570,14 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 	// in this path, so if the map's viewport is already ~4x too large the guest was told the wrong
 	// display size, and if it is correct the fault is downstream in the composite.
 	if (Config::LogUiDrawsEnabled() && index_count <= 64) {
-		static std::atomic<uint32_t> ui_log {0};
-		const auto                   n = ui_log.fetch_add(1, std::memory_order_relaxed);
-		if (n < 400) {
+		// Log a burst, then go quiet, then burst again. A plain first-400 cap spent itself entirely
+		// on boot quads and never saw the HUD - twice. This keeps sampling into gameplay.
+		static std::atomic<uint32_t> ui_seen {0};
+		const auto                   seen = ui_seen.fetch_add(1, std::memory_order_relaxed);
+		constexpr uint32_t           kPeriod = 20000;
+		constexpr uint32_t           kBurst  = 60;
+		const auto                   n       = seen % kPeriod;
+		if (n < kBurst) {
 			std::printf("UiDraw[%u]: idx=%" PRIu32 " vp=(%.1f,%.1f) %.1fx%.1f scissor=(%d,%d) %ux%u "
 			            "fb=%ux%u ps=0x%010" PRIx64 "\n",
 			            n, index_count, static_cast<double>(viewport.x),
