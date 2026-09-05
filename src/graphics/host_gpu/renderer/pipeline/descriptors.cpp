@@ -897,7 +897,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
-	auto       id                  = texture_cache.FindImage(desc, shader_conversion);
+	auto id = texture_cache.FindImage(desc, shader_conversion);
+	if (!id) {
+		// A worker bailed inside FindImage rather than create an image. Return the empty binding
+		// immediately: the draw is already flagged for serial retry and its prepared entry will be
+		// discarded, but indexing the slot vector with an empty id aborts, which is how this
+		// surfaced. Every consumer of image_id below is guarded the same way.
+		return {id, nullptr, std::move(desc)};
+	}
 	auto*      image               = &texture_cache.GetImage(id);
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	if (stencil_association) {
@@ -1080,7 +1087,11 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	descriptors.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
-		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		// An empty id means a worker bailed rather than create the image; the draw is already
+		// flagged for serial retry. Skip it instead of indexing the slot vector with an empty id.
+		if (binding.image_id) {
+			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
+		}
 		descriptors.images.push_back(binding);
 	}
 	descriptors.samplers.reserve(program.info.samplers.size());
@@ -1210,13 +1221,21 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 				old_image->binding = {};
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
-			BindImage(images[i].image_id,
-			          images[i].desc.type == TextureCache::BindingType::Storage);
+			if (images[i].image_id) {
+				BindImage(images[i].image_id,
+				          images[i].desc.type == TextureCache::BindingType::Storage);
+			}
 		}
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
+		// A worker bailed inside FindImage rather than create this image. Everything below indexes
+		// the slot vector with the id, so skip the whole entry; the draw is already flagged for
+		// serial retry and its bindings are discarded.
+		if (!binding.image_id) {
+			continue;
+		}
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
 			EXIT_IF(resource.mip_count == 0u ||
@@ -1400,6 +1419,10 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			// Empty id: a worker bailed inside FindImage. See RebindImages.
+			if (!descriptors.images[i].image_id) {
+				continue;
+			}
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
 			const auto&                 view = binding.desc.view_info;

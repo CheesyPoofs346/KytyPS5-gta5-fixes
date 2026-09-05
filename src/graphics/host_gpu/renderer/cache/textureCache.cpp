@@ -1018,6 +1018,14 @@ void TextureCache::PrepareStorageSampledOverlap(const ImageDesc& desc) {
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	// Same reason as the InsertImage bail in FindImage: this reaches InitializeImage, which records
+	// into the primary. Returning the source id unchanged is what the caller already treats as "no
+	// expansion happened", and the bail-out makes phase 3 redo the draw serially, where the
+	// expansion actually occurs.
+	if (MustStageForWorker()) {
+		RequestWorkerBailout();
+		return source_id;
+	}
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      expanded    = m_slot_images[expanded_id];
@@ -1401,6 +1409,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			// Creating an image allocates Vulkan objects and leads to InitializeImage, which
+			// uploads guest memory through ObtainBufferForImage -> FindBuffer -> CreateBuffer and
+			// records a CopyFrom into the primary. A worker cannot do any of that. It CAN safely
+			// use an image that already exists, which is the common case, so the bail-out sits at
+			// the creation point rather than at the entry to FindImage.
+			//
+			// Found by the CreateBuffer tripwire aborting instead of corrupting: the route is
+			// FindImage -> InsertImage/ExpandImage -> InitializeImage -> ObtainBufferForImage.
+			if (MustStageForWorker()) {
+				RequestWorkerBailout();
+				return {};
+			}
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
