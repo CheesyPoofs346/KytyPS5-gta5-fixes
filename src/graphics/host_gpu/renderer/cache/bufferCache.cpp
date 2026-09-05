@@ -22,6 +22,7 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <xxhash.h>
 
 namespace Libs::Graphics {
 
@@ -76,6 +77,68 @@ private:
 
 
 namespace {
+
+// Is the stream copy storm copying bytes that did not change?
+//
+// Dirty tracking is per CACHING_PAGESIZE = 16 KB, but RAGE packs 64-256 byte constant buffers
+// densely, so one modified buffer marks the whole page CPU-dirty and every buffer sharing that page
+// gets re-copied whether or not its own bytes changed. That would show as a high redundant fraction.
+//
+// Everything here is thread_local and the table is fixed-size. The last diagnostic on this path
+// used shared atomics and cost more than it measured; the point is to not distort the thing being
+// measured.
+struct CopyCensus {
+	static constexpr size_t kSlots = 4096;   // open addressed, power of two, no allocation
+	struct Slot {
+		uint64_t vaddr = 0;
+		uint64_t hash  = 0;
+	};
+	std::array<Slot, kSlots> slots {};
+	uint64_t                 total     = 0;
+	uint64_t                 redundant = 0;   // identical to the previous copy of the same buffer
+	uint64_t                 tracked   = 0;   // had a previous entry to compare against
+	uint64_t                 same_page = 0;   // shares a 16 KB page with the preceding copy
+	uint64_t                 bytes     = 0;
+	uint64_t                 last_page = ~uint64_t {0};
+};
+
+thread_local CopyCensus t_copy;
+
+void NoteStreamCopy(uint64_t vaddr, const void* mapped, uint64_t size) {
+	auto& c = t_copy;
+	c.total++;
+	c.bytes += size;
+	const auto page = vaddr >> BufferCache::CACHING_PAGEBITS;
+	if (page == c.last_page) {
+		c.same_page++;
+	}
+	c.last_page = page;
+
+	const auto hash = XXH3_64bits(mapped, static_cast<size_t>(size));
+	auto&      slot = c.slots[(vaddr >> 4u) & (CopyCensus::kSlots - 1)];
+	if (slot.vaddr == vaddr) {
+		c.tracked++;
+		if (slot.hash == hash) {
+			c.redundant++;
+		}
+	}
+	slot.vaddr = vaddr;
+	slot.hash  = hash;
+
+	if (CurrentDrawWorker() == 0 && c.total % 200000 == 0) {
+		std::printf("CopyCensus[w0]: copies=%llu avg=%lluB | redundant=%llu of %llu tracked (%.1f%%)"
+		            " | same-page-as-previous=%.1f%%\n",
+		            static_cast<unsigned long long>(c.total),
+		            static_cast<unsigned long long>(c.bytes / c.total),
+		            static_cast<unsigned long long>(c.redundant),
+		            static_cast<unsigned long long>(c.tracked),
+		            c.tracked > 0
+		                ? 100.0 * static_cast<double>(c.redundant) / static_cast<double>(c.tracked)
+		                : 0.0,
+		            100.0 * static_cast<double>(c.same_page) / static_cast<double>(c.total));
+		std::fflush(stdout);
+	}
+}
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
@@ -662,6 +725,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		auto& stream          = GetUtilityBuffer(MemoryUsage::Stream);
 		auto [mapped, offset] = stream.Map(size, alignment, false);
 		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
+			NoteStreamCopy(vaddr, mapped, size);
 			stream.Commit();
 			return {&stream, offset};
 		}
