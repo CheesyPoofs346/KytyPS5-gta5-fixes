@@ -66,8 +66,20 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION, BuildFingerprint(),
-	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
+	// Driver and device identity only. The emulator's own build used to be part of this through
+	// KYTY_GIT_REVISION and BuildFingerprint(), and BuildFingerprint() is the executable's size and
+	// last-write time - so every rebuild threw the whole cache away and the next run recreated
+	// every pipeline. Measured cost of a cold cache: CreateGraphicsPipeline at 4.874 us/draw
+	// against 0.40 warm, which is 29% of frame time. It also silently contaminated A/B runs,
+	// because a freshly built side always paid it.
+	//
+	// The emulator build has no bearing on whether a cached pipeline is valid. A VkPipelineCache
+	// blob is opaque and the driver keys entries on its own hash of the full create info, SPIR-V
+	// included: if our shaders change, the lookup simply misses and the pipeline is compiled
+	// fresh. A stale blob cannot produce wrong output, only a wasted lookup. What genuinely
+	// invalidates one is the driver or device changing, and all four of those fields are here.
+	return fmt::format("KytyPC2:{:08x}:{:08x}:{:08x}:{}\n", properties.vendorID, properties.deviceID,
+	                   properties.driverVersion, uuid);
 }
 
 std::string PipelineCacheTitleId() {
