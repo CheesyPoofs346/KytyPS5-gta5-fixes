@@ -80,6 +80,11 @@ struct ConfigOptions {
 	// observe those labels mid-frame because it is blocked in WaitForIdle 96% of the frame, so
 	// the flush at submission end delivers them in time. See HANDOFF-gta5-cpu-and-perf.md.
 	bool                   coalesce_eop_flush            = false;
+	// IT_EVENT_WRITE partial-flush events (CsPartialFlush/GsPartialFlush/PsPartialFlush) currently
+	// end the render pass and emit a full AllCommands barrier, once every ~3 draws. On GCN those
+	// are waits for shader completion, not global cache invalidations. Skipping the render-pass
+	// break for them keeps batching alive. See HANDOFF-gta5-cpu-and-perf.md.
+	bool                   light_partial_flush           = false;
 	// Flush every Nth EOP request instead of every one. 1 reproduces the original behaviour
 	// (~1000 submits/frame, 2.819 us/draw). Skipping them all collapsed submits to 300 and saved
 	// ~12 ms/frame of CPU, but the frame got SLOWER: those submits were feeding the GPU
@@ -193,6 +198,7 @@ bool     TestParallelBindingsEnabled();
 bool     FramePipeliningEnabled();
 bool     LogUiDrawsEnabled();
 bool     CoalesceEopFlushEnabled();
+bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);

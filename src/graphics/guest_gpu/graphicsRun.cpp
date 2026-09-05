@@ -148,6 +148,42 @@ std::atomic<uint64_t> g_census_frames {0};
 // When every queued submission is blocked - DE/CE interleaving that cannot progress - the GPU
 // thread sleeps 100us and retries. That is a poll, not a wait on an event, so if it fires often it
 // is pure dead time on the one thread that does all the work.
+// Which IT_EVENT_WRITE types actually fire, and how many reach EmitGlobalBarrier. 51933 packets
+// over 158816 draws at 1.734 us each; the type histogram says whether the partial flushes are the
+// bulk of it or whether the cache writeback/invalidate events are.
+std::array<std::atomic<uint64_t>, 64> g_event_write_types {};
+std::atomic<uint64_t>                 g_event_write_total {0};
+
+void NoteEventWrite(uint32_t event_type) {
+	if (event_type < g_event_write_types.size()) {
+		g_event_write_types[event_type].fetch_add(1, std::memory_order_relaxed);
+	}
+	const auto n = g_event_write_total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (n % 200000 != 0) {
+		return;
+	}
+	std::printf("EventWrite: total=%llu", static_cast<unsigned long long>(n));
+	for (uint32_t i = 0; i < g_event_write_types.size(); i++) {
+		const auto c = g_event_write_types[i].load(std::memory_order_relaxed);
+		if (c > n / 100) {
+			const char* name = i == 0x07   ? "CsPartialFlush"
+			                   : i == 0x0f ? "GsPartialFlush"
+			                   : i == 0x10 ? "PsPartialFlush"
+			                   : i == 0x16 ? "CbDbWritebackInv"
+			                   : i == 0x31 ? "CbDataWritebackInv"
+			                   : i == 0x2a ? "DbDataWritebackInv"
+			                   : i == 0x2c ? "DbMetaWritebackInv"
+			                   : i == 0x2e ? "CbMetaWritebackInv"
+			                               : "other";
+			std::printf(" | 0x%02x %s=%llu (%.1f%%)", i, name,
+			            static_cast<unsigned long long>(c),
+			            100.0 * static_cast<double>(c) / static_cast<double>(n));
+		}
+	}
+	std::printf("\n");
+	std::fflush(stdout);
+}
+
 std::atomic<uint64_t> g_blocked_polls {0};
 std::atomic<uint64_t> g_blocked_poll_ns {0};
 std::chrono::steady_clock::time_point g_census_start {};
@@ -1808,6 +1844,28 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id);
 }
 
+// The barrier the guest asked for, without tearing the render pass down. Vulkan allows a memory
+// barrier inside a dynamic-rendering pass as long as it does not cross attachment scope, which a
+// shader-completion wait does not.
+void CommandProcessor::EmitInPassBarrier() {
+	CheckBuffer();
+	Common::LockGuard lock(m_renderer.GetMutex());
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eMemoryWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &barrier;
+	// The queued draws still have to be recorded before the barrier they are being synchronised
+	// against - that part is not optional. Only the EndRendering is skipped.
+	if (Config::DrawQueueEnabled()) {
+		m_renderer.GetRenderExecutor().DrainDrawQueue(CurrentBuffer());
+	}
+	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+}
+
 void CommandProcessor::EmitGlobalBarrier() {
 	CheckBuffer();
 
@@ -1851,11 +1909,27 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 	}
 
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
+	NoteEventWrite(event_type);
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
+		//
+		// Measured: IT_EVENT_WRITE fires 51933 times across 158816 draws - once every ~3 draws -
+		// at 1.734 us each, and EmitGlobalBarrier is what makes it expensive. It drains the batched
+		// draw queue, ends the render pass and emits an AllCommands->AllCommands barrier, so the
+		// next draw has to reopen the pass. That is what destroys draw batching.
+		//
+		// On GCN these three are waits for shader completion, not global cache invalidations. The
+		// light path keeps the barrier - the guest did ask for a dependency - but leaves the render
+		// pass open, which is what the batching actually needs.
 		case 0x00000007:
 		case 0x0000000f:
-		case 0x00000010: EmitGlobalBarrier(); break;
+		case 0x00000010:
+			if (Config::LightPartialFlushEnabled()) {
+				EmitInPassBarrier();
+			} else {
+				EmitGlobalBarrier();
+			}
+			break;
 		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
 		case 0x00000016:
 		case 0x00000031:
