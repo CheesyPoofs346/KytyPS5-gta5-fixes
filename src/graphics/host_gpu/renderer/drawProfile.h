@@ -43,6 +43,11 @@ enum class DrawPhase : uint32_t {
 	ObtTracker,         // of which, IsRegionGpuModified + IsRegionCpuModified
 	ObtFindBuffer,      // of which, the page-table lookup
 	ObtSynchronize,     // of which, SynchronizeBuffer
+	// The 1.355 us/draw that the buffer loop's other children do not account for. 97.6% of buffers
+	// take ObtainBuffer's stream fast path, whose Map + TryReadBacking + Commit is a guest->stream
+	// memcpy that no timer covered. The dedup scan in front of it was untimed too.
+	ObtStreamCopy,      // of which, the stream fast path (guest -> stream memcpy)
+	BindDedupScan,      // of which, FindDrawBufferCache
 	BindRebindImages,   // of which
 	VertexIndex,
 	RenderTargets,
@@ -82,6 +87,8 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::ObtTracker:
 		case DrawPhase::ObtFindBuffer:
 		case DrawPhase::ObtSynchronize:
+		case DrawPhase::ObtStreamCopy:
+		case DrawPhase::BindDedupScan:
 		case DrawPhase::BindRebindImages: return true;
 		default: return false;
 	}
@@ -110,6 +117,8 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::ObtTracker: return "      of which tracker queries";
 		case DrawPhase::ObtFindBuffer: return "      of which FindBuffer";
 		case DrawPhase::ObtSynchronize: return "      of which SynchronizeBuffer";
+		case DrawPhase::ObtStreamCopy: return "      of which stream copy (memcpy)";
+		case DrawPhase::BindDedupScan: return "      of which dedup scan";
 		case DrawPhase::BindRebindImages: return "  of which RebindImages";
 		case DrawPhase::VertexIndex: return "vertex+index buffers";
 		case DrawPhase::RenderTargets: return "AcquireRenderTargets";

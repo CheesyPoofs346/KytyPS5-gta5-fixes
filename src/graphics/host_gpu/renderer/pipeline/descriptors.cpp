@@ -270,6 +270,9 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	// have written the memory and the answer can legitimately change. Written buffers are never
 	// cached - they mutate GPU-side state.
 	if (!resource.written && Config::BufferDedupEnabled()) {
+		// Timed to close the buffer loop's accounting: 1.355 us/draw sat between the loop and its
+		// measured children, and this linear scan was one of the two untimed things inside it.
+		DrawPhaseTimer dedup_timer(DrawPhase::BindDedupScan);
 		if (const auto* hit = FindDrawBufferCache(address, size, resource.formatted, id,
 		                                          static_cast<uint32_t>(alignment))) {
 			buffer_offset = hit->buffer_offset;

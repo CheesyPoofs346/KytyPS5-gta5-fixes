@@ -668,6 +668,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		}
 	}
 	if (tracker_fast_path) {
+		// The suspect for the 1.355 us/draw the buffer loop's other children never accounted for.
+		// TrackerGate measured 97.6% of buffers taking this path, and Map + TryReadBacking +
+		// Commit is a guest->stream memcpy that no timer covered - while NativeUpload, the copy I
+		// had assumed was the cost, measures 0.055 us.
+		DrawPhaseTimer stream_copy_timer(DrawPhase::ObtStreamCopy);
 		const auto alignment = std::max<uint64_t>(
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		// Through the selector, not m_stream_buffer directly. A StreamBuffer is bump-allocated
