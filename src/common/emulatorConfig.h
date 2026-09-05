@@ -90,6 +90,13 @@ struct ConfigOptions {
 	// ~12 ms/frame of CPU, but the frame got SLOWER: those submits were feeding the GPU
 	// incrementally, and batching everything to the end lost the CPU/GPU overlap. This is the
 	// middle ground.
+	// The stream fast path copies the WHOLE buffer into a fresh ring allocation every
+	// time, so it can never clear the CPU dirty bit: partial re-upload would leave the
+	// clean bytes of a throwaway allocation uninitialised. Measured 99.6% of 2.8M copies
+	// re-uploading identical bytes. Past N fast-path hits on the same address, fall
+	// through to the persistent FindBuffer/SynchronizeBuffer path, which uploads only
+	// dirty sub-ranges and clears them. 0 disables (original behaviour).
+	uint32_t               stream_repeat_threshold       = 0;
 	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
@@ -200,6 +207,7 @@ bool     LogUiDrawsEnabled();
 bool     CoalesceEopFlushEnabled();
 bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
+uint32_t StreamRepeatThreshold();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);

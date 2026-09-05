@@ -6,6 +6,9 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/drawProfile.h"
+
+#include <optional>
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -2692,10 +2695,39 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	return dw_num + 1;
 }
 
+// Read-only breakdown of CpOpReleaseMem. The packet profile puts R_RELEASE_MEM at 36.5 us/packet
+// and 70.7% of all PM4 non-draw time, but label-write + scheduler-flush + barrier-record only
+// account for ~2.2 of its 5.862 us/draw. These split the remainder without changing behaviour.
+namespace {
+struct RelMemTimer {
+	uint32_t kind;
+	bool     active       = g_draw_profile.active;
+	uint64_t draws_before = g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)];
+	uint64_t start        = active ? DrawProfileReadCycles() : 0;
+
+	~RelMemTimer() {
+		if (active) {
+			const auto elapsed = DrawProfileReadCycles() - start;
+			const auto nested =
+			    g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)] - draws_before;
+			Pm4NoteWork(kind, elapsed, nested);
+		}
+	}
+};
+constexpr uint32_t kRelMemTotal     = 4;
+constexpr uint32_t kRelMemEopWrite  = 5;
+constexpr uint32_t kRelMemInterrupt = 6;
+constexpr uint32_t kRelMemDecode    = 7;
+} // namespace
+
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
+	RelMemTimer total_timer {kRelMemTotal};
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+
+	std::optional<RelMemTimer> decode_timer;
+	decode_timer.emplace(kRelMemDecode);
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;
@@ -2719,9 +2751,11 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	LogUnknownReleaseMemGcr(gcr_cntl);
 
 	const bool gl2_writeback = ((gcr_cntl & GcrGl2Writeback) != 0);
+	decode_timer.reset();
 
 	auto trigger_interrupt = [&]() {
-		bool queued = false;
+		RelMemTimer interrupt_timer {kRelMemInterrupt};
+		bool        queued = false;
 		switch (interrupt_selector) {
 			case 0x00:
 			case 0x03: break;
@@ -2770,9 +2804,13 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		event_index       = 6;
 		auto event_source = 2u;
 
-		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
-		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
-		                      interrupt_selector, interrupt_context_id);
+		{
+			RelMemTimer eop_timer {kRelMemEopWrite};
+			cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
+			                      event_index, event_source, dst_gpu_addr,
+			                      static_cast<uint32_t>(value), interrupt_selector,
+			                      interrupt_context_id);
+		}
 		if (EopShouldFlush(g_eop_flush_data1)) {
 			cp.BufferFlush();
 		}
@@ -2789,9 +2827,13 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		event_index       = 6;
 		auto event_source = 1u;
 
-		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
-		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
-		                      interrupt_selector, interrupt_context_id);
+		{
+			RelMemTimer eop_timer {kRelMemEopWrite};
+			cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
+			                      event_index, event_source, dst_gpu_addr,
+			                      static_cast<uint32_t>(value), interrupt_selector,
+			                      interrupt_context_id);
+		}
 		if (interrupt_selector == 0x01 && EopShouldFlush(g_eop_flush_data5)) {
 			cp.BufferFlush();
 		}

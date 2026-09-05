@@ -111,6 +111,10 @@ private:
 
 	friend class CommandProcessor;
 };
+// Read-only PM4 handler instrumentation. kind indexes the Pm4Work bucket table in
+// graphicsRun.cpp; no-op unless --draw-profile is active.
+void Pm4NoteWork(uint32_t kind, uint64_t cycles, uint64_t nested);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRUN_H_ */

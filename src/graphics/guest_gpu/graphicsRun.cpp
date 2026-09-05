@@ -60,7 +60,7 @@ struct Pm4OpcodeProfile {
 		uint64_t calls = 0;
 	};
 	std::array<Bucket, 256 + Pm4::R_NUM> buckets {};
-	std::array<Bucket, 4> work {};
+	std::array<Bucket, 8> work {};
 	uint64_t packets = 0;
 	uint64_t start_draws = 0;
 	uint64_t start_tsc = 0;
@@ -105,7 +105,10 @@ struct Pm4OpcodeProfile {
 			            total_cycles == 0 ? 0.0 : 100.0 * b.cycles / total_cycles);
 		}
 		std::fflush(stdout);
-		constexpr const char* names[] = {"drain-minus-draws", "barrier-record", "scheduler-flush", "label-write"};
+		constexpr const char* names[] = {"drain-minus-draws", "barrier-record",
+		                                 "scheduler-flush",   "label-write",
+		                                 "relmem-total",      "relmem-eop-write",
+		                                 "relmem-interrupt",  "relmem-decode"};
 		for (size_t i = 0; i < work.size(); ++i) {
 			const auto& b = work[i];
 			std::printf("Pm4Work: %s calls=%llu ms=%.3f us/draw=%.3f\n", names[i],
@@ -118,6 +121,7 @@ struct Pm4OpcodeProfile {
 };
 
 thread_local Pm4OpcodeProfile g_pm4_opcode_profile;
+
 
 struct Pm4WorkTimer {
 	uint32_t kind;
@@ -221,6 +225,19 @@ void ReportFrameThreadCensus(int frame) {
 }
 
 } // namespace
+
+// Read-only instrumentation hook for handlers that live in another TU (CpOpReleaseMem).
+// Same accounting as Pm4WorkTimer: nested draw cycles are subtracted so a handler that
+// records draws is not credited with their cost.
+void Pm4NoteWork(uint32_t kind, uint64_t cycles, uint64_t nested) {
+	if (!g_draw_profile.active || kind >= g_pm4_opcode_profile.work.size()) {
+		return;
+	}
+	auto& bucket = g_pm4_opcode_profile.work[kind];
+	bucket.cycles += cycles - std::min(cycles, nested);
+	bucket.calls++;
+}
+
 
 
 static thread_local CommandProcessor* g_current_processor = nullptr;

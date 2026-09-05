@@ -361,6 +361,9 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (options.config.eop_flush_interval == 0) {
 				options.config.eop_flush_interval = 1;
 			}
+		} else if (arg == "--stream-repeat-threshold") {
+			options.config.stream_repeat_threshold =
+			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
 		} else if (arg == "--light-partial-flush") {
 			if (!ParseBool(value, options.config.light_partial_flush)) {
 				::printf("invalid boolean for --light-partial-flush\n");

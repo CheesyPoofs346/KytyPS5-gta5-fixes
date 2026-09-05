@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -96,6 +97,72 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 		size -= chunk;
 	}
 }
+
+
+// The stream fast path re-copies the entire buffer into a throwaway ring allocation on every
+// draw. It cannot clear the CPU dirty bit the way SynchronizeBuffer does, because a partial
+// re-upload into a fresh allocation would leave the clean bytes uninitialised - so the bit
+// stays set forever and the copy repeats. CopyCensus measured 99.6% of 2.8M copies writing
+// identical bytes.
+//
+// Rather than trying to make the throwaway allocation reusable (it is a wrapping ring; a cached
+// offset dangles as soon as the cursor laps it), count how often an address takes the fast path
+// and, past a threshold, stop offering it. The persistent FindBuffer/SynchronizeBuffer path then
+// uploads only dirty sub-ranges and clears them, which is the behaviour that already works.
+class StreamRepeatTracker {
+public:
+	// Saturating per-address counter. Open addressed, no eviction policy beyond overwrite: a
+	// collision costs one extra full copy, never a correctness problem, because the fast path is
+	// an optimisation and the fallback is the authoritative path.
+	[[nodiscard]] bool Exceeded(uint64_t vaddr, uint32_t threshold) noexcept {
+		auto& slot = m_slots[Hash(vaddr)];
+		if (slot.vaddr != vaddr) {
+			slot.vaddr = vaddr;
+			slot.count = 0;
+		}
+		const bool declined = slot.count >= threshold;
+		if (declined) {
+			m_declined++;
+		} else {
+			slot.count++;
+			m_taken++;
+		}
+		if (((m_taken + m_declined) % kReportInterval) == 0) {
+			Report(threshold);
+		}
+		return declined;
+	}
+
+	void Report(uint32_t threshold) noexcept {
+		const auto total = m_taken + m_declined;
+		if (total == 0) {
+			return;
+		}
+		std::printf("StreamRepeat[thr=%u]: fast=%llu (%.1f%%) fell-through=%llu (%.1f%%)\n",
+		            threshold, static_cast<unsigned long long>(m_taken),
+		            100.0 * static_cast<double>(m_taken) / static_cast<double>(total),
+		            static_cast<unsigned long long>(m_declined),
+		            100.0 * static_cast<double>(m_declined) / static_cast<double>(total));
+		std::fflush(stdout);
+	}
+
+private:
+	struct Slot {
+		uint64_t vaddr = 0;
+		uint32_t count = 0;
+	};
+	static constexpr size_t   kSlots          = 8192;   // power of two
+	static constexpr uint64_t kReportInterval = 400000;
+	[[nodiscard]] static size_t Hash(uint64_t vaddr) noexcept {
+		// Buffers are at least 4-byte aligned, so the low bits carry no entropy.
+		return static_cast<size_t>((vaddr >> 4u) * 0x9E3779B97F4A7C15ull >> 48u) & (kSlots - 1);
+	}
+	std::array<Slot, kSlots> m_slots {};
+	uint64_t                 m_taken    = 0;
+	uint64_t                 m_declined = 0;
+};
+
+thread_local StreamRepeatTracker t_stream_repeat;
 
 struct BufferCache::DownloadCopy {
 	Buffer*  buffer        = nullptr;
@@ -645,6 +712,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (!is_written && size <= CACHING_PAGESIZE) {
 			tracker_fast_path = !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 			                    m_memory_tracker.IsRegionCpuModified(vaddr, size);
+		}
+	}
+	// Past the repeat threshold the fast path is a guaranteed redundant full copy; the
+	// persistent path suppresses it via dirty tracking instead.
+	if (tracker_fast_path) {
+		if (const auto threshold = Config::StreamRepeatThreshold();
+		    threshold != 0 && t_stream_repeat.Exceeded(vaddr, threshold)) {
+			tracker_fast_path = false;
 		}
 	}
 	if (tracker_fast_path) {
