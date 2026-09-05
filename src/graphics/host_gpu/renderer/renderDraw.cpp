@@ -1733,7 +1733,10 @@ struct PassCensus {
 		bool     depth_write  = false;
 		bool     depth_test   = false;
 	};
-	static constexpr size_t kSlots = 64;
+	// 64 filled up on menu and boot passes alone, after which gameplay passes found no free slot
+	// and were silently dropped - the first run reported exactly 64, which is what a full table
+	// looks like.
+	static constexpr size_t kSlots = 256;
 	std::array<Entry, kSlots> entries {};
 	uint64_t                  frames = 0;
 };
@@ -1792,6 +1795,13 @@ void ReportPassCensus() {
 	          [](const PassCensus::Entry* a, const PassCensus::Entry* b) {
 		          return a->draws > b->draws;
 	          });
+	// Nothing worth printing: still on a menu or loading screen. Reset and keep sampling rather
+	// than emitting a table of UI quads that buries the gameplay window we actually want.
+	if (c.frames == 0 || total / c.frames < 200) {
+		c.entries = {};
+		c.frames  = 0;
+		return;
+	}
 	std::printf("PassCensus: %llu passes over %llu frames, %.0f draws/frame total\n",
 	            static_cast<unsigned long long>(n), static_cast<unsigned long long>(c.frames),
 	            static_cast<double>(total) / static_cast<double>(c.frames));
@@ -1804,6 +1814,8 @@ void ReportPassCensus() {
 		            100.0 * static_cast<double>(e->draws) / static_cast<double>(total));
 	}
 	std::fflush(stdout);
+	c.entries = {};
+	c.frames  = 0;
 }
 
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
