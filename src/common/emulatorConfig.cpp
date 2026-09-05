@@ -32,6 +32,7 @@ static std::atomic<bool>     g_frame_pipelining {false};
 static std::atomic<uint32_t> g_pipeline_depth {4};
 static std::atomic<bool>     g_log_ui_draws {false};
 static std::atomic<bool>     g_coalesce_eop_flush {false};
+static std::atomic<uint32_t> g_eop_flush_interval {1};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
@@ -67,6 +68,7 @@ void Load(const ConfigOptions& cfg) {
 	g_pipeline_depth.store(cfg.pipeline_depth, std::memory_order_relaxed);
 	g_log_ui_draws.store(cfg.log_ui_draws, std::memory_order_relaxed);
 	g_coalesce_eop_flush.store(cfg.coalesce_eop_flush, std::memory_order_relaxed);
+	g_eop_flush_interval.store(cfg.eop_flush_interval, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
@@ -195,6 +197,10 @@ bool LogUiDrawsEnabled() {
 
 bool CoalesceEopFlushEnabled() {
 	return g_coalesce_eop_flush.load(std::memory_order_relaxed);
+}
+
+uint32_t EopFlushInterval() {
+	return g_eop_flush_interval.load(std::memory_order_relaxed);
 }
 
 void SetHwCheck(bool enabled) {

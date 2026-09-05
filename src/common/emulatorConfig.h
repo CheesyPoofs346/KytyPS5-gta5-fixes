@@ -80,6 +80,12 @@ struct ConfigOptions {
 	// observe those labels mid-frame because it is blocked in WaitForIdle 96% of the frame, so
 	// the flush at submission end delivers them in time. See HANDOFF-gta5-cpu-and-perf.md.
 	bool                   coalesce_eop_flush            = false;
+	// Flush every Nth EOP request instead of every one. 1 reproduces the original behaviour
+	// (~1000 submits/frame, 2.819 us/draw). Skipping them all collapsed submits to 300 and saved
+	// ~12 ms/frame of CPU, but the frame got SLOWER: those submits were feeding the GPU
+	// incrementally, and batching everything to the end lost the CPU/GPU overlap. This is the
+	// middle ground.
+	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
@@ -187,6 +193,7 @@ bool     TestParallelBindingsEnabled();
 bool     FramePipeliningEnabled();
 bool     LogUiDrawsEnabled();
 bool     CoalesceEopFlushEnabled();
+uint32_t EopFlushInterval();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);

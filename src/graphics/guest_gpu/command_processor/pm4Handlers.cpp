@@ -103,11 +103,20 @@ void ReportEopFlushCensus() {
 }
 
 // True when the caller should actually submit.
+std::atomic<uint64_t> g_eop_since_flush {0};
+
 bool EopShouldFlush(std::atomic<uint64_t>& site) {
-	if (Config::CoalesceEopFlushEnabled()) {
-		g_eop_flush_skipped.fetch_add(1, std::memory_order_relaxed);
-		ReportEopFlushCensus();
-		return false;
+	// Dropping every flush collapsed submits from 37668 to 300 and saved ~12 ms/frame of CPU - and
+	// the frame got SLOWER, 60.7 -> 63.9 ms. Those submits were feeding the GPU incrementally, so
+	// batching everything to the end of the frame lost more overlap than the overhead it saved.
+	// Keeping every Nth is the middle ground: the GPU stays fed, most of the submit cost goes.
+	const auto interval = Config::EopFlushInterval();
+	if (Config::CoalesceEopFlushEnabled() && interval > 1) {
+		if ((g_eop_since_flush.fetch_add(1, std::memory_order_relaxed) + 1) % interval != 0) {
+			g_eop_flush_skipped.fetch_add(1, std::memory_order_relaxed);
+			ReportEopFlushCensus();
+			return false;
+		}
 	}
 	site.fetch_add(1, std::memory_order_relaxed);
 	ReportEopFlushCensus();
