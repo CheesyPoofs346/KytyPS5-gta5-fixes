@@ -75,6 +75,11 @@ struct ConfigOptions {
 	// Dump viewport/scissor for small-index (UI quad) draws. Diagnostic for the oversized
 	// minimap: the icons render at the right size and the map does not, so their geometry differs.
 	bool                   log_ui_draws                  = false;
+	// RELEASE_MEM label writes flush the command buffer on every packet - measured at ~1000
+	// vkQueueSubmit per frame, 2.8 us/draw, the single largest non-draw cost. The guest cannot
+	// observe those labels mid-frame because it is blocked in WaitForIdle 96% of the frame, so
+	// the flush at submission end delivers them in time. See HANDOFF-gta5-cpu-and-perf.md.
+	bool                   coalesce_eop_flush            = false;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
 	bool                   buffer_dedup                = true;
@@ -181,6 +186,7 @@ bool     ParallelResolutionEnabled();
 bool     TestParallelBindingsEnabled();
 bool     FramePipeliningEnabled();
 bool     LogUiDrawsEnabled();
+bool     CoalesceEopFlushEnabled();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);

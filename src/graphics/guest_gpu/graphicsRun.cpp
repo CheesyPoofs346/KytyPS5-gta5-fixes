@@ -52,6 +52,96 @@ namespace Libs::Graphics {
 // pipelining. What that costs depends entirely on the split this prints.
 namespace {
 
+// Windowed, exclusive handler cost. NOP's custom subcommands get separate buckets.
+// Draws drained inside a handler are already charged to DrawPhase::Total.
+struct Pm4OpcodeProfile {
+	struct Bucket {
+		uint64_t cycles = 0;
+		uint64_t calls = 0;
+	};
+	std::array<Bucket, 256 + Pm4::R_NUM> buckets {};
+	std::array<Bucket, 4> work {};
+	uint64_t packets = 0;
+	uint64_t start_draws = 0;
+	uint64_t start_tsc = 0;
+	std::chrono::steady_clock::time_point start_wall {};
+
+	void Begin() {
+		if (start_tsc == 0) {
+			start_wall = std::chrono::steady_clock::now();
+			start_tsc = DrawProfileReadCycles();
+			start_draws = g_draw_profile.draws;
+		}
+	}
+
+	void Add(uint32_t opcode, uint32_t header, uint64_t cycles) {
+		const auto key = opcode == Pm4::IT_NOP ? 256 + KYTY_PM4_R(header) : opcode;
+		buckets[key].cycles += cycles;
+		buckets[key].calls++;
+		if (++packets < 1000000) {
+			return;
+		}
+		const auto elapsed_tsc = DrawProfileReadCycles() - start_tsc;
+		const double elapsed_ns = std::chrono::duration<double, std::nano>(
+		    std::chrono::steady_clock::now() - start_wall).count();
+		const double ns_per_cycle = elapsed_tsc == 0 ? 0.0 : elapsed_ns / elapsed_tsc;
+		const auto draws = g_draw_profile.draws - start_draws;
+		uint64_t total_cycles = 0;
+		for (const auto& bucket : buckets) {
+			total_cycles += bucket.cycles;
+		}
+		std::printf("Pm4Opcodes: %llu packets, %llu draws, %.2f s window, %.2f ms exclusive handlers\n",
+		            static_cast<unsigned long long>(packets), static_cast<unsigned long long>(draws),
+		            elapsed_ns / 1e9, total_cycles * ns_per_cycle / 1e6);
+		for (uint32_t key = 0; key < buckets.size(); ++key) {
+			const auto& b = buckets[key];
+			if (b.calls == 0) {
+				continue;
+			}
+			std::printf("  %s=0x%02x calls=%llu us/packet=%.3f us/draw=%.3f share=%.1f%%\n",
+			            key >= 256 ? "NOP.R" : "opcode", key >= 256 ? key - 256 : key,
+			            static_cast<unsigned long long>(b.calls), b.cycles * ns_per_cycle / b.calls / 1e3,
+			            draws == 0 ? 0.0 : b.cycles * ns_per_cycle / draws / 1e3,
+			            total_cycles == 0 ? 0.0 : 100.0 * b.cycles / total_cycles);
+		}
+		std::fflush(stdout);
+		constexpr const char* names[] = {"drain-minus-draws", "barrier-record", "scheduler-flush", "label-write"};
+		for (size_t i = 0; i < work.size(); ++i) {
+			const auto& b = work[i];
+			std::printf("Pm4Work: %s calls=%llu ms=%.3f us/draw=%.3f\n", names[i],
+			            static_cast<unsigned long long>(b.calls), b.cycles * ns_per_cycle / 1e6,
+			            draws == 0 ? 0.0 : b.cycles * ns_per_cycle / draws / 1e3);
+		}
+		std::fflush(stdout);
+		*this = {};
+	}
+};
+
+thread_local Pm4OpcodeProfile g_pm4_opcode_profile;
+
+struct Pm4WorkTimer {
+	uint32_t kind;
+	bool active = g_draw_profile.active;
+	uint64_t draws_before = g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)];
+	uint64_t start = active ? DrawProfileReadCycles() : 0;
+
+	~Pm4WorkTimer() {
+		if (active) {
+			const auto elapsed = DrawProfileReadCycles() - start;
+			const auto nested = g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)] - draws_before;
+			auto& bucket = g_pm4_opcode_profile.work[kind];
+			bucket.cycles += elapsed - std::min(elapsed, nested);
+			bucket.calls++;
+		}
+	}
+};
+
+template <typename T>
+void WriteProfiledLabel(T* destination, const T& value) {
+	Pm4WorkTimer timer {3};
+	std::memcpy(destination, &value, sizeof(value));
+}
+
 std::atomic<uint64_t> g_guest_blocked_ns {0};   // guest thread inside WaitForIdle
 std::atomic<uint64_t> g_gpu_busy_ns {0};        // GPU thread inside Process()
 std::atomic<uint64_t> g_census_frames {0};
@@ -323,6 +413,7 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	DrainQueuedDraws();
+	Pm4WorkTimer timer {2};
 	GetScheduler().Flush();
 }
 
@@ -339,6 +430,7 @@ void CommandProcessor::DrainQueuedDraws() {
 	if (!Config::DrawQueueEnabled() || !GetScheduler().Active()) {
 		return;
 	}
+	Pm4WorkTimer timer {0};
 	m_renderer.GetRenderExecutor().DrainDrawQueue(CurrentBuffer());
 }
 
@@ -959,21 +1051,25 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 				}
 			}
 			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-		} else {
-			// IT_INDIRECT_BUFFER recurses into a nested command buffer, so this handler can
-			// contain draws - and did: PM4 non-draw read 44.6 ms/frame alongside DrawIndex's
-			// 39.9 ms inside a 57.2 ms frame, which is impossible. Subtracting the DrawIndex time
-			// that accumulated inside the handler leaves the actual non-draw packet cost.
+		} else if (g_draw_profile.active) {
+			g_pm4_opcode_profile.Begin();
 			const auto total_before =
 			    g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)];
-			DrawPhaseTimer packet_timer(DrawPhase::Pm4NonDraw);
-			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
-			packet_timer.Stop();
 			auto& non_draw = g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Pm4NonDraw)];
+			const auto non_draw_before = non_draw;
+			const auto start = DrawProfileReadCycles();
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+			const auto elapsed = DrawProfileReadCycles() - start;
+			// Subtract both nested draws and recursively measured non-draw handlers.
 			const auto nested =
-			    g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)] - total_before;
-			non_draw -= std::min(nested, non_draw);
+			    g_draw_profile.cycles[static_cast<size_t>(DrawPhase::Total)] - total_before +
+			    non_draw - non_draw_before;
+			const auto exclusive = elapsed - std::min(nested, elapsed);
+			non_draw += exclusive;
 			g_draw_profile.pm4_packets++;
+			g_pm4_opcode_profile.Add(opcode, packet_header, exclusive);
+		} else {
+			packet_dw = handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
 		}
 		if (packet_writes_registers) {
 			m_snapshot_cache.MarkRegistersDirty();
@@ -1509,7 +1605,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		WriteProfiledLabel(dst, data);
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1559,7 +1655,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			} else {
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					WriteProfiledLabel(dst, value);
 
 					if (with_interrupt) {
 						if (with_writeback) {
@@ -1649,7 +1745,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			if constexpr (sizeof(T) == sizeof(uint64_t)) {
 				const auto clock = Sync::ReadReferenceClock();
 				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
-				std::memcpy(dst, &clock, sizeof(clock));
+				WriteProfiledLabel(dst, clock);
 				switch (cache_action) {
 					case 0x00:
 						if ((eop_event_type == 0x04 && event_index == 0x05) ||
@@ -1730,8 +1826,10 @@ void CommandProcessor::EmitGlobalBarrier() {
 	// They must be recorded before this barrier, which is what the guest is asking to synchronise
 	// against.
 	if (Config::DrawQueueEnabled()) {
+		Pm4WorkTimer timer {0};
 		m_renderer.GetRenderExecutor().DrainDrawQueue(CurrentBuffer());
 	}
+	Pm4WorkTimer timer {1};
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }

@@ -1,3 +1,4 @@
+#include "common/emulatorConfig.h"
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -69,6 +70,48 @@ constexpr uint32_t RegisterSelectorMask     = 0x70000000u;
 
 constexpr uint32_t NormalizeRegisterOffset(uint32_t raw_offset) {
 	return raw_offset & ~RegisterSelectorMask;
+}
+
+// RELEASE_MEM flushes the command buffer on every label write. Measured at ~1000 vkQueueSubmit a
+// frame - 37668 flushes over 158816 draws, one per 4.2 draws, costing 2.819 us/draw - which is the
+// single largest non-draw cost in the emulator.
+//
+// It should not be needed. The guest cannot observe an EOP label mid-frame: it sits inside
+// WaitForIdle for 96% of the frame (FrameThreads census), and the flush at the end of the
+// submission delivers every label before it regains control. Real hardware does not imply a submit
+// here either - the GPU keeps running and raises the interrupt when it reaches the packet - and
+// RecordEndOfPipeSignal already defers interrupts through the scheduler.
+//
+// Counted per site so the next run shows which one dominates rather than assuming.
+std::atomic<uint64_t> g_eop_flush_interrupt {0};
+std::atomic<uint64_t> g_eop_flush_data1 {0};
+std::atomic<uint64_t> g_eop_flush_data5 {0};
+std::atomic<uint64_t> g_eop_flush_skipped {0};
+
+void ReportEopFlushCensus() {
+	const auto i  = g_eop_flush_interrupt.load(std::memory_order_relaxed);
+	const auto d1 = g_eop_flush_data1.load(std::memory_order_relaxed);
+	const auto d5 = g_eop_flush_data5.load(std::memory_order_relaxed);
+	const auto sk = g_eop_flush_skipped.load(std::memory_order_relaxed);
+	if ((i + d1 + d5 + sk) % 20000 != 0) {
+		return;
+	}
+	std::printf("EopFlush: interrupt=%llu data_sel1=%llu data_sel5=%llu SKIPPED=%llu\n",
+	            static_cast<unsigned long long>(i), static_cast<unsigned long long>(d1),
+	            static_cast<unsigned long long>(d5), static_cast<unsigned long long>(sk));
+	std::fflush(stdout);
+}
+
+// True when the caller should actually submit.
+bool EopShouldFlush(std::atomic<uint64_t>& site) {
+	if (Config::CoalesceEopFlushEnabled()) {
+		g_eop_flush_skipped.fetch_add(1, std::memory_order_relaxed);
+		ReportEopFlushCensus();
+		return false;
+	}
+	site.fetch_add(1, std::memory_order_relaxed);
+	ReportEopFlushCensus();
+	return true;
 }
 
 bool ReleaseMemGcrNeedsBarrier(uint32_t eop_event_type, uint32_t gcr_cntl) {
@@ -2681,7 +2724,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
-		if (queued) {
+		if (queued && EopShouldFlush(g_eop_flush_interrupt)) {
 			cp.BufferFlush();
 		}
 	};
@@ -2721,7 +2764,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		cp.BufferFlush();
+		if (EopShouldFlush(g_eop_flush_data1)) {
+			cp.BufferFlush();
+		}
 
 		return 7;
 	}
@@ -2738,7 +2783,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id);
-		if (interrupt_selector == 0x01) {
+		if (interrupt_selector == 0x01 && EopShouldFlush(g_eop_flush_data5)) {
 			cp.BufferFlush();
 		}
 
