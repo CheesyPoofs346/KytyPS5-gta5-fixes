@@ -153,3 +153,92 @@ could reduce the pipeline set itself, since vertex layout specializes `vs_shader
 **Vertex pulling and descriptor indexing remain deferred, not disproven.** The census measured
 batching opportunity only. Descriptor indexing could reduce binding and preparation cost
 without reducing draw count, and that benefit was never measured here.
+
+---
+
+# Resolution: Design 1 is NOT safe to implement. Retain the lock.
+
+Five conditions were put to this audit. Checked in source, three hold and two do not, and
+one of the failures has no bounded remedy.
+
+## HOLDS - backing decommit, reuse and teardown, both platforms
+
+- Windows: `CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE |
+  SEC_COMMIT, ...)`. `SEC_COMMIT` commits the whole section up front. Every `VirtualFree` in
+  the file targets a guest address (`old.vaddr`, `vaddr`, `region_start`,
+  `info.AllocationBase`, `ptr`, `region_vaddr`, `base`) - never `m_backing_base`.
+- Linux: `memfd_create` plus a single `ftruncate(m_size)`. **No `fallocate`/`PUNCH_HOLE`
+  anywhere in the file**, so no hole punching decommits backing pages.
+- `m_size` is fixed after construction; teardown is destructor-only.
+
+So pages are address-stable **and** commitment-stable for the store's lifetime. This
+condition is satisfied - but it only rules out faulting, which was never the binding
+constraint.
+
+## FAILS - the payload cannot be protected during an unlocked copy
+
+There is no way to show that recommit or reuse cannot modify the source, because the
+sequence is reachable entirely through operations that already exist:
+
+1. thread A: `ReleaseCommitted` / `UnmapBacking` for range R  (takes the mutex)
+2. thread A: `MapBacking` assigns the same `backing_offset` to a different allocation
+   (takes the mutex)
+3. guest code writes to the new allocation - **guest writes never take this mutex**
+4. meanwhile our unlocked `memcpy` is still reading those bytes
+
+The result is a genuine concurrent read/write on the same object: a data race, UB under
+C++20, and in practice a copy torn across two different allocations. A generation counter
+observed *after* the copy reports that this happened; it cannot prevent it. **An atomic
+counter orders the metadata, not the payload.**
+
+Note the lock does not protect the payload from the *guest* today either - guest writes to a
+currently-mapped range already race with `TryReadBacking`, and the dirty-tracking re-upload
+is what absorbs that. But unlocking widens the race from "same allocation, concurrent write"
+to "bytes of a different allocation, torn mid-copy", and nothing in the current model bounds
+the second.
+
+## FAILS - no lease/pin exists, and adding one is not bounded
+
+Grepped for refcounting, leases, pins or shared ownership over direct-memory blocks:
+**none exists**. `MapBacking`/`UnmapBacking` are called with plain `{vaddr, size,
+backing_offset}` records and no reader tracking whatsoever, and
+`KernelReleaseDirectMemory` frees a physical range with nothing consulted about readers.
+
+The smallest sufficient mechanism would be a reader pin on direct-memory ranges: a refcount
+consulted by `UnmapBacking` and by the direct-memory release path, taken by the reader while
+the lock is held and dropped after the copy, with release either blocking or deferring while
+pinned. That means changing the guest direct-memory allocator's ownership model and every
+release path through it. That is a new ownership model in guest memory management, not a
+bounded experiment, and it would need its own audit before it could be trusted.
+
+## Scope note, had it been viable
+
+`TryTransferBacking` is shared machinery and must not be unlocked wholesale:
+`TryWriteBacking` transfers *into* backing, and `TryReadBacking` has callers in
+`bufferCache.cpp` (4), `image.cpp` (2), `textureCache.cpp` (1), `memory.cpp` (2) and
+`pthread.cpp` (2). Only the stream fast path writes into a private stream allocation that is
+uncommitted until after the copy and can therefore be discarded. Any unlocked variant would
+need a separate read-only entry point restricted to that caller. This does not rescue the
+design; it is recorded so the scoping is not re-derived.
+
+## Invalidation surface, for the record
+
+Beyond `m_maps` mutations, these also invalidate or recycle and must be covered by any future
+contract: `Commit`, `ReleaseCommitted`, `ReserveAligned`, `ReserveFixed`, `ReleaseFree`,
+`MapExistingPlaceholderFixed`, `UnmapBacking`, `Protect`, `ProtectTransient`, and the
+direct-memory allocate/release path above this class.
+
+## Retracting "only a visual glitch"
+
+I described reading another allocation's bytes as a one-frame visual glitch. That was wrong:
+the consequence depends on the consumer, and the consumers are not all pixels. Stream-path
+bytes reach `BindingKind::Buffers`, `FlattenedSrt` and the BDA path in `descriptors.cpp`.
+Wrong bytes there can become indices, shader resource-table entries or buffer device
+addresses - which can produce out-of-range access or device loss, not a glitch. Severity is
+not established, and must not be assumed benign.
+
+## Conclusion
+
+**Retain the lock.** Design 1 is withdrawn. Design 2 remains blocked on a sub-page write
+version. No bounded experiment on this path is available without first introducing and
+auditing direct-memory reader pinning.
