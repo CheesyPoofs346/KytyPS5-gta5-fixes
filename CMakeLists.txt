@@ -514,6 +514,7 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_kyty_full_emulator_test(draw_phase_self_time_tests "${KYTY_TESTS_DIR}/DrawPhaseSelfTimeTests.cpp")
 add_kyty_full_emulator_test(binding_storage_pool_tests "${KYTY_TESTS_DIR}/BindingStoragePoolTests.cpp")
+add_kyty_full_emulator_test(agc_trace_cost_tests "${KYTY_TESTS_DIR}/AgcTraceCostTests.cpp")
 add_kyty_full_emulator_test(backing_transfer_fast_path_tests "${KYTY_TESTS_DIR}/BackingTransferFastPathTests.cpp")
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
