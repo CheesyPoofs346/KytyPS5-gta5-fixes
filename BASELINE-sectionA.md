@@ -95,9 +95,16 @@ Median interval ~62 ms against a 16.667 ms budget:
 - Bringing the **median** interval to 16.667 ms needs a **3.8x reduction**.
 
 These ratios describe the median only. A median at 33.333 ms is **not** a 30 fps floor: by
-definition half the intervals would still be slower. A floor is a statement about the tail,
-so the governing figure is p99 (107.95-113.91 ms here), which needs roughly a **3.2x-3.4x**
-reduction to reach 33.333 ms and **6.5x-6.8x** to reach 16.667 ms.
+definition half the intervals would still be slower.
+
+Looking at the tail instead, the measured p99 (107.95-113.91 ms) would need roughly a
+**3.2x-3.4x** reduction to fall under 33.333 ms and **6.5x-6.8x** to fall under 16.667 ms.
+
+These are **the improvement needed to bring the measured p99 of these two captures under
+budget**. They are not a guaranteed uniform speedup requirement, and meeting them would not
+establish a steady 60 fps: a p99 under budget still leaves 1% of intervals above it, the
+remaining tail beyond p99 is unbounded here, and these are guest submission intervals rather
+than displayed frames.
 
 Not a matter of trimming a few percent, on any of these measures.
 

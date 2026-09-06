@@ -1893,10 +1893,12 @@ private:
 		            " sum these\n     buckets, and do NOT subtract the wait-* totals from the"
 		            " inclusive pm4-exec:\n     that subtraction is only valid once thread identity,"
 		            " nesting and capture\n     windows are established, which they are not here.\n");
-		std::printf("     ..processing/..commands/..submissions are the three predicates of\n"
-		            "     WaitForIdle's loop. Each waiting slice is attributed to exactly one, so\n"
-		            "     they are non-overlapping and sum to wait-idle -- they are NESTED INSIDE\n"
-		            "     it, not additional wait categories. Do not add them to wait-idle.\n");
+		std::printf("     ..processing/..commands/..submissions are PREDICATE STATES OBSERVED\n"
+		            "     BEFORE WAITING, not established causes. All three can be true at once;\n"
+		            "     fixed-priority attribution makes them non-overlapping and summable to\n"
+		            "     wait-idle (they are NESTED INSIDE it), but a slice charged to one may\n"
+		            "     equally have been blocked on another. Trace the work keeping the\n"
+		            "     selected predicate active before choosing a fix.\n");
 		std::printf("  scope: %s\n",
 		            g_capture_base_taken
 		                ? "ROUTE-SCOPED deltas, measured from the ROUTE_START snapshot"
@@ -1921,12 +1923,25 @@ private:
 				std::printf("  %-14s 0 calls in route\n", CaptureBucketName(bucket));
 				continue;
 			}
-			std::printf("  %-14s total=%8.1f ms  calls=%-10llu  avg=%8.3f us%s%s\n",
+			// Intervals that began before ROUTE_START contribute their WHOLE duration to this
+			// delta, so a bucket carrying them is not strictly route-contained. Report that
+			// contribution separately; do not compute precise percentages from a total that
+			// includes it.
+			const auto span_ns =
+			    g_capture_spanning_ns[i].load(std::memory_order_relaxed);
+			const auto span_calls =
+			    g_capture_spanning_calls[i].load(std::memory_order_relaxed);
+			std::printf("  %-14s total=%8.1f ms  calls=%-10llu  avg=%8.3f us%s\n",
 			            CaptureBucketName(bucket), static_cast<double>(ns) / 1e6,
 			            static_cast<unsigned long long>(calls),
 			            static_cast<double>(ns) / static_cast<double>(calls) / 1e3,
-			            spanning != 0 ? "  [spanned ROUTE_START]" : "",
 			            inflight_now != 0 ? "  [in flight now]" : "");
+			if (span_ns != 0 || spanning != 0) {
+				std::printf("  %-14s   of which %.1f ms over %llu interval(s) began before "
+				            "ROUTE_START -- NOT route-contained\n",
+				            "", static_cast<double>(span_ns) / 1e6,
+				            static_cast<unsigned long long>(span_calls));
+			}
 		}
 		std::fflush(stdout);
 	}

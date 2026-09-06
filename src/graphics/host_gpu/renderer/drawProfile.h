@@ -191,11 +191,14 @@ enum class CaptureBucket : size_t {
 	WaitPipeline,     // GuestGpu::WaitForPipelineDepth
 	WaitWorkers,      // caller blocked on the worker pool
 	WaitStream,       // stream ring waiting on GPU completion
-	// The three predicates of GuestGpu::WaitForIdle's loop:
+	// PREDICATE STATES OBSERVED IMMEDIATELY BEFORE WAITING, from the loop
 	//   while (m_processing || !m_commands.empty() || m_submission_count != 0)
-	// Each waiting slice is attributed to exactly ONE of these, so they are mutually
-	// non-overlapping and sum to WaitIdle. They are NESTED INSIDE WaitIdle - never add them
-	// to it, and never treat them as additional wait categories.
+	// These predicates CAN ALL BE TRUE AT ONCE. Attributing each slice to one of them by a
+	// fixed priority makes the accounting non-overlapping and summable, but it does NOT
+	// establish independent causes: a slice charged to ..commands may equally have been
+	// blocked on submissions. Read these as 'what was observed true before this wait', then
+	// trace the work that keeps the selected predicate active before choosing any fix.
+	// They are NESTED INSIDE WaitIdle - never add them to it.
 	WaitIdleProcessing,
 	WaitIdleCommands,
 	WaitIdleSubmissions,
@@ -218,6 +221,16 @@ inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture
 inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_calls {};
 inline std::array<int64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_inflight {};
 inline bool g_capture_base_taken = false;
+// Bumped when the baseline is taken. A timer stamps the generation at construction; if it
+// completes under a newer generation it began BEFORE ROUTE_START, so its whole duration
+// lands in the route delta even though only part of it belongs to the route. That
+// contribution is accumulated separately and reported, because a delta containing it is not
+// strictly route-contained and must not be used for precise percentages.
+inline std::atomic<uint64_t> g_capture_generation {0};
+inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Count)>
+    g_capture_spanning_ns {};
+inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Count)>
+    g_capture_spanning_calls {};
 
 // Snapshot at ROUTE_START so every bucket is reported as a route-scoped delta instead of a
 // process-cumulative total contaminated by boot.
@@ -228,11 +241,24 @@ inline void CaptureSnapshotBaseline() {
 		g_capture_base_inflight[i] = g_capture_inflight[i].load(std::memory_order_relaxed);
 	}
 	g_capture_base_taken = true;
+	g_capture_generation.fetch_add(1, std::memory_order_relaxed);
 }
 
 inline void CaptureAccount(CaptureBucket bucket, uint64_t ns) {
 	g_capture_ns[static_cast<size_t>(bucket)].fetch_add(ns, std::memory_order_relaxed);
 	g_capture_calls[static_cast<size_t>(bucket)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// As above, but for a timer that stamped `gen` at construction: if the generation has moved
+// on, the interval straddles the baseline and its contribution is tracked separately too.
+inline void CaptureAccountStamped(CaptureBucket bucket, uint64_t ns, uint64_t gen) {
+	CaptureAccount(bucket, ns);
+	if (gen != g_capture_generation.load(std::memory_order_relaxed)) {
+		g_capture_spanning_ns[static_cast<size_t>(bucket)].fetch_add(ns,
+		                                                             std::memory_order_relaxed);
+		g_capture_spanning_calls[static_cast<size_t>(bucket)].fetch_add(
+		    1, std::memory_order_relaxed);
+	}
 }
 
 // Always on: one steady_clock pair per event, and the events are per-frame or per-packet, not
@@ -242,19 +268,23 @@ public:
 	explicit CaptureTimer(CaptureBucket bucket)
 	    : m_bucket(bucket), m_start(std::chrono::steady_clock::now()) {
 		g_capture_inflight[static_cast<size_t>(bucket)].fetch_add(1, std::memory_order_relaxed);
+		m_gen = g_capture_generation.load(std::memory_order_relaxed);
 	}
 	~CaptureTimer() {
 		g_capture_inflight[static_cast<size_t>(m_bucket)].fetch_sub(1, std::memory_order_relaxed);
-		CaptureAccount(m_bucket, static_cast<uint64_t>(std::chrono::duration_cast<
-		                             std::chrono::nanoseconds>(
-		                             std::chrono::steady_clock::now() - m_start)
-		                             .count()));
+		CaptureAccountStamped(m_bucket,
+		                      static_cast<uint64_t>(
+		                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - m_start)
+		                              .count()),
+		                      m_gen);
 	}
 	CaptureTimer(const CaptureTimer&)            = delete;
 	CaptureTimer& operator=(const CaptureTimer&) = delete;
 
 private:
 	CaptureBucket                         m_bucket;
+	uint64_t                              m_gen = 0;
 	std::chrono::steady_clock::time_point m_start;
 };
 
@@ -278,6 +308,7 @@ public:
 			m_start = std::chrono::steady_clock::now();
 			g_capture_inflight[static_cast<size_t>(bucket)].fetch_add(1,
 			                                                          std::memory_order_relaxed);
+			m_gen = g_capture_generation.load(std::memory_order_relaxed);
 		}
 	}
 	~CaptureOutermostTimer() {
@@ -286,10 +317,12 @@ public:
 			return;
 		}
 		g_capture_inflight[static_cast<size_t>(m_bucket)].fetch_sub(1, std::memory_order_relaxed);
-		CaptureAccount(m_bucket, static_cast<uint64_t>(
-		                             std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                                 std::chrono::steady_clock::now() - m_start)
-		                                 .count()));
+		CaptureAccountStamped(m_bucket,
+		                      static_cast<uint64_t>(
+		                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - m_start)
+		                              .count()),
+		                      m_gen);
 	}
 	CaptureOutermostTimer(const CaptureOutermostTimer&)            = delete;
 	CaptureOutermostTimer& operator=(const CaptureOutermostTimer&) = delete;
@@ -298,6 +331,7 @@ private:
 	static inline thread_local std::array<uint32_t, static_cast<size_t>(CaptureBucket::Count)>
 	    t_depth {};
 	CaptureBucket                         m_bucket;
+	uint64_t                              m_gen       = 0;
 	bool                                  m_outermost = false;
 	std::chrono::steady_clock::time_point m_start;
 };
