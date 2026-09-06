@@ -1090,16 +1090,22 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	descriptors.buffers.reserve(program.info.buffers.size());
 	descriptors.images.reserve(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
-		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		TextureBinding binding;
+		{
+			DrawPhaseTimer resolve_timer(DrawPhase::BindResolveTexture);
+			binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		}
 		// An empty id means a worker bailed rather than create the image; the draw is already
 		// flagged for serial retry. Skip it instead of indexing the slot vector with an empty id.
 		if (binding.image_id) {
+			DrawPhaseTimer bind_timer(DrawPhase::BindBindImage);
 			BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
 		}
 		descriptors.images.push_back(binding);
 	}
 	descriptors.samplers.reserve(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+		DrawPhaseTimer sampler_timer(DrawPhase::BindNativeSampler);
 		descriptors.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
 	if (ShaderRecompiler::IR::FindBinding(

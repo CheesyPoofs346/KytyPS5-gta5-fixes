@@ -36,6 +36,11 @@ enum class DrawPhase : uint32_t {
 	ApplyOutputs,        // of which, ApplyVertex/PixelOutputs
 	Bindings,
 	BindPrepare,        // of which
+	// Inside PrepareBindings, isolating ONLY the resource-resolution path. BindPrepare's total
+	// gave no breakdown, so whether these dominate it was an assumption, not a measurement.
+	BindResolveTexture, // of which, per-image descriptor decode + texture cache lookup
+	BindBindImage,      // of which, BindImage + TrackImageBinding's linear scan
+	BindNativeSampler,  // of which, sampled_pairs scan + sampler cache lookup
 	BindFindBuffers,    // of which
 	BindClampRange,     // of which, inside FindBuffers
 	BindRebindBuffers,  // of which
@@ -99,6 +104,9 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::SrtSnapshot:
 		case DrawPhase::ApplyOutputs:
 		case DrawPhase::BindPrepare:
+		case DrawPhase::BindResolveTexture:
+		case DrawPhase::BindBindImage:
+		case DrawPhase::BindNativeSampler:
 		case DrawPhase::BindFindBuffers:
 		case DrawPhase::BindClampRange:
 		case DrawPhase::BindRebindBuffers:
@@ -135,6 +143,9 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::ApplyOutputs: return "    of which ApplyOutputs";
 		case DrawPhase::Bindings: return "PrepareGraphicsBindings";
 		case DrawPhase::BindPrepare: return "  of which PrepareBindings";
+		case DrawPhase::BindResolveTexture: return "    of which ResolveTexture";
+		case DrawPhase::BindBindImage: return "    of which BindImage";
+		case DrawPhase::BindNativeSampler: return "    of which NativeSampler";
 		case DrawPhase::BindFindBuffers: return "  of which FindBuffers";
 		case DrawPhase::BindClampRange: return "    of which ClampRangeSize";
 		case DrawPhase::BindRebindBuffers: return "  of which RebindBuffers";
