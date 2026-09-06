@@ -1811,6 +1811,7 @@ private:
 			// Snapshot every capture bucket here so they are reported as route-scoped deltas
 			// rather than process-cumulative totals contaminated by boot.
 			CaptureSnapshotBaseline();
+			Libs::LibKernel::Memory::BackingSampleNewEpoch();
 			DrawProfileSnapshotRoute();
 			std::printf("FrameStats: ROUTE_START consumed at sample %zu; that interval straddles the\n            boundary and is excluded, route begins at sample %zu\n",
 			            m_route_begin, m_route_begin + 1);

@@ -109,6 +109,9 @@ void                   RegisterCallbacks(callback_func_t alloc_func, callback_fu
 void                   SetFlexibleMemorySize(uint64_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Diagnostic: starts a new backing-lock sampling epoch, discarding samples from any prior
+// route so the retained set describes the measured route only.
+void                   BackingSampleNewEpoch();
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadPrtBacking(uint64_t vaddr, void* data, uint64_t size);
 // GPU upload callback only: reads CPU-authored bytes without entering GPU fault handlers.

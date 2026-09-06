@@ -42,28 +42,57 @@ struct BackingTransferStats {
 
 	// Sampled lock diagnostic, only populated when backing_lock_sample is set.
 	//
-	// SAMPLING METHOD: probabilistic, not periodic. A fixed every-Nth rule can phase-lock with a
-	// recurring call pattern (the per-draw buffer loop is highly regular), so the sample would
-	// systematically land on the same position in that pattern. A thread_local xorshift picks
-	// each sample independently at ~1/256, which removes that correlation but leaves ordinary
-	// sampling error - so totals extrapolated from these are ESTIMATES, not measurements.
+	// SAMPLING METHOD: probabilistic (~1/256) per acquisition via a thread_local xorshift, so the
+	// sample cannot phase-lock with the highly regular per-draw buffer loop the way a fixed
+	// every-Nth rule would.
 	//
-	// Individual samples are retained (bounded reservoir) so the report can show a distribution;
-	// an average alone cannot distinguish steady moderate waits from rare enormous ones.
+	// RETENTION: Algorithm R reservoir sampling, so the retained set is a UNIFORM sample of the
+	// measured route rather than its first 4096 samples. The previous first-N retention described
+	// the beginning of sampling, which is precisely the wrong thing when the tail is the question.
+	//
+	// Sums are accumulated over EVERY sample, not just retained ones, so means and totals do not
+	// inherit the reservoir bound. Extrapolations from a 1/256 sample remain estimates.
 	static constexpr size_t kReservoir = 4096;
-	uint32_t                thread_id  = 0;
-	uint64_t                sampled    = 0;   // samples actually taken
-	uint64_t                eligible   = 0;   // acquisitions seen while sampling was enabled
-	size_t                  stored     = 0;
+	uint64_t                epoch       = 0;   // route generation this data belongs to
+	uint32_t                thread_id   = 0;
+	uint64_t                sampled     = 0;   // samples taken this epoch
+	uint64_t                eligible    = 0;   // acquisitions seen this epoch
+	uint64_t                acquire_sum = 0;   // over all samples, not just retained
+	uint64_t                hold_sum    = 0;
+	size_t                  stored      = 0;
 	std::array<uint32_t, kReservoir> acquire_ns {};
 	std::array<uint32_t, kReservoir> hold_ns {};
 
-	void AddSample(uint64_t acquire, uint64_t hold) {
+	// Called when the route epoch advances: the previous route's samples must not leak into it.
+	void ResetSampling(uint64_t new_epoch) {
+		epoch       = new_epoch;
+		sampled     = 0;
+		eligible    = 0;
+		acquire_sum = 0;
+		hold_sum    = 0;
+		stored      = 0;
+	}
+
+	void AddSample(uint64_t acquire, uint64_t hold, uint32_t& rng) {
 		sampled++;
+		acquire_sum += acquire;
+		hold_sum += hold;
+		const auto a = static_cast<uint32_t>(std::min<uint64_t>(acquire, UINT32_MAX));
+		const auto h = static_cast<uint32_t>(std::min<uint64_t>(hold, UINT32_MAX));
 		if (stored < kReservoir) {
-			acquire_ns[stored] = static_cast<uint32_t>(std::min<uint64_t>(acquire, UINT32_MAX));
-			hold_ns[stored]    = static_cast<uint32_t>(std::min<uint64_t>(hold, UINT32_MAX));
+			acquire_ns[stored] = a;
+			hold_ns[stored]    = h;
 			stored++;
+			return;
+		}
+		// Algorithm R: keep each of the `sampled` observations with equal probability.
+		rng ^= rng << 13u;
+		rng ^= rng >> 17u;
+		rng ^= rng << 5u;
+		const auto slot = static_cast<uint64_t>(rng) % sampled;
+		if (slot < kReservoir) {
+			acquire_ns[static_cast<size_t>(slot)] = a;
+			hold_ns[static_cast<size_t>(slot)]    = h;
 		}
 	}
 
@@ -96,12 +125,18 @@ struct BackingTransferStats {
 		            static_cast<unsigned long long>(fallback_range_bad),
 		            static_cast<unsigned long long>(rejected));
 		if (sampled != 0) {
-			std::printf("BackingLock[DIAGNOSTIC ONLY, probabilistic ~1/256 per acquisition]:\n"
-			            "    eligible acquisitions=%llu  sampled=%llu  retained=%zu\n"
-			            "    distributions are per thread; totals extrapolated from these are\n"
-			            "    ESTIMATES, and this run is not comparable to a performance capture.\n",
+			std::printf("BackingLock[DIAGNOSTIC ONLY, ~1/256 probabilistic, uniform reservoir]:\n"
+			            "    epoch=%llu eligible=%llu sampled=%llu retained=%zu\n"
+			            "    acquire: sum=%.1f ms mean=%.3f us | hold: sum=%.1f ms mean=%.3f us\n"
+			            "    (sums are over all samples; scaling by ~256 gives an ESTIMATE of the\n"
+			            "     population total, not a measurement)\n",
+			            static_cast<unsigned long long>(epoch),
 			            static_cast<unsigned long long>(eligible),
-			            static_cast<unsigned long long>(sampled), stored);
+			            static_cast<unsigned long long>(sampled), stored,
+			            static_cast<double>(acquire_sum) / 1e6,
+			            static_cast<double>(acquire_sum) / static_cast<double>(sampled) / 1e3,
+			            static_cast<double>(hold_sum) / 1e6,
+			            static_cast<double>(hold_sum) / static_cast<double>(sampled) / 1e3);
 			auto acquire_copy = acquire_ns;
 			auto hold_copy    = hold_ns;
 			Quantiles(acquire_copy, stored, "acquire", thread_id);
@@ -116,6 +151,10 @@ inline BackingTransferStats& BackingStats() {
 	return stats;
 }
 
+// Bumped at ROUTE_START so sampling state is reset and the retained set describes the measured
+// route only.
+inline std::atomic<uint64_t> g_backing_sample_epoch {0};
+
 // Samples acquisition wait against hold time on 1 in 256 acquisitions. Timing every acquisition
 // would distort the hottest lock in the process, which is precisely what is under investigation,
 // so this is diagnostic-only and must stay off in performance captures.
@@ -126,14 +165,17 @@ public:
 			return;
 		}
 		auto& stats = BackingStats();
+		// A new route epoch invalidates the previous route's samples.
+		const auto epoch = g_backing_sample_epoch.load(std::memory_order_relaxed);
+		if (stats.epoch != epoch) {
+			stats.ResetSampling(epoch);
+		}
 		stats.eligible++;
 		if (stats.thread_id == 0) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 			stats.thread_id = static_cast<uint32_t>(GetCurrentThreadId());
 #endif
 		}
-		// xorshift32: independent ~1/256 draws, so the sample cannot phase-lock with the
-		// highly regular per-draw buffer loop the way a fixed every-Nth rule would.
 		m_rng ^= m_rng << 13u;
 		m_rng ^= m_rng >> 17u;
 		m_rng ^= m_rng << 5u;
@@ -161,7 +203,8 @@ public:
 		    static_cast<uint64_t>(
 		        std::chrono::duration_cast<std::chrono::nanoseconds>(m_acquired - m_start).count()),
 		    static_cast<uint64_t>(
-		        std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_acquired).count()));
+		        std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_acquired).count()),
+		    m_rng);
 	}
 
 	KYTY_CLASS_NO_COPY(BackingLockScope);
