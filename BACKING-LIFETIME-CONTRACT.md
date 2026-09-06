@@ -131,7 +131,13 @@ that clears it — is not called on the stream path. A cache keyed on address ne
 that increments on guest write, which does not currently exist at sub-page granularity.
 Content hashing is the alternative and must beat a memcpy it duplicates the reads of.
 
-**Verdict:** blocked on a versioning signal that does not exist. Not proposed now.
+**Verdict: deprioritised, not blocked.** A sub-page write version is NOT inherently required.
+Content identity can instead be established by a protected read plus byte verification: copy
+under the lock as today, compare against the cached snapshot, and reuse the existing GPU
+allocation when the bytes match. That needs no new versioning signal and no new ownership
+model. The objection to it is economic, not structural - the verification reads the same bytes
+the copy would, so it may simply not save enough work to pay. That is a measurable question,
+not an impossibility.
 
 ## 6. Recommended bounded experiment
 

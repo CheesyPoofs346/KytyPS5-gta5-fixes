@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <vector>
 #include <mutex>
@@ -170,7 +171,18 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 }
 
 struct DrawProfileState {
-	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> cycles {};
+	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> cycles {};   // INCLUSIVE
+	// EXCLUSIVE (self) time: elapsed in the zone minus elapsed in zones nested inside it,
+	// determined by ACTUAL TIMER NESTING at run time - not by the DrawPhaseIsChild() table,
+	// which describes intent and was measurably wrong (a child reported 24.40% of total against
+	// a 2.91% parent). Inclusive totals above are unchanged so earlier comparisons stay valid.
+	//
+	// This is EXCLUSIVE INSTRUMENTED ELAPSED TIME. It is NOT CPU execution time: work inside the
+	// zone that no nested timer covers is still counted here, and so is any blocking that occurs
+	// inside it.
+	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> self_cycles {};
+	// Elapsed reported by timers that closed inside the currently-open timer.
+	uint64_t child_cycles = 0;
 	uint64_t                              draws   = 0;
 	uint64_t                              buffers = 0;   // resolved buffer descriptors
 	// The ceiling on any "skip it when the state has not changed" design is how often the state
@@ -198,6 +210,7 @@ struct DrawProfileRegistryEntry {
 	uint32_t          thread_id = 0;
 	// Route baselines, captured at ROUTE_START.
 	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> base_cycles {};
+	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> base_self {};
 	uint64_t                                                    base_draws = 0;
 };
 
@@ -469,7 +482,12 @@ public:
 		// ~10^13 cycles. That is what made the PM4 phase report 670 us/draw.
 		m_active = g_draw_profile.active;
 		if (m_active) {
-			m_start = DrawProfileReadCycles();
+			// Save the enclosing timer's child accumulator and start a fresh one for our own
+			// nested timers; restored in Stop(). This is what makes nesting real rather than
+			// declared.
+			m_saved_child               = g_draw_profile.child_cycles;
+			g_draw_profile.child_cycles = 0;
+			m_start                     = DrawProfileReadCycles();
 		}
 	}
 
@@ -478,9 +496,16 @@ public:
 	// Phases interleave with declarations that outlive them, so they cannot all be plain scopes.
 	void Stop() {
 		if (m_active && !m_stopped) {
-			g_draw_profile.cycles[static_cast<size_t>(m_phase)] +=
-			    DrawProfileReadCycles() - m_start;
-			m_stopped = true;
+			const auto elapsed = DrawProfileReadCycles() - m_start;
+			const auto nested  = g_draw_profile.child_cycles;
+			auto&      profile = g_draw_profile;
+			profile.cycles[static_cast<size_t>(m_phase)] += elapsed;
+			// Guarded subtraction: recursive re-entry of the same zone can make nested exceed
+			// elapsed, and unsigned wrap would poison the accumulator.
+			profile.self_cycles[static_cast<size_t>(m_phase)] += elapsed - std::min(nested, elapsed);
+			// Report our FULL elapsed to the enclosing timer, restoring its accumulator.
+			profile.child_cycles = m_saved_child + elapsed;
+			m_stopped            = true;
 		}
 	}
 
@@ -491,9 +516,10 @@ public:
 
 private:
 	DrawPhase m_phase;
-	uint64_t  m_start   = 0;
-	bool      m_active  = false;
-	bool      m_stopped = false;
+	uint64_t  m_start       = 0;
+	uint64_t  m_saved_child = 0;
+	bool      m_active      = false;
+	bool      m_stopped     = false;
 };
 
 // Called once per draw, at the top of DrawIndex/DrawAuto, before any phase timer.

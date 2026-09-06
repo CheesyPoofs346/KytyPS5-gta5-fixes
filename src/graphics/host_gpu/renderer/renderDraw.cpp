@@ -3296,6 +3296,7 @@ void DrawProfileSnapshotRoute() {
 			continue;
 		}
 		entry.base_cycles = entry.state->cycles;
+		entry.base_self   = entry.state->self_cycles;
 		entry.base_draws  = entry.state->draws;
 	}
 }
@@ -3331,6 +3332,7 @@ void DrawProfileReportRoute() {
 		            static_cast<unsigned long long>(draws),
 		            static_cast<unsigned long long>(total_cycles));
 		uint64_t summed = 0;
+		uint64_t self_sum = 0;
 		for (size_t i = 0; i < static_cast<size_t>(DrawPhase::Count); ++i) {
 			const auto phase = static_cast<DrawPhase>(i);
 			if (phase == DrawPhase::Total) {
@@ -3344,13 +3346,25 @@ void DrawProfileReportRoute() {
 			if (!child) {
 				summed += cycles;
 			}
-			std::printf("      %-28s %10llu cyc  %6.2f%% of total  %s\n", DrawPhaseName(phase),
-			            static_cast<unsigned long long>(cycles),
+			const auto self = entry.state->self_cycles[i] - entry.base_self[i];
+			self_sum += self;
+			std::printf("      %-28s incl=%10llu (%5.2f%%)  SELF=%10llu (%5.2f%%) %s\n",
+			            DrawPhaseName(phase), static_cast<unsigned long long>(cycles),
 			            total_cycles > 0 ? 100.0 * static_cast<double>(cycles) /
 			                                   static_cast<double>(total_cycles)
 			                             : 0.0,
-			            child ? "[nested child - NOT summed]" : "");
+			            static_cast<unsigned long long>(self),
+			            total_cycles > 0 ? 100.0 * static_cast<double>(self) /
+			                                   static_cast<double>(total_cycles)
+			                             : 0.0,
+			            child ? "[declared child]" : "");
 		}
+		// SELF is what ranks candidates: measured nesting, so it does not double count.
+		std::printf("      %-28s %10llu cyc  %6.2f%% of total  <- RANKS CANDIDATES\n",
+		            "SUM OF SELF (all phases)", static_cast<unsigned long long>(self_sum),
+		            total_cycles > 0
+		                ? 100.0 * static_cast<double>(self_sum) / static_cast<double>(total_cycles)
+		                : 0.0);
 		std::printf("      %-28s %10llu cyc  %6.2f%% of total\n", "sum of non-child phases",
 		            static_cast<unsigned long long>(summed),
 		            total_cycles > 0
