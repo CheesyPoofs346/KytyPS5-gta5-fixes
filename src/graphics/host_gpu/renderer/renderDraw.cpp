@@ -1805,6 +1805,9 @@ private:
 		if (!m_route_started && std::filesystem::exists("ROUTE_START")) {
 			m_route_started = true;
 			m_route_begin   = m_samples.size();
+			// Snapshot every capture bucket here so they are reported as route-scoped deltas
+			// rather than process-cumulative totals contaminated by boot.
+			CaptureSnapshotBaseline();
 			std::printf("FrameStats: ROUTE_START consumed at sample %zu; that interval straddles the\n            boundary and is excluded, route begins at sample %zu\n",
 			            m_route_begin, m_route_begin + 1);
 			std::fflush(stdout);
@@ -1890,6 +1893,14 @@ private:
 		            " sum these\n     buckets, and do NOT subtract the wait-* totals from the"
 		            " inclusive pm4-exec:\n     that subtraction is only valid once thread identity,"
 		            " nesting and capture\n     windows are established, which they are not here.\n");
+		std::printf("     ..processing/..commands/..submissions are the three predicates of\n"
+		            "     WaitForIdle's loop. Each waiting slice is attributed to exactly one, so\n"
+		            "     they are non-overlapping and sum to wait-idle -- they are NESTED INSIDE\n"
+		            "     it, not additional wait categories. Do not add them to wait-idle.\n");
+		std::printf("  scope: %s\n",
+		            g_capture_base_taken
+		                ? "ROUTE-SCOPED deltas, measured from the ROUTE_START snapshot"
+		                : "PROCESS-CUMULATIVE (no baseline snapshot - boot is included)");
 		for (size_t i = 0; i < static_cast<size_t>(CaptureBucket::Count); ++i) {
 			const auto bucket = static_cast<CaptureBucket>(i);
 			if (!CaptureBucketWired(bucket)) {
@@ -1897,17 +1908,25 @@ private:
 			                CaptureBucketName(bucket));
 				continue;
 			}
-			const auto ns    = g_capture_ns[i].load(std::memory_order_relaxed);
-			const auto calls = g_capture_calls[i].load(std::memory_order_relaxed);
+			const auto ns_now    = g_capture_ns[i].load(std::memory_order_relaxed);
+			const auto calls_now = g_capture_calls[i].load(std::memory_order_relaxed);
+			const auto ns    = g_capture_base_taken ? ns_now - g_capture_base_ns[i] : ns_now;
+			const auto calls =
+			    g_capture_base_taken ? calls_now - g_capture_base_calls[i] : calls_now;
+			// A timer already running when the baseline was taken began before the route and
+			// contributes its WHOLE duration to this delta. Reported, not silently absorbed.
+			const auto spanning     = g_capture_base_taken ? g_capture_base_inflight[i] : 0;
+			const auto inflight_now = g_capture_inflight[i].load(std::memory_order_relaxed);
 			if (calls == 0) {
-				std::printf("  %-14s 0 calls\n", CaptureBucketName(bucket));
+				std::printf("  %-14s 0 calls in route\n", CaptureBucketName(bucket));
 				continue;
 			}
-			std::printf("  %-14s total=%8.1f ms  calls=%-10llu  avg=%8.3f us\n",
-			            CaptureBucketName(bucket),
-			            static_cast<double>(ns) / 1e6,
+			std::printf("  %-14s total=%8.1f ms  calls=%-10llu  avg=%8.3f us%s%s\n",
+			            CaptureBucketName(bucket), static_cast<double>(ns) / 1e6,
 			            static_cast<unsigned long long>(calls),
-			            static_cast<double>(ns) / static_cast<double>(calls) / 1e3);
+			            static_cast<double>(ns) / static_cast<double>(calls) / 1e3,
+			            spanning != 0 ? "  [spanned ROUTE_START]" : "",
+			            inflight_now != 0 ? "  [in flight now]" : "");
 		}
 		std::fflush(stdout);
 	}

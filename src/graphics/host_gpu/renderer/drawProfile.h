@@ -191,6 +191,14 @@ enum class CaptureBucket : size_t {
 	WaitPipeline,     // GuestGpu::WaitForPipelineDepth
 	WaitWorkers,      // caller blocked on the worker pool
 	WaitStream,       // stream ring waiting on GPU completion
+	// The three predicates of GuestGpu::WaitForIdle's loop:
+	//   while (m_processing || !m_commands.empty() || m_submission_count != 0)
+	// Each waiting slice is attributed to exactly ONE of these, so they are mutually
+	// non-overlapping and sum to WaitIdle. They are NESTED INSIDE WaitIdle - never add them
+	// to it, and never treat them as additional wait categories.
+	WaitIdleProcessing,
+	WaitIdleCommands,
+	WaitIdleSubmissions,
 	Count
 };
 
@@ -200,6 +208,27 @@ inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Coun
 // Guest flips (R_FLIP). A submission boundary is not a flip: correlate the two before
 // calling a submission interval a frame time, and never claim displayed FPS from either.
 inline std::atomic<uint64_t> g_guest_flips {0};
+
+// Timers in flight when a route marker is consumed span the boundary: they began before it
+// and their whole duration lands in the delta. Counted so the contamination is visible
+// rather than silently folded into the route figure.
+inline std::array<std::atomic<int64_t>, static_cast<size_t>(CaptureBucket::Count)>
+    g_capture_inflight {};
+inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_ns {};
+inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_calls {};
+inline std::array<int64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_inflight {};
+inline bool g_capture_base_taken = false;
+
+// Snapshot at ROUTE_START so every bucket is reported as a route-scoped delta instead of a
+// process-cumulative total contaminated by boot.
+inline void CaptureSnapshotBaseline() {
+	for (size_t i = 0; i < static_cast<size_t>(CaptureBucket::Count); ++i) {
+		g_capture_base_ns[i]       = g_capture_ns[i].load(std::memory_order_relaxed);
+		g_capture_base_calls[i]    = g_capture_calls[i].load(std::memory_order_relaxed);
+		g_capture_base_inflight[i] = g_capture_inflight[i].load(std::memory_order_relaxed);
+	}
+	g_capture_base_taken = true;
+}
 
 inline void CaptureAccount(CaptureBucket bucket, uint64_t ns) {
 	g_capture_ns[static_cast<size_t>(bucket)].fetch_add(ns, std::memory_order_relaxed);
@@ -211,8 +240,11 @@ inline void CaptureAccount(CaptureBucket bucket, uint64_t ns) {
 class CaptureTimer {
 public:
 	explicit CaptureTimer(CaptureBucket bucket)
-	    : m_bucket(bucket), m_start(std::chrono::steady_clock::now()) {}
+	    : m_bucket(bucket), m_start(std::chrono::steady_clock::now()) {
+		g_capture_inflight[static_cast<size_t>(bucket)].fetch_add(1, std::memory_order_relaxed);
+	}
 	~CaptureTimer() {
+		g_capture_inflight[static_cast<size_t>(m_bucket)].fetch_sub(1, std::memory_order_relaxed);
 		CaptureAccount(m_bucket, static_cast<uint64_t>(std::chrono::duration_cast<
 		                             std::chrono::nanoseconds>(
 		                             std::chrono::steady_clock::now() - m_start)
@@ -229,8 +261,46 @@ private:
 // A bucket with no instrumentation site is UNMEASURED, which is not the same as measured-zero.
 // wait-stream has no site wired yet and must never be reported as 0 ms.
 inline bool CaptureBucketWired(CaptureBucket bucket) {
-	return bucket != CaptureBucket::WaitStream;
+	return true;
 }
+
+// For recursive functions. ProcessPm4 recurses through ProcessIndirectBuffer, and a plain
+// CaptureTimer re-counted the enclosing time on every nested call - measured ~33x inflation.
+// Only the outermost activation on a thread records.
+//
+// NOTE: outermost elapsed time still INCLUDES any blocking done inside. It is wall time spent
+// in the call, NOT exclusive CPU execution, and must never be labelled as such.
+class CaptureOutermostTimer {
+public:
+	explicit CaptureOutermostTimer(CaptureBucket bucket) : m_bucket(bucket) {
+		m_outermost = (t_depth[static_cast<size_t>(bucket)]++ == 0);
+		if (m_outermost) {
+			m_start = std::chrono::steady_clock::now();
+			g_capture_inflight[static_cast<size_t>(bucket)].fetch_add(1,
+			                                                          std::memory_order_relaxed);
+		}
+	}
+	~CaptureOutermostTimer() {
+		--t_depth[static_cast<size_t>(m_bucket)];
+		if (!m_outermost) {
+			return;
+		}
+		g_capture_inflight[static_cast<size_t>(m_bucket)].fetch_sub(1, std::memory_order_relaxed);
+		CaptureAccount(m_bucket, static_cast<uint64_t>(
+		                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                 std::chrono::steady_clock::now() - m_start)
+		                                 .count()));
+	}
+	CaptureOutermostTimer(const CaptureOutermostTimer&)            = delete;
+	CaptureOutermostTimer& operator=(const CaptureOutermostTimer&) = delete;
+
+private:
+	static inline thread_local std::array<uint32_t, static_cast<size_t>(CaptureBucket::Count)>
+	    t_depth {};
+	CaptureBucket                         m_bucket;
+	bool                                  m_outermost = false;
+	std::chrono::steady_clock::time_point m_start;
+};
 
 inline const char* CaptureBucketName(CaptureBucket bucket) {
 	switch (bucket) {
@@ -240,6 +310,9 @@ inline const char* CaptureBucketName(CaptureBucket bucket) {
 		case CaptureBucket::WaitPipeline: return "wait-pipeline";
 		case CaptureBucket::WaitWorkers: return "wait-workers";
 		case CaptureBucket::WaitStream: return "wait-stream";
+		case CaptureBucket::WaitIdleProcessing: return "  ..processing";
+		case CaptureBucket::WaitIdleCommands: return "  ..commands";
+		case CaptureBucket::WaitIdleSubmissions: return "  ..submissions";
 		default: return "?";
 	}
 }

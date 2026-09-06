@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include "common/assert.h"
@@ -352,6 +353,7 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
                                          std::optional<size_t>     invalidation_mark,
                                          uint64_t requested_upper_bound, bool allow_wait,
                                          size_t& wait_cursor, uint64_t& wait_bound) {
+	CaptureTimer capture_timer {CaptureBucket::WaitStream};
 	if (!invalidation_mark.has_value()) {
 		return true;
 	}

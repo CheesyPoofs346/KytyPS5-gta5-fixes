@@ -706,8 +706,21 @@ void GuestGpu::WaitForIdle() {
 	CaptureTimer capture_timer {CaptureBucket::WaitIdle};
 	const auto        start = std::chrono::steady_clock::now();
 	Common::LockGuard lock(m_queue_mutex);
+	// Attribute each waiting slice to exactly one predicate, so the three sub-buckets are
+	// mutually non-overlapping and sum to the enclosing WaitIdle rather than duplicating it.
+	// Priority is fixed so a slice is never counted twice when several predicates hold.
+	auto slice_start = std::chrono::steady_clock::now();
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+		const auto cause = !m_commands.empty()      ? CaptureBucket::WaitIdleCommands
+		                   : m_submission_count != 0 ? CaptureBucket::WaitIdleSubmissions
+		                                             : CaptureBucket::WaitIdleProcessing;
 		m_idle.Wait(&m_queue_mutex);
+		const auto slice_end = std::chrono::steady_clock::now();
+		CaptureAccount(cause, static_cast<uint64_t>(
+		                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              slice_end - slice_start)
+		                              .count()));
+		slice_start = slice_end;
 	}
 	g_guest_blocked_ns.fetch_add(
 	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -968,7 +981,7 @@ void CommandProcessor::SuspendPm4() {
 
 void CommandProcessor::ProcessPm4(Pm4Execution& execution, size_t stop_depth) {
 	// Inclusive of any blocking a handler does; the wait-* buckets below break that out.
-	CaptureTimer capture_timer {CaptureBucket::Pm4Exec};
+	CaptureOutermostTimer capture_timer {CaptureBucket::Pm4Exec};
 	while (execution.m_buffer_stack.size() > stop_depth) {
 		if (g_gpu_state != nullptr) {
 			g_gpu_state->ProcessCommands();
