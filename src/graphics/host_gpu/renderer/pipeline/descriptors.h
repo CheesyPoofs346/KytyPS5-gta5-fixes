@@ -73,6 +73,13 @@ struct GraphicsBindings {
 // Recycles a PreparedBindings' heap buffers for reuse by the next draw. Safe because only the
 // buffers move; the object keeps value semantics.
 void ReturnPooledBindingStorage(PreparedBindings& prepared);
+// Exposed as the pair of the above so an offline benchmark can exercise the REAL recycling
+// path rather than a re-implementation of it.
+void TakePooledStorage(PreparedBindings& prepared);
+// Test/benchmark accessors for the pool's occupancy and its cap.
+[[nodiscard]] size_t PreparedBindingsPoolSize();
+[[nodiscard]] size_t PreparedBindingsPoolCap();
+void                 ClearPreparedBindingsPool();
 
 // Clears the per-draw buffer resolution cache. MUST be called at the start of every draw: the
 // guest can write buffer memory between draws, so a resolution is only valid within one.

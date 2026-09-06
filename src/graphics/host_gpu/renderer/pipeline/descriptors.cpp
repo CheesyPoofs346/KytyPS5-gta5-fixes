@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
+#include "graphics/host_gpu/renderer/drawBatchQueue.h"   // kMaxBatchDraws
 
 #include "common/assert.h"
 #include <xxhash.h>
@@ -1015,10 +1016,28 @@ struct BindingStorage {
 	std::vector<uint32_t>       user_data;
 };
 
+// Sized for SERIAL draws: one stage object was live at a time. Batched acquisition builds every
+// draw's bindings before recording consumes any, so up to 2 * kMaxBatchDraws coexist while the
+// pool retained 8 - the rest of every batch allocated fresh and was then dropped on return.
+//
+// Measured offline against the real functions at the observed 73.9 draws/batch:
+//   1120 allocations and 138,880 bytes per drain, 0.0901 ms.
+// At 4350 draws/frame that is ~58.9 drains, so ~66,000 allocations and ~5.3 ms per frame.
+//
+// Cap now covers a full batch of both stages. Steady-state retention measured at 512 slots is
+// ~488 KB, which is the price of not re-allocating them every drain.
+constexpr size_t kStoragePoolCap = 2 * DrawBatchQueue::kMaxBatchDraws;
+
+// One pathological draw must not pin a huge buffer in the pool forever. A slot whose vectors
+// have grown past this is released rather than retained; the common small shapes are unaffected.
+constexpr size_t kStoragePoolMaxRetainedElements = 4096;
+
 std::vector<BindingStorage>& StoragePool() {
 	static thread_local std::vector<BindingStorage> pool;
 	return pool;
 }
+
+} // namespace
 
 // Seed a fresh PreparedBindings with recycled buffers (empty, but with capacity).
 void TakePooledStorage(PreparedBindings& prepared) {
@@ -1046,11 +1065,31 @@ void TakePooledStorage(PreparedBindings& prepared) {
 	prepared.user_data          = std::move(slot.user_data);
 }
 
-} // namespace
+size_t PreparedBindingsPoolSize() {
+	return StoragePool().size();
+}
+
+size_t PreparedBindingsPoolCap() {
+	return kStoragePoolCap;
+}
+
+void ClearPreparedBindingsPool() {
+	StoragePool().clear();
+}
 
 void ReturnPooledBindingStorage(PreparedBindings& prepared) {
 	auto& pool = StoragePool();
-	if (pool.size() >= 8) {
+	if (pool.size() >= kStoragePoolCap) {
+		return;
+	}
+	// Oversized buffers are dropped rather than pooled: retention is bounded by cap AND by size.
+	const auto too_big = [](size_t capacity) {
+		return capacity > kStoragePoolMaxRetainedElements;
+	};
+	if (too_big(prepared.resources.buffers.capacity()) ||
+	    too_big(prepared.resources.images.capacity()) ||
+	    too_big(prepared.buffer_descriptors.capacity()) ||
+	    too_big(prepared.flattened_srt.capacity()) || too_big(prepared.user_data.capacity())) {
 		return;
 	}
 	BindingStorage slot;
