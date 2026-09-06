@@ -1,6 +1,7 @@
 #ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_TEXTURECACHE_H_
 
+#include <atomic>
 #include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "common/abi.h"
 #include "common/common.h"
@@ -56,7 +57,11 @@ public:
 	// Bumped whenever an ImageId can be invalidated for other holders: insertion can trigger
 	// overlap merging, and FreeImage retires an id outright. A pre-resolved handle taken before
 	// a bump must be re-resolved rather than trusted.
-	[[nodiscard]] uint64_t ImageInvalidationGeneration() const { return m_image_generation; }
+	[[nodiscard]] uint64_t ImageInvalidationGeneration() const {
+		return m_image_generation.load(std::memory_order_acquire);
+	}
+	// Bumped under m_lock by every operation that can invalidate a retained {id, view} pair.
+	void NoteImageInvalidation() { m_image_generation.fetch_add(1, std::memory_order_release); }
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
@@ -123,7 +128,9 @@ public:
 	[[nodiscard]] bool HasPendingClears() const noexcept { return !m_pending_clears.empty(); }
 
 private:
-	uint64_t m_image_generation = 0;   // see ImageInvalidationGeneration()
+	// Atomic: workers read it while other threads bump it under m_lock. A plain uint64_t here
+	// was a data race, and a race cannot be repaired by checking the value afterwards.
+	std::atomic<uint64_t> m_image_generation {0};
 	enum class TransferDirection { Upload, Download };
 	struct ColorTransferPlan;
 	struct DownloadPlan;

@@ -1,3 +1,4 @@
+#include <chrono>
 #include "graphics/host_gpu/renderer/drawBatchQueue.h"
 
 #include "common/emulatorConfig.h"
@@ -29,6 +30,10 @@ struct DrainCensus {
 	uint64_t bind_cyc      = 0;   // phase 2c, parallel binding (every lookup hits)
 	uint64_t record_cyc    = 0;   // phase 3, serial recording
 	uint64_t buckets[6]    = {};  // 1, 2-4, 5-16, 17-64, 65-255, 256
+	// Wall anchor so phases can be reported in ABSOLUTE ms. Percentages alone are unusable for
+	// an A/B: their denominator is the sum of the phases, which the change itself moves.
+	std::chrono::steady_clock::time_point wall_start {};
+	uint64_t                              tsc_start = 0;
 };
 
 thread_local DrainCensus t_drain;
@@ -52,6 +57,23 @@ void ReportDrainCensus() {
 	if (t_drain.drains % 2000 != 0) {
 		return;
 	}
+	// Convert cycles to time against measured wall elapsed, assuming no TSC frequency.
+	const auto now_tsc = __builtin_ia32_rdtsc();
+	const auto wall_ns = t_drain.wall_start.time_since_epoch().count() == 0
+	                         ? 0.0
+	                         : std::chrono::duration<double, std::nano>(
+	                               std::chrono::steady_clock::now() - t_drain.wall_start)
+	                               .count();
+	const auto tsc_span     = static_cast<double>(now_tsc - t_drain.tsc_start);
+	const auto ns_per_cycle = (tsc_span > 0.0 && wall_ns > 0.0) ? wall_ns / tsc_span : 0.0;
+	const auto ms           = [&](uint64_t cyc) {
+        return static_cast<double>(cyc) * ns_per_cycle / 1e6;
+	};
+	std::printf("DrainMs[window %.2f s]: phase1=%.1f phase2a=%.1f phase2b_ACQUIRE=%.1f "
+	            "phase2c=%.1f phase3_RECORD=%.1f ms | draws=%llu\n",
+	            wall_ns / 1e9, ms(t_drain.prepare_cyc), ms(t_drain.parallel_cyc),
+	            ms(t_drain.acquire_cyc), ms(t_drain.bind_cyc), ms(t_drain.record_cyc),
+	            static_cast<unsigned long long>(t_drain.draws));
 	const auto drains = static_cast<double>(t_drain.drains);
 	const auto total  = static_cast<double>(t_drain.prepare_cyc + t_drain.parallel_cyc +
                                            t_drain.acquire_cyc + t_drain.bind_cyc +
@@ -80,6 +102,10 @@ void ReportDrainCensus() {
 } // namespace
 
 void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
+	if (t_drain.wall_start.time_since_epoch().count() == 0) {
+		t_drain.wall_start = std::chrono::steady_clock::now();
+		t_drain.tsc_start  = __builtin_ia32_rdtsc();
+	}
 	if (m_draws.empty()) {
 		return;
 	}

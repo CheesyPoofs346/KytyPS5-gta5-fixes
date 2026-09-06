@@ -186,7 +186,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	m_image_generation++;   // any holder's ImageId may now be stale
+	NoteImageInvalidation();   // any holder's ImageId may now be stale
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
@@ -233,6 +233,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	NoteImageInvalidation();   // binding validity changed without insert/free
 	image.registered = false;
 }
 
@@ -272,7 +273,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
-	m_image_generation++;   // any holder's ImageId may now be stale
+	NoteImageInvalidation();   // any holder's ImageId may now be stale
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -759,6 +760,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
+		NoteImageInvalidation();   // binding validity changed without insert/free
 		cached.binding.needs_rebind = true;
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
@@ -887,6 +889,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				// rediscovered and re-rendered. Adding a CopyImageMip looked like a fix for "lost"
 				// rendered pixels, but that premise is wrong - see CheckUnifiedTextureCacheFlow, which
 				// asserts discard-and-reload-from-guest-memory is intentional in this cache.
+				NoteImageInvalidation();   // binding validity changed without insert/free
 				cached.binding.needs_rebind = true;
 				if (merged_id) {
 					m_slot_images[merged_id].binding.is_target = true;
@@ -999,6 +1002,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	auto&      source      = m_slot_images[source_id];
 	expanded.usage         = source.usage;
 	if (source.binding.is_bound || source.binding.is_target) {
+		NoteImageInvalidation();   // binding validity changed without insert/free
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id,
