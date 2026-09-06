@@ -361,6 +361,16 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (options.config.eop_flush_interval == 0) {
 				options.config.eop_flush_interval = 1;
 			}
+		} else if (arg == "--backing-fast-path") {
+			if (!ParseBool(value, options.config.backing_fast_path)) {
+				::printf("invalid boolean for --backing-fast-path\n");
+				return false;
+			}
+		} else if (arg == "--backing-lock-sample") {
+			if (!ParseBool(value, options.config.backing_lock_sample)) {
+				::printf("invalid boolean for --backing-lock-sample\n");
+				return false;
+			}
 		} else if (arg == "--warmup-frames") {
 			options.config.warmup_frames =
 			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));

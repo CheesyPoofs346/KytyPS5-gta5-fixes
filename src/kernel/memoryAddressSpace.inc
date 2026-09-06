@@ -29,6 +29,104 @@ static bool CoalescePlaceholders(uint64_t vaddr, uint64_t size) {
 }
 #endif
 
+// Coverage and fallback accounting for the backing transfer fast path. Thread_local plain
+// integers: no atomics, no allocation, so enabling the fast path does not itself change the
+// contention being measured.
+struct BackingTransferStats {
+	uint64_t fast_path          = 0;   // whole request inside one backing range: one lookup
+	uint64_t two_pass           = 0;   // spanned ranges: original validate-then-transfer path
+	uint64_t fallback_spanning  = 0;   // fast path declined, fell through to two-pass
+	uint64_t fallback_unmapped  = 0;   // some byte of the range is not mapped
+	uint64_t fallback_range_bad = 0;   // backing offset/size outside the store
+	uint64_t rejected           = 0;   // rejected before any lookup
+
+	// Sampled lock diagnostic, only populated when backing_lock_sample is set.
+	uint64_t sampled       = 0;
+	uint64_t acquire_ns    = 0;
+	uint64_t hold_ns       = 0;
+
+	void MaybeReport() {
+		const auto total = fast_path + two_pass;
+		if (total == 0 || (total % 2000000) != 0) {
+			return;
+		}
+		std::printf("BackingTransfer: fast=%llu (%.1f%%) two-pass=%llu | fallback spanning=%llu "
+		            "unmapped=%llu range-bad=%llu rejected=%llu\n",
+		            static_cast<unsigned long long>(fast_path),
+		            100.0 * static_cast<double>(fast_path) / static_cast<double>(total),
+		            static_cast<unsigned long long>(two_pass),
+		            static_cast<unsigned long long>(fallback_spanning),
+		            static_cast<unsigned long long>(fallback_unmapped),
+		            static_cast<unsigned long long>(fallback_range_bad),
+		            static_cast<unsigned long long>(rejected));
+		if (sampled != 0) {
+			std::printf("BackingLock[SAMPLED 1/256, diagnostic only]: n=%llu  acquire avg=%.3f us  "
+			            "hold avg=%.3f us  -> %.1f%% of sampled lock time was waiting\n",
+			            static_cast<unsigned long long>(sampled),
+			            static_cast<double>(acquire_ns) / static_cast<double>(sampled) / 1e3,
+			            static_cast<double>(hold_ns) / static_cast<double>(sampled) / 1e3,
+			            (acquire_ns + hold_ns) > 0
+			                ? 100.0 * static_cast<double>(acquire_ns) /
+			                      static_cast<double>(acquire_ns + hold_ns)
+			                : 0.0);
+		}
+		std::fflush(stdout);
+	}
+};
+
+inline BackingTransferStats& BackingStats() {
+	static thread_local BackingTransferStats stats;
+	return stats;
+}
+
+// Samples acquisition wait against hold time on 1 in 256 acquisitions. Timing every acquisition
+// would distort the hottest lock in the process, which is precisely what is under investigation,
+// so this is diagnostic-only and must stay off in performance captures.
+class BackingLockScope {
+public:
+	BackingLockScope() {
+		if (!Config::BackingLockSample()) {
+			return;
+		}
+		auto& stats = BackingStats();
+		if ((++m_counter & 0xffu) != 0) {
+			return;
+		}
+		m_sampling = true;
+		m_start    = std::chrono::steady_clock::now();
+		(void)stats;
+	}
+
+	// Called immediately after the lock is held: everything before is wait, after is hold.
+	void Acquired() {
+		if (!m_sampling) {
+			return;
+		}
+		m_acquired = std::chrono::steady_clock::now();
+	}
+
+	~BackingLockScope() {
+		if (!m_sampling) {
+			return;
+		}
+		const auto now   = std::chrono::steady_clock::now();
+		auto&      stats = BackingStats();
+		stats.sampled++;
+		stats.acquire_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(m_acquired - m_start).count());
+		stats.hold_ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_acquired).count());
+	}
+
+	KYTY_CLASS_NO_COPY(BackingLockScope);
+
+private:
+	static inline thread_local uint32_t   m_counter = 0;
+	bool                                  m_sampling = false;
+	std::chrono::steady_clock::time_point m_start;
+	std::chrono::steady_clock::time_point m_acquired;
+};
+
 class GuestBackingStore {
 public:
 	enum class FailureReason {
@@ -482,19 +580,53 @@ private:
 	template <typename Transfer>
 	bool TryTransferBacking(uint64_t vaddr, uint64_t size, Transfer transfer) {
 		if (!IsAvailable() || size == 0 || UINT64_MAX - vaddr < size) {
+			BackingStats().rejected++;
 			return false;
 		}
 
-		std::lock_guard lock(m_mutex);
-		const auto      end     = vaddr + size;
-		auto            current = vaddr;
+		BackingLockScope lock_scope;
+		std::lock_guard  lock(m_mutex);
+		lock_scope.Acquired();
+
+		// Fast path: the overwhelming majority of requests lie entirely inside one backing
+		// range, and FindContainingUnlocked already tests exactly that - it returns true only
+		// when vaddr + size <= entry.vaddr + entry.size. So one lookup answers the question the
+		// two passes below answer with two. Nothing about locking or visibility changes; this
+		// only removes a redundant second traversal of the same map under the same lock.
+		//
+		// No-partial-copy is preserved by construction: the single transfer happens only after
+		// RangeOk has validated the whole range, so there is no state in which some bytes are
+		// written and false is returned.
+		if (Config::BackingFastPath()) {
+			MapEntry entry {};
+			if (FindContainingUnlocked(vaddr, size, &entry)) {
+				const auto offset = entry.backing_offset + vaddr - entry.vaddr;
+				if (!RangeOk(offset, size)) {
+					BackingStats().fallback_range_bad++;
+					return false;
+				}
+				BackingStats().fast_path++;
+				transfer(m_backing_base + offset, 0, static_cast<size_t>(size));
+				BackingStats().MaybeReport();
+				return true;
+			}
+			// Not contained in a single range: either it spans several mappings or part of it
+			// is unmapped. Both are handled by the original two-pass path below, which
+			// validates everything before transferring anything.
+			BackingStats().fallback_spanning++;
+		}
+
+		const auto end     = vaddr + size;
+		auto       current = vaddr;
 		while (current < end) {
 			MapEntry entry {};
 			if (!FindContainingUnlocked(current, 1, &entry)) {
+				BackingStats().fallback_unmapped++;
 				return false;
 			}
 			const auto bytes = std::min(end, entry.vaddr + entry.size) - current;
 			if (!RangeOk(entry.backing_offset + current - entry.vaddr, bytes)) {
+				BackingStats().fallback_range_bad++;
 				return false;
 			}
 			current += bytes;
@@ -509,6 +641,8 @@ private:
 			transfer(m_backing_base + offset, current - vaddr, static_cast<size_t>(bytes));
 			current += bytes;
 		}
+		BackingStats().two_pass++;
+		BackingStats().MaybeReport();
 		return true;
 	}
 

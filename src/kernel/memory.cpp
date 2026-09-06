@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/magicEnum.h"
 #include "common/stringUtils.h"
@@ -16,6 +17,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <memory>

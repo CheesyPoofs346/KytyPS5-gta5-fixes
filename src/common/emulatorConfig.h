@@ -100,6 +100,16 @@ struct ConfigOptions {
 	// Frames excluded from the measured route so cold streaming is not counted as steady
 	// state. Samples are still recorded and marked "warmup" in frametimes.csv.
 	uint32_t               warmup_frames                 = 0;
+	// TryTransferBacking takes one global exclusive mutex and looks the mapping up TWICE (a
+	// validate pass then a transfer pass) for every guest memory read. Measured 2.499 us/draw,
+	// 42.78% of the draw path, at ~26k calls/frame across 7 runners. When the whole request
+	// lies in one backing range - which FindContainingUnlocked already tests - one lookup
+	// suffices. Spanning requests keep the two-pass path and its no-partial-copy semantics.
+	bool                   backing_fast_path             = false;
+	// DIAGNOSTIC ONLY. Samples lock acquisition wait against lock hold time on a subset of
+	// acquisitions. Never enable during a performance capture: it times the thing being
+	// measured, on the hottest lock in the process.
+	bool                   backing_lock_sample           = false;
 	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
@@ -212,6 +222,8 @@ bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
 uint32_t StreamRepeatThreshold();
 uint32_t WarmupFrames();
+bool BackingFastPath();
+bool BackingLockSample();
 // Every performance-relevant setting actually in effect, not just CLI overrides.
 void LogEffectiveSettings();
 uint32_t PipelineDepth();
