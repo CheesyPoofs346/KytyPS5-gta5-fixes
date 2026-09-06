@@ -2978,7 +2978,6 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			auto* submixer                    = reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
 			*submixer                         = {};
 			submixer->voice_state.state_flags = Ngs2GetStateFlags(voice);
-			LOGF("\t state_flags = %u\n", submixer->voice_state.state_flags);
 			break;
 		}
 		case Ngs2RackType::CustomMastering: {
@@ -2989,7 +2988,6 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			std::memset(state, 0, state_size);
 			auto* mastering = reinterpret_cast<Ngs2CustomMasteringVoiceState*>(state);
 			mastering->voice_state.state_flags = Ngs2GetStateFlags(voice);
-			LOGF("\t state_flags = %u\n", mastering->voice_state.state_flags);
 			break;
 		}
 		case Ngs2RackType::Sampler:
@@ -3004,7 +3002,6 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 
 			state->state_flags = Ngs2GetStateFlags(voice);
 			if (state_size < sizeof(Ngs2SamplerVoiceState)) {
-				LOGF("\t state_flags = %u\n", state->state_flags);
 				break;
 			}
 
@@ -3015,7 +3012,6 @@ int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* stat
 			sampler->num_decoded_samples = 0;
 			sampler->user_data           = 0;
 			sampler->waveform_data       = nullptr;
-			LOGF("\t state_flags = %u\n", sampler->voice_state.state_flags);
 			break;
 		}
 		default: EXIT("unknown type: %s\n", Common::EnumName(voice->rack->type).c_str());
@@ -3035,8 +3031,6 @@ int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state
 	Common::LockGuard lock(voice->rack->ngs->mutex);
 
 	*state_flags = Ngs2GetStateFlags(voice);
-
-	LOGF("\t state_flags = %u\n", *state_flags);
 
 	return OK;
 }
