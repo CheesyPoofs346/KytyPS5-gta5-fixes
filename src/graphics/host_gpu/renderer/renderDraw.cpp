@@ -40,6 +40,9 @@
 #include <chrono>
 #include <bit>
 #include <cmath>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
@@ -1808,6 +1811,7 @@ private:
 			// Snapshot every capture bucket here so they are reported as route-scoped deltas
 			// rather than process-cumulative totals contaminated by boot.
 			CaptureSnapshotBaseline();
+			DrawProfileSnapshotRoute();
 			std::printf("FrameStats: ROUTE_START consumed at sample %zu; that interval straddles the\n            boundary and is excluded, route begins at sample %zu\n",
 			            m_route_begin, m_route_begin + 1);
 			std::fflush(stdout);
@@ -1936,6 +1940,20 @@ private:
 			            static_cast<unsigned long long>(calls),
 			            static_cast<double>(ns) / static_cast<double>(calls) / 1e3,
 			            inflight_now != 0 ? "  [in flight now]" : "");
+			// For a bucket that samples thread CPU time, elapsed - cpu on the SAME thread over
+			// the SAME interval is time that thread was not running. This subtraction is valid
+			// because both sides share a thread and an interval and cannot overlap.
+			const auto cpu_now = g_capture_cpu_ns[i].load(std::memory_order_relaxed);
+			const auto cpu_ns =
+			    g_capture_base_taken ? cpu_now - g_capture_base_cpu_ns[i] : cpu_now;
+			if (cpu_ns != 0) {
+				std::printf("  %-14s   thread CPU=%.1f ms of %.1f ms elapsed -> %.1f%% running, "
+				            "%.1f ms NOT running (same thread, same interval)\n",
+				            "", static_cast<double>(cpu_ns) / 1e6, static_cast<double>(ns) / 1e6,
+				            ns > 0 ? 100.0 * static_cast<double>(cpu_ns) / static_cast<double>(ns)
+				                   : 0.0,
+				            static_cast<double>(ns - std::min(ns, cpu_ns)) / 1e6);
+			}
 			if (span_ns != 0 || spanning != 0) {
 				std::printf("  %-14s   of which %.1f ms over %llu interval(s) began before "
 				            "ROUTE_START -- NOT route-contained\n",
@@ -1943,7 +1961,27 @@ private:
 				            static_cast<unsigned long long>(span_calls));
 			}
 		}
+		// Aggregate worker time divided by worker count is an AVERAGE and hides imbalance, so
+		// report the distribution across runners instead.
+		{
+			std::vector<double> runner_ms;
+			for (size_t r = 0; r < kCaptureMaxRunners; ++r) {
+				const auto now_ns = g_runner_exec_ns[r].load(std::memory_order_relaxed);
+				const auto delta  = g_capture_base_taken ? now_ns - g_runner_base_ns[r] : now_ns;
+				if (delta != 0) {
+					runner_ms.push_back(static_cast<double>(delta) / 1e6);
+				}
+			}
+			if (!runner_ms.empty()) {
+				std::sort(runner_ms.begin(), runner_ms.end());
+				std::printf("  runner busy-ms over %zu active runners: min=%.1f med=%.1f max=%.1f"
+				            "  (distribution, NOT an average - imbalance is visible here)\n",
+				            runner_ms.size(), runner_ms.front(), runner_ms[runner_ms.size() / 2],
+				            runner_ms.back());
+			}
+		}
 		std::fflush(stdout);
+		DrawProfileReportRoute();
 	}
 
 	std::vector<Sample> m_samples;
@@ -2964,6 +3002,127 @@ void FrameStatsNoteBoundary() {
 
 void FrameStatsReportFinal() {
 	g_frame_stats.ReportFinal();
+}
+
+
+// Thread CPU time (kernel+user) for the calling thread, in nanoseconds. Windows GetThreadTimes
+// reports in 100 ns units. Sampled only by CaptureOutermostTimer (about 10k calls in a route),
+// so the syscall cost is negligible against the intervals being measured.
+uint64_t DrawProfileThreadCpuNs() {
+#ifdef _WIN32
+	FILETIME creation {};
+	FILETIME exit {};
+	FILETIME kernel {};
+	FILETIME user {};
+	if (GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user) == 0) {
+		return 0;
+	}
+	const auto to_ns = [](const FILETIME& ft) {
+		return ((static_cast<uint64_t>(ft.dwHighDateTime) << 32u) |
+		        static_cast<uint64_t>(ft.dwLowDateTime)) *
+		       100ull;
+	};
+	return to_ns(kernel) + to_ns(user);
+#else
+	return 0;
+#endif
+}
+
+// Each thread that runs draws adds its thread_local profile to the registry once, with its
+// thread id preserved, so the report can attribute phases per thread instead of collapsing
+// them into a single anonymous cumulative mean.
+void DrawProfileRegister() {
+	static thread_local bool registered = false;
+	if (registered) {
+		return;
+	}
+	registered = true;
+	std::scoped_lock lock(g_draw_profile_registry_lock);
+	DrawProfileRegistryEntry entry;
+	entry.state     = &g_draw_profile;
+#ifdef _WIN32
+	entry.thread_id = static_cast<uint32_t>(GetCurrentThreadId());
+#endif
+	g_draw_profile_registry.push_back(entry);
+}
+
+// Snapshot every registered thread's phase counters at ROUTE_START.
+void DrawProfileSnapshotRoute() {
+	std::scoped_lock lock(g_draw_profile_registry_lock);
+	for (auto& entry: g_draw_profile_registry) {
+		if (entry.state == nullptr) {
+			continue;
+		}
+		entry.base_cycles = entry.state->cycles;
+		entry.base_draws  = entry.state->draws;
+	}
+}
+
+// Per-thread, route-scoped phase attribution.
+//
+// Total is the INCLUSIVE per-draw zone; the child phases nest inside it. Only non-child
+// phases are summed, and the residual is reported as UNMATCHED rather than being silently
+// distributed. Draw counts are the actual summed per-thread deltas, never an interval count
+// multiplied by a representative draw count.
+void DrawProfileReportRoute() {
+	std::scoped_lock lock(g_draw_profile_registry_lock);
+	if (g_draw_profile_registry.empty()) {
+		std::printf("DrawPhases: no threads registered (was --draw-profile set?)\n");
+		std::fflush(stdout);
+		return;
+	}
+	std::printf("DrawPhases[route-scoped, per thread]: elapsed-time zones only. More zones can\n"
+	            "  locate an expensive function but cannot by themselves separate computation\n"
+	            "  from blocking inside it -- compare against the thread CPU time above.\n");
+	for (const auto& entry: g_draw_profile_registry) {
+		if (entry.state == nullptr) {
+			continue;
+		}
+		const auto draws = entry.state->draws - entry.base_draws;
+		if (draws == 0) {
+			continue;
+		}
+		const auto total_idx = static_cast<size_t>(DrawPhase::Total);
+		const auto total_cycles =
+		    entry.state->cycles[total_idx] - entry.base_cycles[total_idx];
+		std::printf("  thread %-6u draws=%-10llu  TOTAL(inclusive)=%llu cyc\n", entry.thread_id,
+		            static_cast<unsigned long long>(draws),
+		            static_cast<unsigned long long>(total_cycles));
+		uint64_t summed = 0;
+		for (size_t i = 0; i < static_cast<size_t>(DrawPhase::Count); ++i) {
+			const auto phase = static_cast<DrawPhase>(i);
+			if (phase == DrawPhase::Total) {
+				continue;
+			}
+			const auto cycles = entry.state->cycles[i] - entry.base_cycles[i];
+			if (cycles == 0) {
+				continue;
+			}
+			const bool child = DrawPhaseIsChild(phase);
+			if (!child) {
+				summed += cycles;
+			}
+			std::printf("      %-28s %10llu cyc  %6.2f%% of total  %s\n", DrawPhaseName(phase),
+			            static_cast<unsigned long long>(cycles),
+			            total_cycles > 0 ? 100.0 * static_cast<double>(cycles) /
+			                                   static_cast<double>(total_cycles)
+			                             : 0.0,
+			            child ? "[nested child - NOT summed]" : "");
+		}
+		std::printf("      %-28s %10llu cyc  %6.2f%% of total\n", "sum of non-child phases",
+		            static_cast<unsigned long long>(summed),
+		            total_cycles > 0
+		                ? 100.0 * static_cast<double>(summed) / static_cast<double>(total_cycles)
+		                : 0.0);
+		std::printf("      %-28s %10lld cyc  %6.2f%% of total  <- not attributed to any phase\n",
+		            "UNMATCHED",
+		            static_cast<long long>(total_cycles) - static_cast<long long>(summed),
+		            total_cycles > 0 ? 100.0 * (static_cast<double>(total_cycles) -
+		                                        static_cast<double>(summed)) /
+		                                   static_cast<double>(total_cycles)
+		                             : 0.0);
+	}
+	std::fflush(stdout);
 }
 
 } // namespace Libs::Graphics

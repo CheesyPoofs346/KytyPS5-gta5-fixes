@@ -133,6 +133,9 @@ void DrawWorkerPool::WorkerLoop(uint32_t index, std::stop_token stop) {
 		}
 		{
 		CaptureTimer capture_timer {CaptureBucket::WorkerExec};
+		// Per-runner elapsed time, so the report can show the distribution across workers
+		// rather than an average that hides imbalance.
+		const auto runner_start = std::chrono::steady_clock::now();
 		for (;;) {
 			const auto item = m_next.fetch_add(1, std::memory_order_relaxed);
 			if (item >= m_count) {
@@ -141,6 +144,11 @@ void DrawWorkerPool::WorkerLoop(uint32_t index, std::stop_token stop) {
 			g_items_by_runner[index].fetch_add(1, std::memory_order_relaxed);
 			(*body)(item, index);
 		}
+		g_runner_exec_ns[std::min<size_t>(index, kCaptureMaxRunners - 1)].fetch_add(
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                              std::chrono::steady_clock::now() - runner_start)
+		                              .count()),
+		    std::memory_order_relaxed);
 		}
 		if (m_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
 			std::lock_guard lock(m_mutex);

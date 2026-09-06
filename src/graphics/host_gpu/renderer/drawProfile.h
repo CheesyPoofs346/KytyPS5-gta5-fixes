@@ -5,6 +5,8 @@
 
 #include <atomic>
 #include <array>
+#include <vector>
+#include <mutex>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -175,6 +177,26 @@ struct DrawProfileState {
 };
 
 inline thread_local DrawProfileState g_draw_profile;
+// The draw phase profile is thread_local and was previously reported per thread on that
+// thread's own cumulative draw count since process start. For attribution we need every
+// thread's state, identified, and scoped to the route - so each thread registers itself and
+// the reporter walks the registry.
+struct DrawProfileRegistryEntry {
+	DrawProfileState* state     = nullptr;
+	uint32_t          thread_id = 0;
+	// Route baselines, captured at ROUTE_START.
+	std::array<uint64_t, static_cast<size_t>(DrawPhase::Count)> base_cycles {};
+	uint64_t                                                    base_draws = 0;
+};
+
+inline std::mutex                            g_draw_profile_registry_lock;
+inline std::vector<DrawProfileRegistryEntry> g_draw_profile_registry;
+
+void DrawProfileRegister();
+void DrawProfileSnapshotRoute();
+void DrawProfileReportRoute();
+
+
 
 // Section A diagnostic: separate execution from blocking, per role.
 //
@@ -220,6 +242,26 @@ inline std::array<std::atomic<int64_t>, static_cast<size_t>(CaptureBucket::Count
 inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_ns {};
 inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_calls {};
 inline std::array<int64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_inflight {};
+
+// Thread CPU time (kernel+user) for the CALLING thread. Elapsed time alone cannot separate
+// computation from blocking inside a function; CPU time can, because for one thread over one
+// interval, elapsed - cpu is time the thread was not running. That subtraction is valid
+// precisely because both sides are the same thread and the same interval, with no overlap.
+// Defined out-of-line so the Windows headers stay out of this header.
+uint64_t DrawProfileThreadCpuNs();
+
+// Elapsed and CPU are kept in separate arrays; never mix them into one bucket.
+inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Count)>
+    g_capture_cpu_ns {};
+inline std::array<uint64_t, static_cast<size_t>(CaptureBucket::Count)> g_capture_base_cpu_ns {};
+
+// Per-worker elapsed time. Aggregate worker time divided by worker count is an AVERAGE and
+// says nothing about balance, so the distribution is recorded per runner and reported as
+// min/median/max across runners.
+inline constexpr size_t kCaptureMaxRunners = 33;
+inline std::array<std::atomic<uint64_t>, kCaptureMaxRunners> g_runner_exec_ns {};
+inline std::array<uint64_t, kCaptureMaxRunners>              g_runner_base_ns {};
+
 inline bool g_capture_base_taken = false;
 // Bumped when the baseline is taken. A timer stamps the generation at construction; if it
 // completes under a newer generation it began BEFORE ROUTE_START, so its whole duration
@@ -239,10 +281,15 @@ inline void CaptureSnapshotBaseline() {
 		g_capture_base_ns[i]       = g_capture_ns[i].load(std::memory_order_relaxed);
 		g_capture_base_calls[i]    = g_capture_calls[i].load(std::memory_order_relaxed);
 		g_capture_base_inflight[i] = g_capture_inflight[i].load(std::memory_order_relaxed);
+		g_capture_base_cpu_ns[i]   = g_capture_cpu_ns[i].load(std::memory_order_relaxed);
+	}
+	for (size_t i = 0; i < kCaptureMaxRunners; ++i) {
+		g_runner_base_ns[i] = g_runner_exec_ns[i].load(std::memory_order_relaxed);
 	}
 	g_capture_base_taken = true;
 	g_capture_generation.fetch_add(1, std::memory_order_relaxed);
 }
+
 
 inline void CaptureAccount(CaptureBucket bucket, uint64_t ns) {
 	g_capture_ns[static_cast<size_t>(bucket)].fetch_add(ns, std::memory_order_relaxed);
@@ -309,6 +356,7 @@ public:
 			g_capture_inflight[static_cast<size_t>(bucket)].fetch_add(1,
 			                                                          std::memory_order_relaxed);
 			m_gen = g_capture_generation.load(std::memory_order_relaxed);
+			m_cpu_start = DrawProfileThreadCpuNs();
 		}
 	}
 	~CaptureOutermostTimer() {
@@ -317,6 +365,9 @@ public:
 			return;
 		}
 		g_capture_inflight[static_cast<size_t>(m_bucket)].fetch_sub(1, std::memory_order_relaxed);
+		const auto cpu_end = DrawProfileThreadCpuNs();
+		g_capture_cpu_ns[static_cast<size_t>(m_bucket)].fetch_add(
+		    cpu_end - std::min(cpu_end, m_cpu_start), std::memory_order_relaxed);
 		CaptureAccountStamped(m_bucket,
 		                      static_cast<uint64_t>(
 		                          std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -332,6 +383,7 @@ private:
 	    t_depth {};
 	CaptureBucket                         m_bucket;
 	uint64_t                              m_gen       = 0;
+	uint64_t                              m_cpu_start = 0;
 	bool                                  m_outermost = false;
 	std::chrono::steady_clock::time_point m_start;
 };
@@ -399,6 +451,7 @@ inline void DrawProfileBeginDraw() {
 	if (!profile.active) {
 		return;
 	}
+	DrawProfileRegister();
 	if (!profile.started) {
 		profile.started    = true;
 		profile.wall_start = std::chrono::steady_clock::now();
