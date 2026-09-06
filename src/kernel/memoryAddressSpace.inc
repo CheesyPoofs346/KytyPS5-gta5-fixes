@@ -41,9 +41,45 @@ struct BackingTransferStats {
 	uint64_t rejected           = 0;   // rejected before any lookup
 
 	// Sampled lock diagnostic, only populated when backing_lock_sample is set.
-	uint64_t sampled       = 0;
-	uint64_t acquire_ns    = 0;
-	uint64_t hold_ns       = 0;
+	//
+	// SAMPLING METHOD: probabilistic, not periodic. A fixed every-Nth rule can phase-lock with a
+	// recurring call pattern (the per-draw buffer loop is highly regular), so the sample would
+	// systematically land on the same position in that pattern. A thread_local xorshift picks
+	// each sample independently at ~1/256, which removes that correlation but leaves ordinary
+	// sampling error - so totals extrapolated from these are ESTIMATES, not measurements.
+	//
+	// Individual samples are retained (bounded reservoir) so the report can show a distribution;
+	// an average alone cannot distinguish steady moderate waits from rare enormous ones.
+	static constexpr size_t kReservoir = 4096;
+	uint32_t                thread_id  = 0;
+	uint64_t                sampled    = 0;   // samples actually taken
+	uint64_t                eligible   = 0;   // acquisitions seen while sampling was enabled
+	size_t                  stored     = 0;
+	std::array<uint32_t, kReservoir> acquire_ns {};
+	std::array<uint32_t, kReservoir> hold_ns {};
+
+	void AddSample(uint64_t acquire, uint64_t hold) {
+		sampled++;
+		if (stored < kReservoir) {
+			acquire_ns[stored] = static_cast<uint32_t>(std::min<uint64_t>(acquire, UINT32_MAX));
+			hold_ns[stored]    = static_cast<uint32_t>(std::min<uint64_t>(hold, UINT32_MAX));
+			stored++;
+		}
+	}
+
+	static void Quantiles(std::array<uint32_t, kReservoir>& v, size_t n, const char* label,
+	                      uint32_t tid) {
+		if (n == 0) {
+			return;
+		}
+		std::sort(v.begin(), v.begin() + static_cast<long>(n));
+		const auto at = [&](double q) {
+			return v[std::min(n - 1, static_cast<size_t>(q * static_cast<double>(n - 1) + 0.5))];
+		};
+		std::printf("    thread %-6u %-8s n=%-6zu min=%.3f med=%.3f p95=%.3f p99=%.3f max=%.3f us\n",
+		            tid, label, n, at(0.0) / 1e3, at(0.50) / 1e3, at(0.95) / 1e3, at(0.99) / 1e3,
+		            at(1.0) / 1e3);
+	}
 
 	void MaybeReport() {
 		const auto total = fast_path + two_pass;
@@ -60,15 +96,16 @@ struct BackingTransferStats {
 		            static_cast<unsigned long long>(fallback_range_bad),
 		            static_cast<unsigned long long>(rejected));
 		if (sampled != 0) {
-			std::printf("BackingLock[SAMPLED 1/256, diagnostic only]: n=%llu  acquire avg=%.3f us  "
-			            "hold avg=%.3f us  -> %.1f%% of sampled lock time was waiting\n",
-			            static_cast<unsigned long long>(sampled),
-			            static_cast<double>(acquire_ns) / static_cast<double>(sampled) / 1e3,
-			            static_cast<double>(hold_ns) / static_cast<double>(sampled) / 1e3,
-			            (acquire_ns + hold_ns) > 0
-			                ? 100.0 * static_cast<double>(acquire_ns) /
-			                      static_cast<double>(acquire_ns + hold_ns)
-			                : 0.0);
+			std::printf("BackingLock[DIAGNOSTIC ONLY, probabilistic ~1/256 per acquisition]:\n"
+			            "    eligible acquisitions=%llu  sampled=%llu  retained=%zu\n"
+			            "    distributions are per thread; totals extrapolated from these are\n"
+			            "    ESTIMATES, and this run is not comparable to a performance capture.\n",
+			            static_cast<unsigned long long>(eligible),
+			            static_cast<unsigned long long>(sampled), stored);
+			auto acquire_copy = acquire_ns;
+			auto hold_copy    = hold_ns;
+			Quantiles(acquire_copy, stored, "acquire", thread_id);
+			Quantiles(hold_copy, stored, "hold", thread_id);
 		}
 		std::fflush(stdout);
 	}
@@ -89,12 +126,22 @@ public:
 			return;
 		}
 		auto& stats = BackingStats();
-		if ((++m_counter & 0xffu) != 0) {
+		stats.eligible++;
+		if (stats.thread_id == 0) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			stats.thread_id = static_cast<uint32_t>(GetCurrentThreadId());
+#endif
+		}
+		// xorshift32: independent ~1/256 draws, so the sample cannot phase-lock with the
+		// highly regular per-draw buffer loop the way a fixed every-Nth rule would.
+		m_rng ^= m_rng << 13u;
+		m_rng ^= m_rng >> 17u;
+		m_rng ^= m_rng << 5u;
+		if ((m_rng & 0xffu) != 0) {
 			return;
 		}
 		m_sampling = true;
 		m_start    = std::chrono::steady_clock::now();
-		(void)stats;
 	}
 
 	// Called immediately after the lock is held: everything before is wait, after is hold.
@@ -109,19 +156,18 @@ public:
 		if (!m_sampling) {
 			return;
 		}
-		const auto now   = std::chrono::steady_clock::now();
-		auto&      stats = BackingStats();
-		stats.sampled++;
-		stats.acquire_ns += static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(m_acquired - m_start).count());
-		stats.hold_ns += static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_acquired).count());
+		const auto now = std::chrono::steady_clock::now();
+		BackingStats().AddSample(
+		    static_cast<uint64_t>(
+		        std::chrono::duration_cast<std::chrono::nanoseconds>(m_acquired - m_start).count()),
+		    static_cast<uint64_t>(
+		        std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_acquired).count()));
 	}
 
 	KYTY_CLASS_NO_COPY(BackingLockScope);
 
 private:
-	static inline thread_local uint32_t   m_counter = 0;
+	static inline thread_local uint32_t   m_rng     = 0x9E3779B9u;
 	bool                                  m_sampling = false;
 	std::chrono::steady_clock::time_point m_start;
 	std::chrono::steady_clock::time_point m_acquired;
