@@ -44,6 +44,7 @@
 #include <windows.h>
 #endif
 #include <cstdio>
+#include <xxhash.h>
 #include <ctime>
 #include <filesystem>
 #include <cstring>
@@ -395,6 +396,193 @@ namespace {
 //
 // Vulkan dynamic state is per COMMAND BUFFER, so the cache is invalidated whenever the handle
 // changes - otherwise a new buffer would inherit state it was never given.
+
+// Section E batching census. Read-only: it changes no rendering and no ordering.
+//
+// Counts MAXIMAL RUNS of consecutive draws that could legally share one host draw call. A run
+// ends when any component that a single call cannot vary changes. Three variants are counted on
+// the same draw stream:
+//
+//   current   every component must match, including which resources are bound
+//   indexed   resource SELECTION may vary (descriptor indexing could represent it); everything
+//             else - pipeline, attachments, dynamic state, index buffer/type, vertex input,
+//             command buffer - must still match
+//   indexed+  as indexed, and per-draw push-constant data may also vary, on the assumption it
+//             moves into an indexed per-draw record selected by drawBase + gl_DrawID
+//
+// Pipelines are NEVER merged: differing shader specialisation stays a break in every variant.
+// Guest order is preserved - only CONSECUTIVE draws are ever considered, never reordered.
+//
+// A run of N does not remove N-1 draws: it predicts one host CALL covering them. The GPU still
+// executes every draw, and per-draw CPU preparation is only avoided where it is per-call.
+struct BatchCensus {
+	enum Reason : uint32_t {
+		CmdGeneration = 1u << 0u,   // new command buffer: all state must be re-issued
+		Pipeline      = 1u << 1u,
+		RenderTargets = 1u << 2u,
+		IndexBuffer   = 1u << 3u,
+		DynamicState  = 1u << 4u,
+		VertexInput   = 1u << 5u,
+		Descriptors   = 1u << 6u,
+		PushConstants = 1u << 7u,
+		kReasonCount  = 8u,
+	};
+	static constexpr const char* kReasonName[kReasonCount] = {
+	    "command-buffer", "pipeline",    "render-targets", "index-buffer",
+	    "dynamic-state",  "vertex-input", "descriptors",    "push-constants"};
+
+	struct Variant {
+		uint32_t mask       = 0;   // components that end a run in this variant
+		uint64_t runs       = 0;
+		uint64_t draws      = 0;
+		uint64_t current    = 0;
+		uint64_t longest    = 0;
+		std::array<uint64_t, 12> histogram {};   // run lengths 1,2,3,4,5-8,9-16,...
+		void Close() {
+			if (current == 0) {
+				return;
+			}
+			runs++;
+			longest = std::max(longest, current);
+			size_t bucket = 0;
+			auto   n      = current;
+			while (n > 1 && bucket + 1 < histogram.size()) {
+				n >>= 1u;
+				bucket++;
+			}
+			histogram[bucket]++;
+			current = 0;
+		}
+		void Note(uint32_t changed) {
+			if ((changed & mask) != 0) {
+				Close();
+			}
+			current++;
+			draws++;
+		}
+	};
+
+	uint64_t prev_generation = UINT64_MAX;
+	uint64_t prev_pipeline   = 0;
+	uint64_t prev_targets    = 0;
+	uint64_t prev_index      = 0;
+	uint64_t prev_dynamic    = 0;
+	uint64_t prev_vertex     = 0;
+	uint64_t prev_desc       = 0;
+	uint64_t prev_push       = 0;
+	bool     primed          = false;
+
+	Variant                              current_v {0xffu};
+	Variant                              indexed_v {0xffu & ~Descriptors};
+	Variant                              indexed_plus_v {0xffu & ~Descriptors & ~PushConstants};
+	std::array<uint64_t, kReasonCount>   breaks_involving {};
+	std::array<uint64_t, kReasonCount>   breaks_sole {};
+	uint64_t                             total_draws = 0;
+
+	void Note(uint64_t generation, uint64_t pipeline, uint64_t targets, uint64_t index,
+	          uint64_t dynamic, uint64_t vertex, uint64_t desc, uint64_t push) {
+		uint32_t changed = 0;
+		if (!primed) {
+			primed  = true;
+			changed = 0xffu;   // first draw starts every run
+		} else {
+			if (generation != prev_generation) { changed |= CmdGeneration; }
+			if (pipeline != prev_pipeline)     { changed |= Pipeline; }
+			if (targets != prev_targets)       { changed |= RenderTargets; }
+			if (index != prev_index)           { changed |= IndexBuffer; }
+			if (dynamic != prev_dynamic)       { changed |= DynamicState; }
+			if (vertex != prev_vertex)         { changed |= VertexInput; }
+			if (desc != prev_desc)             { changed |= Descriptors; }
+			if (push != prev_push)             { changed |= PushConstants; }
+			// Every applicable reason is counted, not just a first-match, so the per-reason
+			// totals do not add up to the break count and are not presented as if they did.
+			if (changed != 0) {
+				uint32_t set = 0;
+				for (uint32_t i = 0; i < kReasonCount; ++i) {
+					if ((changed & (1u << i)) != 0) {
+						breaks_involving[i]++;
+						set++;
+					}
+				}
+				if (set == 1) {
+					for (uint32_t i = 0; i < kReasonCount; ++i) {
+						if ((changed & (1u << i)) != 0) {
+							breaks_sole[i]++;
+						}
+					}
+				}
+			}
+		}
+		prev_generation = generation;
+		prev_pipeline   = pipeline;
+		prev_targets    = targets;
+		prev_index      = index;
+		prev_dynamic    = dynamic;
+		prev_vertex     = vertex;
+		prev_desc       = desc;
+		prev_push       = push;
+
+		current_v.Note(changed);
+		indexed_v.Note(changed);
+		indexed_plus_v.Note(changed);
+		total_draws++;
+		if ((total_draws % 2000000) == 0) {
+			Report();
+		}
+	}
+
+	static void PrintVariant(const char* name, Variant v) {
+		v.Close();
+		if (v.runs == 0) {
+			return;
+		}
+		const auto mean = static_cast<double>(v.draws) / static_cast<double>(v.runs);
+		std::printf("  %-10s guest draws=%llu -> predicted host calls=%llu  (mean run %.2f, "
+		            "longest %llu)\n",
+		            name, static_cast<unsigned long long>(v.draws),
+		            static_cast<unsigned long long>(v.runs), mean,
+		            static_cast<unsigned long long>(v.longest));
+		std::printf("             run-length histogram (1,2,4,8,...):");
+		for (size_t i = 0; i < v.histogram.size(); ++i) {
+			if (v.histogram[i] != 0) {
+				std::printf(" %zu:%llu", static_cast<size_t>(1u) << i,
+				            static_cast<unsigned long long>(v.histogram[i]));
+			}
+		}
+		std::printf("\n");
+	}
+
+	void Report() const {
+		std::printf("BatchCensus: %llu draws examined. Consecutive only; guest order preserved;\n"
+		            "  pipelines never merged. A run of N predicts ONE host call, it does not\n"
+		            "  remove N-1 draws of GPU work or of per-draw CPU preparation.\n",
+		            static_cast<unsigned long long>(total_draws));
+		PrintVariant("current", current_v);
+		PrintVariant("indexed", indexed_v);
+		PrintVariant("indexed+", indexed_plus_v);
+		std::printf("  break reasons (a break can have several; these do NOT sum to the break "
+		            "count):\n");
+		for (uint32_t i = 0; i < kReasonCount; ++i) {
+			if (breaks_involving[i] == 0) {
+				continue;
+			}
+			std::printf("    %-16s involved=%-10llu sole-cause=%llu\n", kReasonName[i],
+			            static_cast<unsigned long long>(breaks_involving[i]),
+			            static_cast<unsigned long long>(breaks_sole[i]));
+		}
+		std::fflush(stdout);
+	}
+};
+
+BatchCensus& Batch() {
+	static thread_local BatchCensus census;
+	return census;
+}
+
+// Set by CommitBindings just before the descriptors are pushed, on the same recording thread.
+thread_local uint64_t t_batch_desc_hash = 0;
+thread_local uint64_t t_batch_push_hash = 0;
+
 struct DynamicStateCache {
 	// Generation, not handle: command buffers come from a pool and handles are RECYCLED, so an
 	// unchanged handle does not mean the recording is the same one.
@@ -2428,6 +2616,22 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	DrawCensusTick();
 		begin_rendering_timer.Stop();
+		// Section E census, immediately before the draw is emitted: every component that could
+		// end a batch is known and applied by this point. Read-only.
+		if (Config::BatchCensusEnabled()) {
+			const auto& dyn = DynState();
+			Batch().Note(
+			    CurrentCommandGeneration(),
+			    reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline.pipeline)),
+			    XXH3_64bits(&state.rendering, sizeof(state.rendering)),
+			    XXH3_64bits_withSeed(&dyn.index_offset, sizeof(dyn.index_offset),
+			                         reinterpret_cast<uint64_t>(dyn.index_buffer) ^
+			                             dyn.index_type),
+			    XXH3_64bits(&dyn.viewport, sizeof(dyn.viewport)) ^
+			        XXH3_64bits(&dyn.scissor, sizeof(dyn.scissor)),
+			    XXH3_64bits(&state.vs_input_info, sizeof(state.vs_input_info)),
+			    t_batch_desc_hash, t_batch_push_hash);
+		}
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
 	}
@@ -3124,6 +3328,12 @@ void DrawProfileReportRoute() {
 		                             : 0.0);
 	}
 	std::fflush(stdout);
+}
+
+
+void BatchCensusNoteBindings(uint64_t descriptor_hash, uint64_t push_hash) {
+	t_batch_desc_hash = descriptor_hash;
+	t_batch_push_hash = push_hash;
 }
 
 } // namespace Libs::Graphics

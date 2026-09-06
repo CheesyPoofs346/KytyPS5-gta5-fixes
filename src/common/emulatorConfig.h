@@ -110,6 +110,10 @@ struct ConfigOptions {
 	// acquisitions. Never enable during a performance capture: it times the thing being
 	// measured, on the hottest lock in the process.
 	bool                   backing_lock_sample           = false;
+	// Section E batching census: counts maximal runs of consecutive draws that could share one
+	// host call, under the current bindings and under a hypothetical descriptor-indexing scheme.
+	// Read-only; changes no rendering. Adds two hashes per draw, so keep it off for timing.
+	bool                   batch_census                  = false;
 	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
@@ -224,6 +228,7 @@ uint32_t StreamRepeatThreshold();
 uint32_t WarmupFrames();
 bool BackingFastPath();
 bool BackingLockSample();
+bool BatchCensusEnabled();
 // Every performance-relevant setting actually in effect, not just CLI overrides.
 void LogEffectiveSettings();
 uint32_t PipelineDepth();

@@ -361,6 +361,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (options.config.eop_flush_interval == 0) {
 				options.config.eop_flush_interval = 1;
 			}
+		} else if (arg == "--batch-census") {
+			if (!ParseBool(value, options.config.batch_census)) {
+				::printf("invalid boolean for --batch-census\n");
+				return false;
+			}
 		} else if (arg == "--backing-fast-path") {
 			if (!ParseBool(value, options.config.backing_fast_path)) {
 				::printf("invalid boolean for --backing-fast-path\n");

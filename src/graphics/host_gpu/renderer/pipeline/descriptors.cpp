@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/assert.h"
+#include <xxhash.h>
 #include "common/emulatorConfig.h"
 #include "graphics/host_gpu/renderer/drawProfile.h"
 #include "common/common.h"
@@ -1509,6 +1510,30 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			std::copy(prepared->user_data.begin(), prepared->user_data.end(),
 			          PushConstants().begin() + offset / sizeof(uint32_t));
 		}
+	}
+	// Batching census (diagnostic): publish what this draw actually binds, so the recorder can
+	// decide whether the next draw could have joined this one. Hashing the descriptor writes and
+	// the push constants captures resource SELECTION and per-draw data separately, which is the
+	// distinction descriptor indexing turns on.
+	if (Config::BatchCensusEnabled()) {
+		uint64_t desc_hash = 0;
+		for (const auto& w: DescriptorWrites()) {
+			desc_hash = XXH3_64bits_withSeed(&w.dstBinding, sizeof(w.dstBinding), desc_hash);
+			desc_hash = XXH3_64bits_withSeed(&w.descriptorType, sizeof(w.descriptorType), desc_hash);
+			if (w.pBufferInfo != nullptr) {
+				desc_hash = XXH3_64bits_withSeed(w.pBufferInfo,
+				                                 sizeof(vk::DescriptorBufferInfo) *
+				                                     w.descriptorCount,
+				                                 desc_hash);
+			}
+			if (w.pImageInfo != nullptr) {
+				desc_hash = XXH3_64bits_withSeed(
+				    w.pImageInfo, sizeof(vk::DescriptorImageInfo) * w.descriptorCount, desc_hash);
+			}
+		}
+		const auto push_hash = XXH3_64bits(PushConstants().data(),
+		                                   ShaderRecompiler::IR::NativePushConstantSize);
+		BatchCensusNoteBindings(desc_hash, push_hash);
 	}
 	record.pushConstants(pipeline.pipeline_layout, push_constant_stages, 0,
 	                     ShaderRecompiler::IR::NativePushConstantSize, PushConstants().data());

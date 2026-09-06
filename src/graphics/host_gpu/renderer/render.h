@@ -353,6 +353,11 @@ private:
 void FrameStatsNoteBoundary();
 void FrameStatsReportFinal();
 
+
+// Section E batching census: publishes the bound-resource and push-constant hashes for the
+// draw currently being recorded. No-op unless --batch-census is set.
+void BatchCensusNoteBindings(uint64_t descriptor_hash, uint64_t push_hash);
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_GRAPHICSRENDER_H_ */

@@ -39,6 +39,7 @@ static std::atomic<uint32_t> g_stream_repeat_threshold {0};
 static std::atomic<uint32_t> g_warmup_frames {0};
 static std::atomic<bool>     g_backing_fast_path {false};
 static std::atomic<bool>     g_backing_lock_sample {false};
+static std::atomic<bool>     g_batch_census {false};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
@@ -80,6 +81,7 @@ void Load(const ConfigOptions& cfg) {
 	g_warmup_frames.store(cfg.warmup_frames, std::memory_order_relaxed);
 	g_backing_fast_path.store(cfg.backing_fast_path, std::memory_order_relaxed);
 	g_backing_lock_sample.store(cfg.backing_lock_sample, std::memory_order_relaxed);
+	g_batch_census.store(cfg.batch_census, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
@@ -217,6 +219,10 @@ uint32_t EopFlushInterval() {
 
 bool BackingFastPath() {
 	return g_backing_fast_path.load(std::memory_order_relaxed);
+}
+
+bool BatchCensusEnabled() {
+	return g_batch_census.load(std::memory_order_relaxed);
 }
 
 bool BackingLockSample() {
@@ -502,6 +508,7 @@ void LogEffectiveSettings() {
 	std::printf("  %-28s %u\n", "warmup_frames", g_warmup_frames.load(std::memory_order_relaxed));
 	std::printf("  %-28s %s\n", "backing_fast_path", g_backing_fast_path.load(std::memory_order_relaxed) ? "true" : "false");
 	std::printf("  %-28s %s\n", "backing_lock_sample", g_backing_lock_sample.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "batch_census", g_batch_census.load(std::memory_order_relaxed) ? "true" : "false");
 	std::fflush(stdout);
 }
 
