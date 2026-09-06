@@ -594,6 +594,16 @@ struct BatchCensus {
 			            static_cast<unsigned long long>(breaks_involving[i]),
 			            static_cast<unsigned long long>(breaks_sole[i]));
 		}
+		// If boundary-op dominates, the split may be incidental rather than necessary, so name
+		// the operation responsible instead of leaving it as one opaque bucket.
+		std::printf("  boundary operations recorded (which activity ended a run):\n");
+		for (size_t i = 0; i < static_cast<size_t>(BoundarySource::Count); ++i) {
+			const auto n = g_boundary_by_source[i].load(std::memory_order_relaxed);
+			if (n != 0) {
+				std::printf("    %-18s %llu\n", BoundarySourceName(static_cast<BoundarySource>(i)),
+				            static_cast<unsigned long long>(n));
+			}
+		}
 		std::fflush(stdout);
 	}
 };
@@ -3203,6 +3213,9 @@ void FlushSecondaryBatch(RenderContext& context) {
 	g_last_flushed_state = batch.rendering;
 	g_have_last_flushed  = true;
 	auto primary = scheduler.Current().Handle();
+	// A secondary boundary: dynamic state and bindings do not carry across it, so no run
+	// can span two secondaries.
+	NoteBatchBoundary(BoundarySource::ExecuteCommands);
 	primary.executeCommands(1, &batch.buffer);
 	scheduler.EndRendering();
 

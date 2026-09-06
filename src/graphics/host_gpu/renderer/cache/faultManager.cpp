@@ -134,15 +134,17 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier2(dependency);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
 	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = m_caching_num_pages / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
-	NoteBatchBoundary();
+	NoteBatchBoundary(BoundarySource::Transfer);
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;

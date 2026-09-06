@@ -169,12 +169,12 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state, bool secondary_contents) {
-	NoteBatchBoundary();
+	NoteBatchBoundary(BoundarySource::Rendering);
 	Current().BeginRendering(state, secondary_contents);
 }
 
 void CommandScheduler::EndRendering() {
-	NoteBatchBoundary();
+	NoteBatchBoundary(BoundarySource::Rendering);
 	// Re-entrant by design: FlushSecondaryBatch ends the pass it just opened, and its own guard
 	// stops the recursion.
 	FlushSecondaryBatch(m_context);

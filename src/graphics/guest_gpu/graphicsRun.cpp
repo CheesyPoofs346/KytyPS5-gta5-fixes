@@ -1903,7 +1903,7 @@ void CommandProcessor::EmitInPassBarrier() {
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
-	NoteBatchBoundary();
+	NoteBatchBoundary(BoundarySource::GlobalBarrier);
 	CheckBuffer();
 
 	Common::LockGuard lock(m_renderer.GetMutex());

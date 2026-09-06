@@ -1375,6 +1375,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (descriptors.gds.buffer != nullptr) {
 			buffer.EndRendering();
 			const auto barrier = MakeGdsDependency(descriptors.gds.buffer);
+			NoteBatchBoundary(BoundarySource::PipelineBarrier);
 			vk_buffer.pipelineBarrier(
 			    vk::PipelineStageFlagBits::eHost | vk::PipelineStageFlagBits::eTransfer |
 			        vk::PipelineStageFlagBits::eAllGraphics |

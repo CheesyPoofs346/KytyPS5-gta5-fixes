@@ -331,6 +331,7 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 	barriers[2].offset        = dispatches.front().params_offset;
 	barriers[2].size =
 	    dispatches.back().params_offset - dispatches.front().params_offset + sizeof(Push);
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer, {}, 0,
@@ -340,6 +341,7 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 		barriers[1].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
 		barriers[1].dstAccessMask =
 		    vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+		NoteBatchBoundary(BoundarySource::PipelineBarrier);
 		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 		                        vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 1,
 		                        &barriers[1], 0, nullptr);
@@ -363,13 +365,14 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		NoteBatchBoundary();
+		NoteBatchBoundary(BoundarySource::Transfer);
 		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
 
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
@@ -555,6 +558,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	                            vk::AccessFlagBits::eTransferWrite |
 	                            vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
@@ -615,13 +619,14 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			push.slice_bytes = static_cast<uint32_t>(layout.target_row_stride);
 			command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
 			                      sizeof(push), &push);
-			NoteBatchBoundary();
+			NoteBatchBoundary(BoundarySource::Transfer);
 			command.dispatch(static_cast<uint32_t>(groups_x), rows, 1);
 			row += rows;
 		}
 	}
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1,
 	                        &barriers[1], 0, nullptr);
@@ -683,6 +688,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eShaderWrite;
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier(
 	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
 	    vk::PipelineStageFlagBits::eComputeShader, {}, 0, nullptr, 2, barriers, 0, nullptr);
@@ -695,10 +701,11 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	push.width    = pixels;
 	command.pushConstants(m_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
 	                      &push);
-	NoteBatchBoundary();
+	NoteBatchBoundary(BoundarySource::Transfer);
 	command.dispatch((pixels + 63u) / 64u, 1, 1);
 	barriers[1].srcAccessMask = vk::AccessFlagBits::eShaderWrite;
 	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	NoteBatchBoundary(BoundarySource::PipelineBarrier);
 	command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
 	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &barriers[1],
 	                        0, nullptr);

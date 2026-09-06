@@ -251,8 +251,38 @@ inline std::atomic<uint64_t> g_guest_flips {0};
 // Bumped at those sites and folded into the census key, so such a pair can never be merged.
 inline std::atomic<uint64_t> g_batch_boundary {0};
 
-inline void NoteBatchBoundary() {
+// Which recording activity ended the run. Without this a dominant boundary-op break reason is
+// unattributable, and the census cannot say whether the split was necessary or incidental.
+enum class BoundarySource : size_t {
+	Rendering,        // BeginRendering / EndRendering
+	GlobalBarrier,    // CommandProcessor::EmitGlobalBarrier
+	PipelineBarrier,  // vkCmdPipelineBarrier(2) recorded between draws
+	Clear,            // clearAttachments
+	Dispatch,         // compute
+	Transfer,         // copy / blit / resolve
+	ExecuteCommands,  // secondary boundary: state does not carry across
+	Count,
+};
+
+inline std::array<std::atomic<uint64_t>, static_cast<size_t>(BoundarySource::Count)>
+    g_boundary_by_source {};
+
+inline const char* BoundarySourceName(BoundarySource s) {
+	switch (s) {
+		case BoundarySource::Rendering: return "rendering-restart";
+		case BoundarySource::GlobalBarrier: return "global-barrier";
+		case BoundarySource::PipelineBarrier: return "pipeline-barrier";
+		case BoundarySource::Clear: return "clear-attachments";
+		case BoundarySource::Dispatch: return "dispatch";
+		case BoundarySource::Transfer: return "copy/blit/resolve";
+		case BoundarySource::ExecuteCommands: return "execute-commands";
+		default: return "?";
+	}
+}
+
+inline void NoteBatchBoundary(BoundarySource source) {
 	g_batch_boundary.fetch_add(1, std::memory_order_relaxed);
+	g_boundary_by_source[static_cast<size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
 
