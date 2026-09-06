@@ -5,7 +5,10 @@ Section A of the performance audit. Percentiles are computed once over every
 retained route sample. Percentiles of windows are never averaged together.
 
 Usage:
-    python tools/frametimes.py run1.csv [run2.csv ...]
+    python tools/frametimes.py run1.csv [run2.csv ...] [--live]
+
+--live tolerates one incomplete trailing record, for reading a capture that is still
+being written. Without it, any malformed row rejects the capture.
 
 With two or more captures it also reports the spread between runs, which is the
 variance floor any claimed improvement has to clear.
@@ -21,17 +24,46 @@ def percentile(sorted_values, p):
     return sorted_values[min(idx, len(sorted_values) - 1)]
 
 
-def load(path):
-    route, warmup = [], []
+def load(path, live=False):
+    """Parse a capture.
+
+    A malformed INTERIOR row is a corrupt capture and is rejected outright. Only an
+    incomplete FINAL row is tolerable, and only with live=True, because a running
+    capture is buffered and its last record may be half-written. Every dropped row is
+    reported: silently skipping records is how a capture lies about its own sample count.
+    """
+    route, warmup, rows = [], [], []
     with open(path, newline="") as handle:
-        for row in csv.DictReader(handle):
-            sample = (float(row["ms"]), int(row["draws"]))
-            (route if row["phase"] == "route" else warmup).append(sample)
+        rows = list(csv.DictReader(handle))
+
+    dropped = []
+    for i, row in enumerate(rows):
+        bad = [k for k in ("ms", "draws", "phase") if row.get(k) in (None, "")]
+        if not bad:
+            continue
+        is_last = (i == len(rows) - 1)
+        if is_last and live:
+            dropped.append(i)
+            continue
+        raise ValueError(
+            "%s: malformed %s row %d (missing %s). An interior malformed row means the "
+            "capture is corrupt; rerun it. Pass --live only for a still-running capture."
+            % (path, "final" if is_last else "INTERIOR", i, ",".join(bad)))
+
+    for i, row in enumerate(rows):
+        if i in dropped:
+            continue
+        sample = (float(row["ms"]), int(row["draws"]))
+        (route if row["phase"] == "route" else warmup).append(sample)
+
+    if dropped:
+        print("  NOTE %s: dropped %d incomplete trailing record(s) (live read)"
+              % (path, len(dropped)))
     return route, warmup
 
 
-def summarise(path):
-    route, warmup = load(path)
+def summarise(path, live=False):
+    route, warmup = load(path, live)
     if len(route) < 2:
         print("%s: only %d route samples, need at least 2" % (path, len(route)))
         return None
@@ -62,10 +94,12 @@ def summarise(path):
 
 
 def main():
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if a != "--live"]
+    live = "--live" in sys.argv[1:]
+    if not args:
         print(__doc__)
         return 1
-    runs = [r for r in (summarise(p) for p in sys.argv[1:]) if r]
+    runs = [r for r in (summarise(p, live) for p in args) if r]
     if len(runs) < 2:
         return 0
 
