@@ -114,6 +114,11 @@ struct ConfigOptions {
 	// host call, under the current bindings and under a hypothetical descriptor-indexing scheme.
 	// Read-only; changes no rendering. Adds two hashes per draw, so keep it off for timing.
 	bool                   batch_census                  = false;
+	// Vertical slice: resolve a draw's IMAGES on a worker instead of the caller. Phase 2b is
+	// serial and holds PrepareBindings, the largest preparation zone still on the caller.
+	// Resolution only - BindImage mutates image.binding and m_bound_images and stays on the
+	// caller, as does every creation, barrier and recording.
+	bool                   worker_resolve_images         = false;
 	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
@@ -228,7 +233,8 @@ uint32_t StreamRepeatThreshold();
 uint32_t WarmupFrames();
 bool BackingFastPath();
 bool BackingLockSample();
-bool BatchCensusEnabled();
+bool BatchCensusEnabled();
+bool WorkerResolveImages();
 // Every performance-relevant setting actually in effect, not just CLI overrides.
 void LogEffectiveSettings();
 uint32_t PipelineDepth();

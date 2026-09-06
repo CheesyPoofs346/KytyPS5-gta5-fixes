@@ -148,6 +148,12 @@ void DrawBatchQueue::Drain(RenderExecutor& executor, CommandBuffer& buffer) {
 				                 prepared[index].valid = false;
 				                 prepared[index].bindings_valid = false;
 				                 g_bailouts.fetch_add(1, std::memory_order_relaxed);
+			                 } else {
+				                 // Phase 2a2: resolve this draw's images here rather than in the
+				                 // serial acquire phase. Resolution only; a miss tickets one slot
+				                 // and leaves the rest usable, so unlike the bail-out above this
+				                 // never discards the draw.
+				                 executor.PreResolveQueuedImages(prepared[index]);
 			                 }
 		                 });
 		t_drain.parallel_cyc += __builtin_ia32_rdtsc() - parallel_start;

@@ -1065,7 +1065,85 @@ void ReturnPooledBindingStorage(PreparedBindings& prepared) {
 	pool.push_back(std::move(slot));
 }
 
-PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime) {
+// Coverage and cost of the worker image-resolution slice. Thread_local, no atomics, so
+// measuring does not perturb what it measures.
+struct WorkerImageCensus {
+	uint64_t slots        = 0;   // image slots seen by the caller
+	uint64_t used         = 0;   // served from a worker resolve
+	uint64_t ticketed     = 0;   // worker could not resolve (creation needed): caller resolved
+	uint64_t stale        = 0;   // worker resolved, but the cache moved: caller re-resolved
+	uint64_t not_attempted = 0;  // no worker pass ran for this draw
+
+	void Report() const {
+		if (slots == 0 || (slots % 2000000) != 0) {
+			return;
+		}
+		std::printf("WorkerImages: slots=%llu used=%llu (%.1f%%) ticketed=%llu (%.1f%%) "
+		            "stale=%llu (%.1f%%) no-worker-pass=%llu (%.1f%%)\n",
+		            static_cast<unsigned long long>(slots),
+		            static_cast<unsigned long long>(used), 100.0 * double(used) / double(slots),
+		            static_cast<unsigned long long>(ticketed),
+		            100.0 * double(ticketed) / double(slots),
+		            static_cast<unsigned long long>(stale), 100.0 * double(stale) / double(slots),
+		            static_cast<unsigned long long>(not_attempted),
+		            100.0 * double(not_attempted) / double(slots));
+		std::fflush(stdout);
+	}
+};
+
+WorkerImageCensus& ImageCensus() {
+	static thread_local WorkerImageCensus census;
+	return census;
+}
+
+// Phase 2a2, on a WORKER. Resolution only.
+//
+// What is deliberately NOT done here: BindImage (mutates image.binding and pushes to the shared
+// m_bound_images), image creation (FindImage bails to the caller at its creation point),
+// barriers, and recording. Those stay on the caller in guest order.
+//
+// A miss ticketed one slot; every other slot's result is retained, so a draw that needs one new
+// image does not replay its whole resolution on the caller.
+void RenderExecutor::PreResolveQueuedImages(PreparedShaders& prepared) {
+	if (!Config::WorkerResolveImages() || !prepared.valid) {
+		return;
+	}
+	auto&      cache      = m_context.GetTextureCache();
+	const auto generation = cache.ImageInvalidationGeneration();
+	auto       run        = [&](const ShaderStageRuntime& rt,
+                        PreparedShaders::PreResolvedImages& out) {
+		if (!rt) {
+			return;
+		}
+		const auto& program  = *rt.program;
+		const auto& snapshot = *rt.resources;
+		const auto  count    = program.info.images.size();
+		out.bindings.assign(count, TextureBinding {});
+		out.ok.assign(count, 0);
+		out.generation = generation;
+		out.attempted  = true;
+		for (uint32_t i = 0; i < count; i++) {
+			// Clear any stale flag first so this slot's outcome is its own.
+			(void)TakeWorkerBailout();
+			auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			if (TakeWorkerBailout() || !binding.image_id) {
+				continue;   // ticketed: the caller resolves this slot
+			}
+			out.bindings[i] = std::move(binding);
+			out.ok[i]       = 1;
+		}
+	};
+	run(prepared.vs_input_info.stage, prepared.vertex_images);
+	if (prepared.ps_active) {
+		run(prepared.ps_input_info.stage, prepared.pixel_images);
+	}
+	// The bailout flag must not leak into the phase-2a caller, which reads it to invalidate the
+	// whole draw. Ticketing already recorded every miss.
+	(void)TakeWorkerBailout();
+}
+
+PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime&                 runtime,
+                                                 const PreparedShaders::PreResolvedImages* pre) {
 	KYTY_PROFILER_FUNCTION();
 	DrawPhaseTimer draw_phase_timer(DrawPhase::BindPrepare);
 	EXIT_IF(!runtime);
@@ -1093,7 +1171,29 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 		TextureBinding binding;
 		{
 			DrawPhaseTimer resolve_timer(DrawPhase::BindResolveTexture);
-			binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			auto&      census        = ImageCensus();
+			auto&      texture_cache = m_context.GetTextureCache();
+			const bool have_pre      = pre != nullptr && pre->attempted && i < pre->ok.size();
+			census.slots++;
+			if (pre == nullptr || !pre->attempted) {
+				census.not_attempted++;
+			}
+			// Revalidation: a worker's handle is trusted only if nothing since could have
+			// retired it. Any insertion or free - including one caused by an earlier slot of
+			// THIS draw - bumps the generation, and then the handle is re-resolved.
+			if (have_pre && pre->ok[i] != 0 &&
+			    pre->generation == texture_cache.ImageInvalidationGeneration()) {
+				binding = pre->bindings[i];
+				census.used++;
+			} else {
+				if (have_pre && pre->ok[i] != 0) {
+					census.stale++;
+				} else if (have_pre) {
+					census.ticketed++;
+				}
+				binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			}
+			census.Report();
 		}
 		// An empty id means a worker bailed rather than create the image; the draw is already
 		// flagged for serial retry. Skip it instead of indexing the slot vector with an empty id.
@@ -1293,17 +1393,18 @@ RenderExecutor::PrepareGraphicsBindings(const ShaderStageRuntime& vertex,
 //
 // The split is not arbitrary: PrepareBindings and FindBuffers ARE the acquisition half, and
 // RebindBuffers/RebindImages ARE the binding half, so the existing boundaries already drew the line.
-GraphicsBindings RenderExecutor::AcquireGraphicsBindings(const ShaderStageRuntime& vertex,
-                                                        const ShaderStageRuntime& pixel,
-                                                        bool                      pixel_active) {
+GraphicsBindings RenderExecutor::AcquireGraphicsBindings(
+    const ShaderStageRuntime& vertex, const ShaderStageRuntime& pixel, bool pixel_active,
+    const PreparedShaders::PreResolvedImages* vertex_pre,
+    const PreparedShaders::PreResolvedImages* pixel_pre) {
 	EXIT_IF(MustStageForWorker());
 	// One draw's worth of buffer resolutions; see BeginDrawBufferScope.
 	BeginDrawBufferScope();
 	GraphicsBindings bindings {
-	    .vertex = PrepareBindings(vertex),
+	    .vertex = PrepareBindings(vertex, vertex_pre),
 	};
 	if (pixel_active) {
-		bindings.pixel.emplace(PrepareBindings(pixel));
+		bindings.pixel.emplace(PrepareBindings(pixel, pixel_pre));
 	}
 	FindBuffers(bindings.vertex);
 	if (bindings.pixel) {

@@ -3135,9 +3135,9 @@ void RenderExecutor::AcquireQueuedBindings(PreparedShaders& prepared) {
 	if (!prepared.valid) {
 		return;
 	}
-	prepared.bindings =
-	    AcquireGraphicsBindings(prepared.vs_input_info.stage, prepared.ps_input_info.stage,
-	                            prepared.ps_active);
+	prepared.bindings = AcquireGraphicsBindings(
+	    prepared.vs_input_info.stage, prepared.ps_input_info.stage, prepared.ps_active,
+	    &prepared.vertex_images, &prepared.pixel_images);
 	prepared.bindings_valid = true;
 }
 

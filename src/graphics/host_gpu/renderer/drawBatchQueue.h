@@ -54,6 +54,21 @@ struct PreparedShaders {
 	// Separate from `valid`: a draw can resolve its shaders on a worker and still have to build
 	// its bindings serially, when PrepareBda forces a bail-out.
 	bool                  bindings_valid = false;
+
+	// Images resolved on a worker ahead of the serial acquire phase.
+	//
+	// Per slot, so a miss on one image does not discard the rest: the caller resolves only the
+	// ticketed slots. `generation` is the texture cache's invalidation counter as of the worker
+	// resolve - if it has moved, caller-side creation or overlap merging may have retired these
+	// ids, so they are re-resolved rather than trusted.
+	struct PreResolvedImages {
+		std::vector<TextureBinding> bindings;
+		std::vector<uint8_t>        ok;           // 1 = resolved by a worker, retained
+		uint64_t                    generation = 0;
+		bool                        attempted  = false;
+	};
+	PreResolvedImages     vertex_images {};
+	PreResolvedImages     pixel_images {};
 };
 
 struct QueuedDraw {

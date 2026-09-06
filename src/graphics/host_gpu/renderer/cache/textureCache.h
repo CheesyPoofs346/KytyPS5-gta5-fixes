@@ -53,6 +53,11 @@ public:
 	~TextureCache();
 	KYTY_CLASS_NO_COPY(TextureCache);
 
+	// Bumped whenever an ImageId can be invalidated for other holders: insertion can trigger
+	// overlap merging, and FreeImage retires an id outright. A pre-resolved handle taken before
+	// a bump must be re-resolved rather than trusted.
+	[[nodiscard]] uint64_t ImageInvalidationGeneration() const { return m_image_generation; }
+
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
@@ -118,6 +123,7 @@ public:
 	[[nodiscard]] bool HasPendingClears() const noexcept { return !m_pending_clears.empty(); }
 
 private:
+	uint64_t m_image_generation = 0;   // see ImageInvalidationGeneration()
 	enum class TransferDirection { Upload, Download };
 	struct ColorTransferPlan;
 	struct DownloadPlan;

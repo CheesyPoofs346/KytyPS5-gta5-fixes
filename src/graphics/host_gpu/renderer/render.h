@@ -210,7 +210,9 @@ public:
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
 
-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
+	[[nodiscard]] PreparedBindings PrepareBindings(
+	    const ShaderStageRuntime&                 runtime,
+	    const PreparedShaders::PreResolvedImages* pre = nullptr);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -228,6 +230,9 @@ public:
 	// Builds both stages' bindings for an already-resolved draw, on whatever thread calls it.
 	// Sets prepared.bindings_valid; the caller clears it if the draw bailed out.
 	// Phase 2b: acquisition, main thread only - creates any missing buffer or image.
+	// Phase 2a2: resolves this draw's images on a WORKER. Resolution only - no BindImage, no
+	// creation, no recording. Misses are ticketed per slot rather than failing the draw.
+	void PreResolveQueuedImages(PreparedShaders& prepared);
 	void AcquireQueuedBindings(PreparedShaders& prepared);
 	// Phase 2c: binding only, safe on a worker.
 	void BindQueuedResources(PreparedShaders& prepared);
@@ -267,9 +272,10 @@ private:
 	                                                       const ShaderStageRuntime& pixel,
 	                                                       bool                      pixel_active);
 	// Phase 2b: acquisition. Creates any missing buffer or image. Main thread only.
-	[[nodiscard]] GraphicsBindings AcquireGraphicsBindings(const ShaderStageRuntime& vertex,
-	                                                       const ShaderStageRuntime& pixel,
-	                                                       bool                      pixel_active);
+	[[nodiscard]] GraphicsBindings AcquireGraphicsBindings(
+	    const ShaderStageRuntime& vertex, const ShaderStageRuntime& pixel, bool pixel_active,
+	    const PreparedShaders::PreResolvedImages* vertex_pre = nullptr,
+	    const PreparedShaders::PreResolvedImages* pixel_pre  = nullptr);
 	// Phase 2c: binding only, every lookup guaranteed to hit. Safe on a worker.
 	void                           BindGraphicsResources(GraphicsBindings& bindings);
 	void ResolveRenderColorTarget(uint64_t submit_id, CommandBuffer& buffer,

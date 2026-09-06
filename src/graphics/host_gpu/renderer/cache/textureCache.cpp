@@ -186,6 +186,7 @@ bool TextureCache::SafeToDownload(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	m_image_generation++;   // any holder's ImageId may now be stale
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
 		RegisterImage(id);
@@ -271,6 +272,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	m_image_generation++;   // any holder's ImageId may now be stale
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -1362,6 +1364,13 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				// FreeImage mutates shared cache state and invalidates the id for every other
+				// holder. A worker reaching this bailed only AFTER doing that, which is the
+				// cache-hit-path mutation the parallel design must not perform. Bail first.
+				if (MustStageForWorker()) {
+					RequestWorkerBailout();
+					return {};
+				}
 				// Deliberate: an exact backing with insufficient resources is discarded and recreated
 				// from guest memory rather than expanded, because the guest mip layout differs once
 				// the resource count grows. Asserted by CheckUnifiedTextureCacheFlow
