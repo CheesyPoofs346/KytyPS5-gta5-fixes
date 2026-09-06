@@ -49,7 +49,13 @@ enum class DrawPhase : uint32_t {
 	// The 1.355 us/draw that the buffer loop's other children do not account for. 97.6% of buffers
 	// take ObtainBuffer's stream fast path, whose Map + TryReadBacking + Commit is a guest->stream
 	// memcpy that no timer covered. The dedup scan in front of it was untimed too.
-	ObtStreamCopy,      // of which, the stream fast path (guest -> stream memcpy)
+	// The whole stream-upload path, NOT a memcpy: alignment, buffer selection, Map (which
+	// contains WaitPendingOperations, a GPU wait), TryReadBacking (the actual copy) and Commit
+	// (which contains vmaFlushAllocation). Split below because the copy was assumed to dominate.
+	ObtStreamCopy,
+	ObtStreamMap,       // of which, stream.Map (includes the GPU wait)
+	ObtStreamRead,      // of which, TryReadBacking - the actual guest->host memcpy
+	ObtStreamCommit,    // of which, stream.Commit (includes vmaFlushAllocation)
 	BindDedupScan,      // of which, FindDrawBufferCache
 	// Phase 2c is the only parallel phase that scales negatively (16.1 -> 18.0 -> 22.8% at 2/4/8
 	// workers) while phase 2a scales cleanly (16.7 -> 11.5 -> 9.0). The difference is that 2c takes
@@ -100,6 +106,9 @@ inline bool DrawPhaseIsChild(DrawPhase phase) {
 		case DrawPhase::ObtTracker:
 		case DrawPhase::ObtFindBuffer:
 		case DrawPhase::ObtSynchronize:
+		case DrawPhase::ObtStreamMap:
+		case DrawPhase::ObtStreamRead:
+		case DrawPhase::ObtStreamCommit:
 		case DrawPhase::ObtStreamCopy:
 		case DrawPhase::BindDedupScan:
 		case DrawPhase::TexLockAcquire:
@@ -133,7 +142,10 @@ inline const char* DrawPhaseName(DrawPhase phase) {
 		case DrawPhase::ObtTracker: return "      of which tracker queries";
 		case DrawPhase::ObtFindBuffer: return "      of which FindBuffer";
 		case DrawPhase::ObtSynchronize: return "      of which SynchronizeBuffer";
-		case DrawPhase::ObtStreamCopy: return "      of which stream copy (memcpy)";
+		case DrawPhase::ObtStreamCopy: return "      of which stream-upload path";
+		case DrawPhase::ObtStreamMap: return "        of which Map (incl GPU wait)";
+		case DrawPhase::ObtStreamRead: return "        of which TryReadBacking (memcpy)";
+		case DrawPhase::ObtStreamCommit: return "        of which Commit (incl flush)";
 		case DrawPhase::BindDedupScan: return "      of which dedup scan";
 		case DrawPhase::TexLockAcquire: return "      of which texture lock acquire";
 		case DrawPhase::BufLockAcquire: return "      of which buffer lock acquire";

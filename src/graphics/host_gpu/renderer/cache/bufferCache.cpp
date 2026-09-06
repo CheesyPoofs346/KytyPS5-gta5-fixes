@@ -20,6 +20,7 @@
 #include <array>
 #include <cinttypes>
 #include <cstring>
+#include <tuple>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -735,10 +736,26 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		// and silently overwrite each other's uniform and vertex data - which is exactly the
 		// stretched geometry and detached meshes the first attempt produced. Slot 0 resolves back
 		// to m_stream_buffer, so the main thread's behaviour is unchanged.
-		auto& stream          = GetUtilityBuffer(MemoryUsage::Stream);
-		auto [mapped, offset] = stream.Map(size, alignment, false);
-		if (mapped != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size)) {
-			stream.Commit();
+		auto& stream = GetUtilityBuffer(MemoryUsage::Stream);
+		// Split so the copy is separated from the allocation and flush around it. The enclosing
+		// zone was read as if it were the memcpy; it is not -- Map contains a GPU wait and
+		// Commit contains vmaFlushAllocation.
+		uint8_t* mapped = nullptr;
+		uint64_t offset = 0;
+		{
+			DrawPhaseTimer map_timer(DrawPhase::ObtStreamMap);
+			std::tie(mapped, offset) = stream.Map(size, alignment, false);
+		}
+		bool read_ok = false;
+		if (mapped != nullptr) {
+			DrawPhaseTimer read_timer(DrawPhase::ObtStreamRead);
+			read_ok = Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size);
+		}
+		if (read_ok) {
+			{
+				DrawPhaseTimer commit_timer(DrawPhase::ObtStreamCommit);
+				stream.Commit();
+			}
 			return {&stream, offset};
 		}
 	}
