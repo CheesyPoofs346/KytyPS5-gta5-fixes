@@ -10,6 +10,7 @@
 #include "common/profiler.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -475,7 +476,21 @@ void CommandProcessor::BufferFlush() {
 	if (GetScheduler().Active()) {
 		m_renderer.GetGpuResources().GetBufferCache().RecordHotShadows();
 	}
+	// b072439: stamp the flush so RequestBufferFlush can rate-limit against it.
+	m_last_flush_qpc = Common::Timer::QueryPerformanceCounter();
 	GetScheduler().Flush();
+}
+
+void CommandProcessor::RequestBufferFlush() {
+	// UE4 titles emit an end-of-pipe fence after almost every pass; submitting a command buffer
+	// for each one produced ~170 vkQueueSubmit calls per frame of a few draws each. One submit
+	// per millisecond keeps fence latency bounded while batching the work.
+	static const uint64_t min_interval = Common::Timer::QueryPerformanceFrequency() / 1000;
+	const auto            now          = Common::Timer::QueryPerformanceCounter();
+	if (m_last_flush_qpc != 0 && now - m_last_flush_qpc < min_interval) {
+		return;
+	}
+	BufferFlush();
 }
 
 void CommandProcessor::BufferFlushAndWait() {
@@ -1196,10 +1211,6 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
                                       const volatile void* address, uint32_t count_in_dwords) {
-	if (wait_op != 0) {
-		BufferFlushAndWait();
-	}
-
 	(void)count_in_dwords;
 
 	switch (op) {
@@ -1208,6 +1219,14 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 		} break;
 		case 0x03: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			const auto predicate_address = reinterpret_cast<uint64_t>(address);
+			auto&      buffer_cache      = m_renderer.GetBufferCache();
+			const bool predicate_gpu_dirty =
+			    buffer_cache.HasGpuDirtyBytes(predicate_address, sizeof(uint64_t)) ||
+			    buffer_cache.IsRegionGpuModified(predicate_address, sizeof(uint64_t));
+			if (wait_op != 0 && predicate_gpu_dirty) {
+				BufferFlushAndWait();
+			}
 
 			auto value = *reinterpret_cast<const volatile uint64_t*>(address);
 

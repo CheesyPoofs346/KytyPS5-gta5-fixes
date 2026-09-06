@@ -65,6 +65,9 @@ public:
 	void            BufferInit();
 	void            BufferFlush();
 	void                      DrainQueuedDraws();
+	// Flush wanted for prompt fence completion, not for correctness. Rate-limited: the slice end
+	// always flushes, so deferring only delays a fence by at most one slice.
+	void                      RequestBufferFlush();
 	void            BufferFlushAndWait();
 	void            BufferWait();
 	HW::Context&    GetCtx() { return m_ctx; }
@@ -194,6 +197,7 @@ private:
 	uint64_t  m_submit_id                   = 0;
 	uint64_t  m_synthetic_occlusion_counter = 0;
 	bool      m_predicate_skip              = false;
+	uint64_t  m_last_flush_qpc              = 0;
 };
 
 } // namespace Libs::Graphics

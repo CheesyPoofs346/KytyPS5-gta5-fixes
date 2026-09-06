@@ -2770,8 +2770,13 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
-		if (queued && EopShouldFlush(g_eop_flush_interrupt)) {
-			cp.BufferFlush();
+		// b072439 replaces our count-based EopShouldFlush gate with a TIME-based rate limit.
+		// Our eop_flush_interval experiment failed because skipping every Nth submit lost the
+		// incremental CPU/GPU overlap; rate-limiting by time bounds the submit count while still
+		// feeding the GPU steadily.
+		if (queued) {
+			RelMemTimer flush_timer {kRelMemFlush};
+			cp.RequestBufferFlush();
 		}
 	};
 
@@ -2814,9 +2819,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			                      static_cast<uint32_t>(value), interrupt_selector,
 			                      interrupt_context_id);
 		}
-		if (EopShouldFlush(g_eop_flush_data1)) {
+		{
 			RelMemTimer flush_timer {kRelMemFlush};
-			cp.BufferFlush();
+			cp.RequestBufferFlush();
 		}
 
 		return 7;
@@ -2838,9 +2843,9 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 			                      static_cast<uint32_t>(value), interrupt_selector,
 			                      interrupt_context_id);
 		}
-		if (interrupt_selector == 0x01 && EopShouldFlush(g_eop_flush_data5)) {
+		if (interrupt_selector == 0x01) {
 			RelMemTimer flush_timer {kRelMemFlush};
-			cp.BufferFlush();
+			cp.RequestBufferFlush();
 		}
 
 		return 7;
