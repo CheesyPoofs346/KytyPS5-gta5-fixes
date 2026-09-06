@@ -937,6 +937,15 @@ void TextureCache::PrepareStorageSampledOverlap(const ImageDesc& desc) {
 	// optional CPU-read tracker, while TryDownloadImage supports the same linear/tiled
 	// download plan used by normal image retirement.
 	if (!gpu_candidates.empty()) {
+		// TryDownloadImage records a pipeline barrier into the primary and can Finish() the
+		// scheduler, so a worker must not reach it. FindImage's existing bail-out sits at the
+		// CREATION point, which is downstream of here - this path was an uncovered second route
+		// to main-thread-only work, and the tripwire in TryDownloadImage caught it by aborting.
+		// Bail to the caller, which runs this path unchanged. The tripwire stays as the backstop.
+		if (MustStageForWorker()) {
+			RequestWorkerBailout();
+			return;
+		}
 		{
 			std::scoped_lock lock {m_lock};
 			for (const auto id: gpu_candidates) {
