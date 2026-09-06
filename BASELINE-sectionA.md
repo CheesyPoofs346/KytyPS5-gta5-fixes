@@ -42,36 +42,64 @@ Phase accounting per run: run 1 `4194 warmup / 1 straddle / 1445 route / 170 aft
 run 2 `3785 warmup / 1 straddle / 1024 route / …`. The interval straddling ROUTE_START
 was excluded in both.
 
-## Run-to-run spread — the variance floor
+## Observed difference between the two runs
 
 ```
-median ms        61.35 – 62.95   spread 1.60  (2.6%)
-p95 ms           81.12 – 84.57   spread 3.46  (4.3%)
-p99 ms          107.95 – 113.91  spread 5.96  (5.5%)
-% over 16.667ms  97.85 – 100.00  spread 2.15  (2.2%)
+median ms        61.35 – 62.95   difference 1.60  (2.6%)
+p95 ms           81.12 – 84.57   difference 3.46  (4.3%)
+p99 ms          107.95 – 113.91  difference 5.96  (5.5%)
+% over 16.667ms  97.85 – 100.00  difference 2.15  (2.2%)
 ```
 
-**A later A/B difference smaller than this is not a result.** Draw medians agree to 1.8%
-(4261 vs 4339), so the two hand-driven routes were genuinely comparable.
+This is **the observed difference between two runs, not a statistical variance floor**. Two
+samples cannot establish a distribution: they give no confidence interval and no estimate of
+how much larger the spread could be across more runs. Treat it as a first indication of
+magnitude, and re-establish it with repeated captures before leaning on it to judge an A/B.
 
-## Run 1 contains a non-gameplay excursion
+Median draw counts agree to 1.8% (4261 vs 4339), which **suggests** similar scene density.
+It does not prove equivalent workloads: the routes differed in duration (93.16 s vs 66.34 s),
+run 1 contains a segment run 2 does not (below), and equal medians are compatible with
+different distributions of work.
 
-All 31 sub-16.667 ms intervals in run 1 are at **60–312 draws**, and its 1655.70 ms outlier
-is at **369 draws** — menu/pause/transition frames, not fast gameplay frames. Run 2 is clean
-(min 44.80 ms, no low-draw intervals).
+## Run 1 contains low-draw intervals that run 2 does not
 
-So run 1's 97.9% is not "2.1% of frames hit 60 fps"; it is 2.1% of intervals not being
-gameplay at all. **Run 2's 100.0% is the honest figure.** Prefer run 2 for the over-threshold
-statistic; the medians and p95/p99 are unaffected.
+Run 1 has **43 route intervals with fewer than 1000 draws** (all 31 of its sub-16.667 ms
+intervals are among them, at 60–312 draws; its 1655.70 ms outlier is at 369 draws).
+Run 2 has **zero**.
+
+Low draw counts are consistent with menu, pause or transition frames, but that is an
+**inference from the draw counter, not a confirmed observation** — no route annotation or
+state marker was recorded to establish what was on screen. It is unconfirmed.
+
+**The unfiltered result stands as the primary figure.** The filtered view below is reported
+as an explicit, reversible exclusion (`draws >= 1000`, dropping 43 of 1445), not a correction:
+
+| run 1 | n | med | p95 | p99 | min | max | over 16.667 | over 33.333 |
+|---|---|---|---|---|---|---|---|---|
+| unfiltered (primary) | 1445 | 61.35 | 84.57 | 113.91 | 5.57 | 1655.70 | 97.9% | 97.3% |
+| draws >= 1000 | 1402 | 61.64 | 84.67 | 112.49 | 38.13 | 336.87 | 100.0% | 100.0% |
+
+Recalculated, not assumed: excluding those intervals moves the median +0.47%, p95 +0.12%
+and p99 -1.25%. Those shifts are smaller than the 2.6-5.5% difference observed between the
+two runs, so the central and tail statistics are **not very sensitive** to this exclusion --
+but they are not literally unaffected, and the max and min move a great deal.
+
+The over-threshold statistic is what the exclusion actually changes: 97.9% to 100.0%,
+matching run 2 exactly.
 
 ## The gap to target
 
 Median interval ~62 ms against a 16.667 ms budget:
 
-- 30 fps floor (33.333 ms) needs a **1.9× reduction** in median interval.
-- 60 fps (16.667 ms) needs a **3.8× reduction**.
+- Bringing the **median** interval to 33.333 ms needs a **1.9x reduction**.
+- Bringing the **median** interval to 16.667 ms needs a **3.8x reduction**.
 
-Not a matter of trimming a few percent.
+These ratios describe the median only. A median at 33.333 ms is **not** a 30 fps floor: by
+definition half the intervals would still be slower. A floor is a statement about the tail,
+so the governing figure is p99 (107.95-113.91 ms here), which needs roughly a **3.2x-3.4x**
+reduction to reach 33.333 ms and **6.5x-6.8x** to reach 16.667 ms.
+
+Not a matter of trimming a few percent, on any of these measures.
 
 ## What these numbers are not
 
