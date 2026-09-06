@@ -469,6 +469,12 @@ void CommandProcessor::BufferInit() {
 void CommandProcessor::BufferFlush() {
 	DrainQueuedDraws();
 	Pm4WorkTimer timer {2};
+	// From Almo7aya/KytyPS5 97a895b: record host-visible shadows of buffers the CPU reads back,
+	// so a later poll does not fault and drain the whole GPU. Inside the flush timer because it
+	// is flush work; after DrainQueuedDraws so the shadows cover everything this flush submits.
+	if (GetScheduler().Active()) {
+		m_renderer.GetGpuResources().GetBufferCache().RecordHotShadows();
+	}
 	GetScheduler().Flush();
 }
 
