@@ -226,6 +226,12 @@ private:
 	std::chrono::steady_clock::time_point m_start;
 };
 
+// A bucket with no instrumentation site is UNMEASURED, which is not the same as measured-zero.
+// wait-stream has no site wired yet and must never be reported as 0 ms.
+inline bool CaptureBucketWired(CaptureBucket bucket) {
+	return bucket != CaptureBucket::WaitStream;
+}
+
 inline const char* CaptureBucketName(CaptureBucket bucket) {
 	switch (bucket) {
 		case CaptureBucket::Pm4Exec: return "pm4-exec";

@@ -1747,12 +1747,17 @@ public:
 		OpenCsv();
 		PollMarkers();
 		const bool warm = m_samples.size() >= Config::WarmupFrames();
-		const bool in_route = m_route_started && !m_route_ended && warm;
+		// The interval in flight when ROUTE_START was consumed began before the marker existed,
+		// so it straddles the boundary and is excluded. The route begins at the next interval.
+		const bool straddles = m_route_started && m_samples.size() == m_route_begin;
+		const bool in_route  = m_route_started && !m_route_ended && warm && !straddles;
 		m_samples.push_back({ms, draws, in_route});
 		if (m_csv != nullptr) {
 			std::fprintf(m_csv, "%zu,%.4f,%llu,%s\n", m_samples.size() - 1, ms,
 			             static_cast<unsigned long long>(draws),
-			             in_route ? "route" : (m_route_ended ? "after" : "warmup"));
+			             in_route ? "route"
+			                      : (straddles ? "straddle"
+			                                   : (m_route_ended ? "after" : "warmup")));
 		}
 		if (in_route && (++m_route_samples % kReportEvery) == 0) {
 			Report("progress");
@@ -1795,13 +1800,13 @@ private:
 	// Explicit measured-route boundaries, triggered externally by creating a sentinel file, so
 	// the route starts when the operator is at the landmark rather than at an assumed frame index.
 	void PollMarkers() {
-		if ((m_samples.size() % 8) != 0) {   // a stat every 8 frames is far below frame cost
-			return;
-		}
+		// Polled every sample: a stat is microseconds against a frame of tens of
+		// milliseconds, and an 8-frame poll made the consumption point ambiguous.
 		if (!m_route_started && std::filesystem::exists("ROUTE_START")) {
 			m_route_started = true;
 			m_route_begin   = m_samples.size();
-			std::printf("FrameStats: ROUTE START at sample %zu\n", m_route_begin);
+			std::printf("FrameStats: ROUTE_START consumed at sample %zu; that interval straddles the\n            boundary and is excluded, route begins at sample %zu\n",
+			            m_route_begin, m_route_begin + 1);
 			std::fflush(stdout);
 		}
 		if (m_route_started && !m_route_ended && std::filesystem::exists("ROUTE_END")) {
@@ -1853,6 +1858,10 @@ private:
 		const auto p99 = Percentile(ms, 0.99);
 		// Milliseconds are authoritative. fps-equiv figures are the rate a tail-SLOW frame
 		// corresponds to (1000/p95ms), not the 95th percentile of FPS.
+		const double route_ms = std::accumulate(ms.begin(), ms.end(), 0.0);
+		std::printf("FrameStats[%s]: route duration %.2f s over %zu intervals "
+		            "(ROUTE_START consumed at sample %zu)\n",
+		            tag, route_ms / 1000.0, ms.size(), m_route_begin);
 		std::printf("FrameStats[%s]: guest-submission-intervals n=%zu | ms med=%.2f p95=%.2f "
 		            "p99=%.2f min=%.2f max=%.2f mean=%.2f | fps-equiv med=%.1f p95ms=%.1f "
 		            "p99ms=%.1f | draws med=%llu max=%llu | over16.667ms=%zu (%.1f%%) "
@@ -1866,22 +1875,36 @@ private:
 		            100.0 * static_cast<double>(over30) / static_cast<double>(n));
 		const auto flips = g_guest_flips.load(std::memory_order_relaxed);
 		std::printf("FrameStats[%s]: guest flips=%llu over %zu boundaries, ratio=%.3f "
-		            "(1.000 means one flip per submission; anything else means these intervals "
-		            "are not frame times)\n",
+		            "-- a COUNT CONSISTENCY CHECK only. 1.000 does not establish one-to-one "
+		            "correspondence between a flip and a submission, nor that their timing "
+		            "matches. These remain guest submission intervals, not frame times, and "
+		            "displayed FPS is not derivable from them.\n",
 		            tag, static_cast<unsigned long long>(flips), m_samples.size(),
 		            m_samples.empty() ? 0.0
 		                              : static_cast<double>(flips) /
 		                                    static_cast<double>(m_samples.size()));
 		// Execution vs blocking, process-wide wall nanoseconds. These are directly comparable to
 		// each other and to the route duration; they are NOT the thread_local draw phases.
+		std::printf("  -- these are PROCESS-WIDE ACCUMULATED elapsed times and they OVERLAP each"
+		            " other.\n     8 workers busy for 10 ms contribute 80 ms of worker-exec. Do NOT"
+		            " sum these\n     buckets, and do NOT subtract the wait-* totals from the"
+		            " inclusive pm4-exec:\n     that subtraction is only valid once thread identity,"
+		            " nesting and capture\n     windows are established, which they are not here.\n");
 		for (size_t i = 0; i < static_cast<size_t>(CaptureBucket::Count); ++i) {
+			const auto bucket = static_cast<CaptureBucket>(i);
+			if (!CaptureBucketWired(bucket)) {
+				std::printf("  %-14s N/A (no instrumentation site wired - unmeasured, not zero)\n",
+			                CaptureBucketName(bucket));
+				continue;
+			}
 			const auto ns    = g_capture_ns[i].load(std::memory_order_relaxed);
 			const auto calls = g_capture_calls[i].load(std::memory_order_relaxed);
 			if (calls == 0) {
+				std::printf("  %-14s 0 calls\n", CaptureBucketName(bucket));
 				continue;
 			}
 			std::printf("  %-14s total=%8.1f ms  calls=%-10llu  avg=%8.3f us\n",
-			            CaptureBucketName(static_cast<CaptureBucket>(i)),
+			            CaptureBucketName(bucket),
 			            static_cast<double>(ns) / 1e6,
 			            static_cast<unsigned long long>(calls),
 			            static_cast<double>(ns) / static_cast<double>(calls) / 1e3);
