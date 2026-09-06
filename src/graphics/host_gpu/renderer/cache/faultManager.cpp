@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/cache/faultManager.h"
 
 #include "common/assert.h"
@@ -139,6 +140,7 @@ void FaultManager::ProcessFaultBuffer() {
 	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = m_caching_num_pages / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
+	NoteBatchBoundary();
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);

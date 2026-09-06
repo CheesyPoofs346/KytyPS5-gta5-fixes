@@ -420,16 +420,25 @@ struct BatchCensus {
 		CmdGeneration = 1u << 0u,   // new command buffer: all state must be re-issued
 		Pipeline      = 1u << 1u,
 		RenderTargets = 1u << 2u,
-		IndexBuffer   = 1u << 3u,
+		IndexBuffer   = 1u << 3u,   // index BUFFER or TYPE changed
 		DynamicState  = 1u << 4u,
 		VertexInput   = 1u << 5u,
 		Descriptors   = 1u << 6u,
 		PushConstants = 1u << 7u,
-		kReasonCount  = 8u,
+		// Something was recorded between the two draws that a single call cannot span: a
+		// barrier, rendering restart, dispatch, copy, blit, query or conditional-rendering
+		// boundary. Identical state keys are not sufficient, so this breaks EVERY variant.
+		Boundary      = 1u << 8u,
+		// Only the index OFFSET moved, with the same buffer and type. Reported separately
+		// because firstIndex can express some of these given bounds and alignment checks -
+		// treated here as a break (conservative), not assumed permanently unbatchable.
+		IndexOffset   = 1u << 9u,
+		kReasonCount  = 10u,
 	};
 	static constexpr const char* kReasonName[kReasonCount] = {
-	    "command-buffer", "pipeline",    "render-targets", "index-buffer",
-	    "dynamic-state",  "vertex-input", "descriptors",    "push-constants"};
+	    "command-buffer", "pipeline",     "render-targets", "index-buffer",
+	    "dynamic-state",  "vertex-input", "descriptors",    "push-constants",
+	    "boundary-op",    "index-offset"};
 
 	struct Variant {
 		uint32_t mask       = 0;   // components that end a run in this variant
@@ -472,15 +481,24 @@ struct BatchCensus {
 	uint64_t prev_push       = 0;
 	bool     primed          = false;
 
-	Variant                              current_v {0xffu};
-	Variant                              indexed_v {0xffu & ~Descriptors};
-	Variant                              indexed_plus_v {0xffu & ~Descriptors & ~PushConstants};
+	static constexpr uint32_t kAll = (1u << kReasonCount) - 1u;
+	Variant                   current_v {kAll};
+	Variant                   indexed_v {kAll & ~Descriptors};
+	Variant                   indexed_plus_v {kAll & ~Descriptors & ~PushConstants};
+	// As indexed+, additionally tolerating index-offset-only changes, which firstIndex could
+	// express subject to bounds/alignment checks this census does NOT verify. Reported as an
+	// upper bound on what offset handling could add, not as an achievable figure.
+	Variant                   indexed_ofs_v {kAll & ~Descriptors & ~PushConstants & ~IndexOffset};
 	std::array<uint64_t, kReasonCount>   breaks_involving {};
 	std::array<uint64_t, kReasonCount>   breaks_sole {};
 	uint64_t                             total_draws = 0;
 
+	uint64_t prev_boundary = UINT64_MAX;
+	uint64_t prev_ixofs    = 0;
+
 	void Note(uint64_t generation, uint64_t pipeline, uint64_t targets, uint64_t index,
-	          uint64_t dynamic, uint64_t vertex, uint64_t desc, uint64_t push) {
+	          uint64_t index_offset, uint64_t dynamic, uint64_t vertex, uint64_t desc,
+	          uint64_t push, uint64_t boundary) {
 		uint32_t changed = 0;
 		if (!primed) {
 			primed  = true;
@@ -494,6 +512,8 @@ struct BatchCensus {
 			if (vertex != prev_vertex)         { changed |= VertexInput; }
 			if (desc != prev_desc)             { changed |= Descriptors; }
 			if (push != prev_push)             { changed |= PushConstants; }
+			if (boundary != prev_boundary)     { changed |= Boundary; }
+			if (index_offset != prev_ixofs)    { changed |= IndexOffset; }
 			// Every applicable reason is counted, not just a first-match, so the per-reason
 			// totals do not add up to the break count and are not presented as if they did.
 			if (changed != 0) {
@@ -521,10 +541,13 @@ struct BatchCensus {
 		prev_vertex     = vertex;
 		prev_desc       = desc;
 		prev_push       = push;
+		prev_boundary   = boundary;
+		prev_ixofs      = index_offset;
 
 		current_v.Note(changed);
 		indexed_v.Note(changed);
 		indexed_plus_v.Note(changed);
+		indexed_ofs_v.Note(changed);
 		total_draws++;
 		if ((total_draws % 2000000) == 0) {
 			Report();
@@ -560,6 +583,7 @@ struct BatchCensus {
 		PrintVariant("current", current_v);
 		PrintVariant("indexed", indexed_v);
 		PrintVariant("indexed+", indexed_plus_v);
+		PrintVariant("idx+ofs", indexed_ofs_v);
 		std::printf("  break reasons (a break can have several; these do NOT sum to the break "
 		            "count):\n");
 		for (uint32_t i = 0; i < kReasonCount; ++i) {
@@ -2624,13 +2648,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    CurrentCommandGeneration(),
 			    reinterpret_cast<uint64_t>(static_cast<VkPipeline>(pipeline.pipeline)),
 			    XXH3_64bits(&state.rendering, sizeof(state.rendering)),
-			    XXH3_64bits_withSeed(&dyn.index_offset, sizeof(dyn.index_offset),
-			                         reinterpret_cast<uint64_t>(dyn.index_buffer) ^
-			                             dyn.index_type),
+			    reinterpret_cast<uint64_t>(dyn.index_buffer) ^ dyn.index_type,
+			    dyn.index_offset,
 			    XXH3_64bits(&dyn.viewport, sizeof(dyn.viewport)) ^
 			        XXH3_64bits(&dyn.scissor, sizeof(dyn.scissor)),
 			    XXH3_64bits(&state.vs_input_info, sizeof(state.vs_input_info)),
-			    t_batch_desc_hash, t_batch_push_hash);
+			    t_batch_desc_hash, t_batch_push_hash,
+			    g_batch_boundary.load(std::memory_order_relaxed));
 		}
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);

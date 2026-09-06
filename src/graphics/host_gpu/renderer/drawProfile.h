@@ -245,6 +245,16 @@ inline std::array<std::atomic<uint64_t>, static_cast<size_t>(CaptureBucket::Coun
 // Guest flips (R_FLIP). A submission boundary is not a flip: correlate the two before
 // calling a submission interval a frame time, and never claim displayed FPS from either.
 inline std::atomic<uint64_t> g_guest_flips {0};
+// Section E: anything recorded between two draws that a single host call cannot span.
+// Identical draw-state keys are NOT sufficient - a barrier, rendering restart, dispatch, copy,
+// blit, query or conditional-rendering boundary can sit between two otherwise identical draws.
+// Bumped at those sites and folded into the census key, so such a pair can never be merged.
+inline std::atomic<uint64_t> g_batch_boundary {0};
+
+inline void NoteBatchBoundary() {
+	g_batch_boundary.fetch_add(1, std::memory_order_relaxed);
+}
+
 
 // Timers in flight when a route marker is consumed span the boundary: they began before it
 // and their whole duration lands in the delta. Counted so the contamination is visible

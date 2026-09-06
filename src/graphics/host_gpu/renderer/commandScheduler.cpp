@@ -1,3 +1,4 @@
+#include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -168,10 +169,12 @@ void CommandScheduler::Begin(HW::Context& registers, HW::UserConfig& user_config
 }
 
 void CommandScheduler::BeginRendering(const RenderState& state, bool secondary_contents) {
+	NoteBatchBoundary();
 	Current().BeginRendering(state, secondary_contents);
 }
 
 void CommandScheduler::EndRendering() {
+	NoteBatchBoundary();
 	// Re-entrant by design: FlushSecondaryBatch ends the pass it just opened, and its own guard
 	// stops the recursion.
 	FlushSecondaryBatch(m_context);

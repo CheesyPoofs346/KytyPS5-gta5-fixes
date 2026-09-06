@@ -278,6 +278,7 @@ void BufferCache::RecordUpload(vk::Buffer destination, uint64_t destination_size
 	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
 	                       0, nullptr, 1, &before, 0, nullptr);
+	NoteBatchBoundary();
 	native.copyBuffer(source, destination, static_cast<uint32_t>(copies.size()), copies.data());
 	auto after          = before;
 	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
