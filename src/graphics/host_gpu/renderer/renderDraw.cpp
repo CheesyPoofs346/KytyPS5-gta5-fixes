@@ -19,9 +19,11 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/drawProfile.h"
+#include "graphics/host_gpu/renderer/cache/bufferCensus.h"
 #include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/vertexBufferDescriptor.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -1386,11 +1388,6 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
-static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer) {
-	return (buffer.stride != 0 ? static_cast<uint64_t>(buffer.stride) * buffer.num_records
-	                           : buffer.num_records);
-}
-
 struct VertexBufferRange {
 	uint64_t                     base_address  = 0;
 	uint64_t                     requested_end = 0;
@@ -1418,7 +1415,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex);
+		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
 		if (size == 0) {
 			continue;
 		}
@@ -1467,7 +1464,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex);
+		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
 		if (size == 0) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
@@ -1978,11 +1975,21 @@ public:
 		const bool in_route  = m_route_started && !m_route_ended && warm && !straddles;
 		m_samples.push_back({ms, draws, in_route});
 		if (m_csv != nullptr) {
-			std::fprintf(m_csv, "%zu,%.4f,%llu,%s\n", m_samples.size() - 1, ms,
-			             static_cast<unsigned long long>(draws),
-			             in_route ? "route"
-			                      : (straddles ? "straddle"
-			                                   : (m_route_ended ? "after" : "warmup")));
+			const char* phase = in_route ? "route"
+			                             : (straddles ? "straddle"
+			                                          : (m_route_ended ? "after" : "warmup"));
+			if (Config::DmaCensusEnabled()) {
+				uint64_t dma_bytes = 0;
+				uint64_t dma_ns    = 0;
+				DmaCensusTake(&dma_bytes, &dma_ns);
+				std::fprintf(m_csv, "%zu,%.4f,%llu,%s,%llu,%llu\n", m_samples.size() - 1, ms,
+				             static_cast<unsigned long long>(draws), phase,
+				             static_cast<unsigned long long>(dma_bytes),
+				             static_cast<unsigned long long>(dma_ns));
+			} else {
+				std::fprintf(m_csv, "%zu,%.4f,%llu,%s\n", m_samples.size() - 1, ms,
+				             static_cast<unsigned long long>(draws), phase);
+			}
 		}
 		if (in_route && (++m_route_samples % kReportEvery) == 0) {
 			Report("progress");
@@ -2016,7 +2023,9 @@ private:
 		m_csv = std::fopen(name, "w");
 		if (m_csv != nullptr) {
 			// Buffered; flushed at each report and at route end.
-			std::fprintf(m_csv, "index,ms,draws,phase\n");
+			std::fprintf(m_csv, Config::DmaCensusEnabled()
+			                        ? "index,ms,draws,phase,dma_bytes,dma_ns\n"
+			                        : "index,ms,draws,phase\n");
 			std::printf("FrameStats: capture file %s\n", name);
 			std::fflush(stdout);
 		}
@@ -2029,6 +2038,10 @@ private:
 		// milliseconds, and an 8-frame poll made the consumption point ambiguous.
 		if (!m_route_started && std::filesystem::exists("ROUTE_START")) {
 			m_route_started = true;
+			// Snapshot the buffer census so gameplay can be reported without boot and loading.
+			if (Config::BufferCensusEnabled()) {
+				MarkBufferCensusRouteStart();
+			}
 			m_route_begin   = m_samples.size();
 			// Snapshot every capture bucket here so they are reported as route-scoped deltas
 			// rather than process-cumulative totals contaminated by boot.

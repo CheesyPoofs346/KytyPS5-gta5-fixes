@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/vertexBufferDescriptor.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -12571,6 +12572,29 @@ void TestVertexAttributeFormatChannelSwizzles() {
   }
 }
 
+void TestStrideZeroVertexDescriptorExtent() {
+  ShaderVertexInputInfo info{};
+  auto& constant = info.buffers[0];
+  constant.stride = 0;
+  constant.num_records = 1;
+  constant.attr_num = 2;
+  constant.attr_indices[0] = 0;
+  constant.attr_offsets[0] = 12;
+  constant.attr_indices[1] = 1;
+  constant.attr_offsets[1] = 32;
+  info.resources[0].fields[3] = (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 12u) | (2u << 28u);
+  info.resources[1].fields[3] = (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float) << 12u) | (2u << 28u);
+  Check(VertexBufferDescriptorSize(constant, info) == 48,
+        "stride-zero OOB=2 descriptor did not cover the last attribute extent");
+  constant.num_records = 0;
+  Check(VertexBufferDescriptorSize(constant, info) == 0,
+        "zero-record stride-zero descriptor was not empty");
+  constant.stride = 24;
+  constant.num_records = 3;
+  Check(VertexBufferDescriptorSize(constant, info) == 72,
+        "ordinary-stride descriptor size changed");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -12579,6 +12603,7 @@ int main() {
 
   EnsureConfigInitialized();
   TestVertexAttributeFormatChannelSwizzles();
+  TestStrideZeroVertexDescriptorExtent();
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
