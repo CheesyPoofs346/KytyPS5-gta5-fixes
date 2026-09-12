@@ -12520,6 +12520,57 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+void TestVertexAttributeFormatChannelSwizzles() {
+  struct Case {
+    Prospero::VertexAttribFormat format;
+    uint32_t expected_swizzle;
+  };
+  const Case cases[] = {
+      {Prospero::VertexAttribFormat::k32UInt, DstSel(4, 0, 0, 1)},
+      {Prospero::VertexAttribFormat::k32_32Float, DstSel(4, 5, 0, 1)},
+      {Prospero::VertexAttribFormat::k32_32_32Float, DstSel(4, 5, 6, 1)},
+      {Prospero::VertexAttribFormat::k32_32_32_32Float, DstSel(4, 5, 6, 7)},
+  };
+
+  std::array<uint16_t, static_cast<size_t>(AgcDirectResourceType::Last) + 1> offsets;
+  offsets.fill(AGC_ILLEGAL_DIRECT_OFFSET);
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexBufferTable)] = 0;
+  offsets[static_cast<size_t>(AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
+  ShaderUserData user_data{};
+  user_data.direct_resource_offset = offsets.data();
+  user_data.direct_resource_count = static_cast<uint16_t>(offsets.size());
+
+  for (const auto& test: cases) {
+    const uint32_t code[] = {EncodeSopp(0x01)};
+    const uint32_t attribute = static_cast<uint32_t>(test.format) << 5u;
+    const uint32_t buffer[] = {0x10000000u, 16u << 16u, 1u,
+                               static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float)
+                                   << 12u};
+    HW::VertexShaderInfo regs{};
+    regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+    regs.gs_regs.chksum = 1;
+    regs.gs_regs.rsrc2.user_sgpr = 4;
+    const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffer),
+                               reinterpret_cast<uint64_t>(&attribute)};
+    std::memcpy(regs.gs_user_sgpr.value, tables, sizeof(tables));
+    ShaderSemantic semantic{};
+    semantic.hardware_mapping = 9;
+    semantic.size_in_elements = 4;
+    ShaderMappedData mapped{};
+    mapped.user_data = &user_data;
+    mapped.input_semantics = &semantic;
+    mapped.num_input_semantics = 1;
+    mapped.code_size_bytes = sizeof(code);
+    ShaderMapUserData(regs.es_regs.data_addr, mapped);
+    ShaderVertexInputInfo input{};
+    PrepareProgram(regs, HW::ShaderRegisters{}, input);
+    Check(input.resources_num == 1 && input.resources[0].fields[3] ==
+                                      (((static_cast<uint32_t>(test.format) >> 2u) << 12u) |
+                                       test.expected_swizzle),
+          "vertex attribute channel count did not select the required fetch swizzle");
+  }
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -12527,6 +12578,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestVertexAttributeFormatChannelSwizzles();
   TestResourceDescriptorClassification();
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
