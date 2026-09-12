@@ -12598,10 +12598,18 @@ void TestStrideZeroVertexDescriptorExtent() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char** argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--vertex-format-only") == 0) {
+    TestVertexAttributeFormatChannelSwizzles();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--vertex-stride-only") == 0) {
+    TestStrideZeroVertexDescriptorExtent();
+    return 0;
+  }
   TestVertexAttributeFormatChannelSwizzles();
   TestStrideZeroVertexDescriptorExtent();
   TestResourceDescriptorClassification();
