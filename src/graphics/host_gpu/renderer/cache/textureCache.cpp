@@ -1340,14 +1340,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
-	PrepareStorageSampledOverlap(desc);
-
-	ImageId result {};
-	{
-		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
-
+	auto find_locked = [&](const ImageIds& candidates) -> ImageId {
+		ImageId result {};
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (!IsStorageSampledFormatMismatch(image, desc.info, desc.type) &&
@@ -1431,8 +1425,35 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
+		return result;
+	};
+
+	if (Config::TextureSingleWalkEnabled() &&
+	    (desc.type == BindingType::Texture || desc.type == BindingType::Storage)) {
+		ImageIds candidates;
+		bool     has_overlap = false;
+		{
+			std::scoped_lock lock {m_lock};
+			candidates = FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+			for (const auto id: candidates) {
+				const auto* image = m_slot_images.try_get(id);
+				if (image != nullptr &&
+				    IsStorageSampledFormatMismatch(*image, desc.info, desc.type)) {
+					has_overlap = true;
+					break;
+				}
+			}
+			if (!has_overlap) {
+				return find_locked(candidates);
+			}
+		}
+		PrepareStorageSampledOverlap(desc);
+	} else {
+		PrepareStorageSampledOverlap(desc);
 	}
-	return result;
+
+	std::scoped_lock lock {m_lock};
+	return find_locked(FindImagesInRegion(desc.info.data.address, desc.info.data.size, false));
 }
 
 void TextureCache::UpdateImage(ImageId id) {
@@ -1813,6 +1834,7 @@ void TextureCache::FlushPendingClears() {
 		if (image == nullptr) {
 			continue;   // retired between staging and flush
 		}
+		image->MarkHostInitialized();   // a clear produces defined contents
 		image->Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
 		               {}, native);
 		if (pending.is_depth) {

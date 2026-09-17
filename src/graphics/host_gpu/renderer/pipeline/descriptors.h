@@ -25,7 +25,28 @@ struct BufferView {
 	vk::Buffer     buffer = nullptr;
 	vk::DeviceSize offset = 0;
 	vk::DeviceSize range  = VK_WHOLE_SIZE;
+	// Byte adjustment folded into the packed memory offsets in user_data. Kept on the view so
+	// publication can rewrite both together and they cannot disagree.
+	uint32_t       publish_adjustment = 0;
 };
+
+// Result of the PURE texture-descriptor decode. Published so the differential test can compare
+// cached against uncached decoding without standing up a RenderExecutor.
+struct DecodedTexture {
+	ShaderTextureResource   descriptor {};
+	TextureCache::ImageDesc desc {};
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size_bytes        = 0;
+	bool                    storage           = false;
+	bool                    shader_conversion = false;
+	bool                    is_null           = false;
+};
+
+// Test seam: the pure decode, callable without a RenderExecutor.
+void DecodeTextureUncachedForTest(const ShaderRecompiler::IR::ImageResource&   resource,
+                                  const ShaderRecompiler::IR::DescriptorValue& value,
+                                  DecodedTexture&                              out);
 
 struct TextureBinding {
 	ImageId                    image_id;
@@ -55,9 +76,25 @@ struct PreparedBindings {
 	// Clamped against the guest range table by FindBuffers. RebindBuffers used to ask for the
 	// same answer a second time, and that query is a contended lock away.
 	std::vector<uint64_t>                         buffer_sizes;
+	// Identity for the publication step, one entry per buffer resource. A BufferId is exactly
+	// what retirement invalidates, so cache-backed bindings are re-derived from the GUEST RANGE.
+	// Stream-backed bindings carry no range and are republished verbatim.
+	struct PublishedBuffer {
+		uint64_t address   = 0;
+		uint64_t size      = 0;
+		uint32_t alignment = 0;
+		bool     stream    = false;
+		bool     resolved  = false;
+	};
+	std::vector<PublishedBuffer>                  buffer_publish;
 	std::vector<uint32_t>                         flattened_srt;
 	std::vector<uint32_t>                         user_data;
 	bool                                          committed = false;
+	// Set by PublishBuffers. CommitBindings asserts it: the user_data and flattened_srt uploads
+	// live in publication, so a caller that rebinds and commits without publishing leaves those
+	// descriptors unbound. That shipped once and died as view.buffer == nullptr at the commit
+	// site, which named the symptom and not the cause.
+	bool                                          published = false;
 };
 
 // Both stages' bindings for one draw.
