@@ -919,6 +919,9 @@ static std::atomic<uint64_t> g_draw_skip_empty {0};
 static std::atomic<uint64_t> g_draw_skip_metadata {0};
 static std::atomic<uint64_t> g_draw_skip_no_vs {0};
 static std::atomic<uint64_t> g_draw_skip_ge {0};
+// Diagnostic --skip-ps-chksum: draws whose draw command was omitted. Exact, unlike the old
+// every-20000 message.
+static std::atomic<uint64_t> g_draw_skip_ps_chksum {0};
 
 static std::atomic<uint64_t> g_draw_census_total {0};
 
@@ -981,7 +984,9 @@ void ReportCensus() {
 	            static_cast<double>(total) / static_cast<double>(frames),
 	            static_cast<unsigned long long>(frames));
 	for (size_t i = 0; i < 12 && rows[i].first != 0; i++) {
-		std::printf("  --skip-ps 0x%010llx   %6.0f draws/frame  %5.1f%%\n",
+		// Keyed on the checksum (NoteShaderDraw), so name the checksum flag: --skip-ps takes guest
+		// addresses and would silently match nothing.
+		std::printf("  --skip-ps-chksum 0x%08llx   %6.0f draws/frame  %5.1f%%\n",
 		            static_cast<unsigned long long>(rows[i].second),
 		            static_cast<double>(rows[i].first) / static_cast<double>(frames),
 		            static_cast<double>(rows[i].first) / static_cast<double>(total) * 100.0);
@@ -999,12 +1004,13 @@ static void DrawCensusTick() {
 	// LOGF is silenced in this build, so this census has never printed once and the skip rate is
 	// still unknown - and skipped draws dilute every per-draw average the profiler reports.
 	std::printf("DrawCensus: accepted=%" PRIu64 " skip_empty=%" PRIu64 " skip_metadata=%" PRIu64
-	     " skip_no_vs=%" PRIu64 " skip_ge=%" PRIu64 "\n",
+	     " skip_no_vs=%" PRIu64 " skip_ge=%" PRIu64 " skip_ps_chksum=%" PRIu64 "\n",
 	     g_draw_accepted.load(std::memory_order_relaxed),
 	     g_draw_skip_empty.load(std::memory_order_relaxed),
 	     g_draw_skip_metadata.load(std::memory_order_relaxed),
 	     g_draw_skip_no_vs.load(std::memory_order_relaxed),
-	     g_draw_skip_ge.load(std::memory_order_relaxed));
+	     g_draw_skip_ge.load(std::memory_order_relaxed),
+	     g_draw_skip_ps_chksum.load(std::memory_order_relaxed));
 	std::fflush(stdout);
 }
 
@@ -2595,18 +2601,25 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (set_auto_debug) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (Config::ShouldSkipPixelShaderChksum(buffer.GetShaders().GetPs().ps_regs.chksum)) {
-		static std::atomic<uint64_t> s_skipped {0};
-		if ((s_skipped.fetch_add(1, std::memory_order_relaxed) + 1) % 20000 == 0) {
-			std::printf("SkipPsChksum: 20000 draws skipped\n");
-			std::fflush(stdout);
-		}
-		return;
-	}
+	// Diagnostic, default off (--skip-ps-chksum). Selects by the pixel shader checksum, which is the
+	// declared hash the shader recompiler keys on. Only the draw command (EmitDrawPrimitives) is
+	// omitted: everything above - bindings and SRT materialization, vertex/index uploads, render
+	// targets, pipeline, descriptor commits, dynamic state, BeginRendering, pipeline bind - and the
+	// shader-write barrier teardown below still run. A speedup therefore measures the dropped draws
+	// and their downstream effects, not how efficient the shader is; it is never an optimization.
+	const auto ps_chksum      = buffer.GetShaders().GetPs().ps_regs.chksum;
+	const bool skip_ps_chksum = Config::ShouldSkipPixelShaderChksum(ps_chksum);
 	// Counted AFTER the skip: counting before made skipped draws indistinguishable from executed
 	// ones, so every A/B measured scene variation instead of the skip.
-	NoteShaderDraw(buffer.GetShaders().GetPs().ps_regs.chksum);
-	if (Config::ShouldSkipPixelShader(buffer.GetShaders().GetPs().ps_regs.data_addr)) {
+	if (!skip_ps_chksum) {
+		NoteShaderDraw(ps_chksum);
+	}
+	if (skip_ps_chksum) {
+		g_draw_skip_ps_chksum.fetch_add(1, std::memory_order_relaxed);
+		LogDrawPhase(draw.name, "DrawSkippedByShaderChksum");
+		DrawCensusTick();
+		begin_rendering_timer.Stop();
+	} else if (Config::ShouldSkipPixelShader(buffer.GetShaders().GetPs().ps_regs.data_addr)) {
 		// Diagnostic: drop every draw that uses this guest pixel shader.
 		LogDrawPhase(draw.name, "DrawSkippedByShaderFilter");
 	} else {

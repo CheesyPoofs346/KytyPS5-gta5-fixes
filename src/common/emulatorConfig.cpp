@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 
 namespace Config {
@@ -36,14 +39,24 @@ static std::atomic<bool>     g_coalesce_eop_flush {false};
 static std::atomic<bool>     g_light_partial_flush {false};
 static std::atomic<uint32_t> g_eop_flush_interval {1};
 static std::atomic<uint32_t> g_stream_repeat_threshold {0};
+static std::atomic<bool>     g_stream_read_census {false};
 static std::atomic<uint32_t> g_warmup_frames {0};
 static std::atomic<bool>     g_backing_fast_path {false};
+static std::atomic<bool>     g_texture_single_walk {false};
 static std::atomic<bool>     g_backing_lock_sample {false};
 static std::atomic<bool>     g_batch_census {false};
 static std::atomic<bool>     g_worker_resolve_images {false};
+static std::atomic<bool>     g_compiled_srt {false};
+static std::atomic<bool>     g_dma_census {false};
+static std::atomic<uint32_t> g_blocked_poll_us {0};
+static std::atomic<uint32_t> g_blocked_poll_tries {0};
+static std::atomic<bool>     g_buffer_census {false};
+static std::atomic<bool>     g_image_census {false};
+static std::atomic<bool>     g_buffer_growth {false};
 static std::atomic<bool> g_cache_descriptors {false};
 static std::atomic<bool> g_pipeline_memo {true};
 static std::atomic<bool> g_buffer_dedup {true};
+static std::atomic<bool> g_binding_publish {false};
 
 void Initialize() {
 	EXIT_IF(g_config != nullptr);
@@ -79,14 +92,24 @@ void Load(const ConfigOptions& cfg) {
 	g_light_partial_flush.store(cfg.light_partial_flush, std::memory_order_relaxed);
 	g_eop_flush_interval.store(cfg.eop_flush_interval, std::memory_order_relaxed);
 	g_stream_repeat_threshold.store(cfg.stream_repeat_threshold, std::memory_order_relaxed);
+	g_stream_read_census.store(cfg.stream_read_census, std::memory_order_relaxed);
 	g_warmup_frames.store(cfg.warmup_frames, std::memory_order_relaxed);
 	g_backing_fast_path.store(cfg.backing_fast_path, std::memory_order_relaxed);
+	g_texture_single_walk.store(cfg.texture_single_walk, std::memory_order_relaxed);
 	g_backing_lock_sample.store(cfg.backing_lock_sample, std::memory_order_relaxed);
 	g_batch_census.store(cfg.batch_census, std::memory_order_relaxed);
 	g_worker_resolve_images.store(cfg.worker_resolve_images, std::memory_order_relaxed);
+	g_compiled_srt.store(cfg.compiled_srt, std::memory_order_relaxed);
+	g_dma_census.store(cfg.dma_census, std::memory_order_relaxed);
+	g_blocked_poll_us.store(cfg.blocked_poll_us, std::memory_order_relaxed);
+	g_blocked_poll_tries.store(cfg.blocked_poll_tries, std::memory_order_relaxed);
+	g_buffer_census.store(cfg.buffer_census, std::memory_order_relaxed);
+	g_image_census.store(cfg.image_census, std::memory_order_relaxed);
+	g_buffer_growth.store(cfg.buffer_growth, std::memory_order_relaxed);
 	g_cache_descriptors.store(cfg.cache_descriptors, std::memory_order_relaxed);
 	g_pipeline_memo.store(cfg.pipeline_memo, std::memory_order_relaxed);
 	g_buffer_dedup.store(cfg.buffer_dedup, std::memory_order_relaxed);
+	g_binding_publish.store(cfg.binding_publish, std::memory_order_relaxed);
 	LogEffectiveSettings();
 }
 
@@ -223,6 +246,42 @@ bool BackingFastPath() {
 	return g_backing_fast_path.load(std::memory_order_relaxed);
 }
 
+bool TextureSingleWalkEnabled() {
+	return g_texture_single_walk.load(std::memory_order_relaxed);
+}
+
+bool BufferGrowthEnabled() {
+	return g_buffer_growth.load(std::memory_order_relaxed);
+}
+
+bool BufferCensusEnabled() {
+	return g_buffer_census.load(std::memory_order_relaxed);
+}
+
+bool ImageCensusEnabled() {
+	return g_image_census.load(std::memory_order_relaxed);
+}
+
+uint32_t BlockedPollMicros() {
+	return g_blocked_poll_us.load(std::memory_order_relaxed);
+}
+
+uint32_t BlockedPollTries() {
+	return g_blocked_poll_tries.load(std::memory_order_relaxed);
+}
+
+bool DmaCensusEnabled() {
+	return g_dma_census.load(std::memory_order_relaxed);
+}
+
+bool CompiledSrtEnabled() {
+	return g_compiled_srt.load(std::memory_order_relaxed);
+}
+
+void SetCompiledSrtForTest(bool enabled) {
+	g_compiled_srt.store(enabled, std::memory_order_relaxed);
+}
+
 bool WorkerResolveImages() {
 	return g_worker_resolve_images.load(std::memory_order_relaxed);
 }
@@ -243,6 +302,10 @@ uint32_t StreamRepeatThreshold() {
 	return g_stream_repeat_threshold.load(std::memory_order_relaxed);
 }
 
+bool StreamReadCensusEnabled() {
+	return g_stream_read_census.load(std::memory_order_relaxed);
+}
+
 bool LightPartialFlushEnabled() {
 	return g_light_partial_flush.load(std::memory_order_relaxed);
 }
@@ -261,6 +324,14 @@ bool DynStateCacheEnabled() {
 
 bool PipelineMemoEnabled() {
 	return g_pipeline_memo.load(std::memory_order_relaxed);
+}
+
+void SetBindingPublishForTest(bool enabled) {
+	g_binding_publish.store(enabled, std::memory_order_relaxed);
+}
+
+bool BindingPublishEnabled() {
+	return g_binding_publish.load(std::memory_order_relaxed);
 }
 
 bool BufferDedupEnabled() {
@@ -371,6 +442,25 @@ bool ShouldSkipPixelShaderChksum(uint64_t chksum) {
 		return false;
 	}
 	return std::find(list.begin(), list.end(), chksum) != list.end();
+}
+
+bool ParsePixelShaderChksum(const char* text, uint64_t& chksum) {
+	// strtoull skips whitespace and accepts a sign ("-1" becomes 2^64-1), so require a digit first.
+	if (text == nullptr || text[0] < '0' || text[0] > '9') {
+		return false;
+	}
+	// A leading zero followed by a digit would be read as octal.
+	if (text[0] == '0' && text[1] >= '0' && text[1] <= '9') {
+		return false;
+	}
+	errno            = 0;
+	char*      end   = nullptr;
+	const auto value = std::strtoull(text, &end, 0);
+	if (errno != 0 || end == text || *end != '\0' || value == 0 || value > UINT32_MAX) {
+		return false;
+	}
+	chksum = value;
+	return true;
 }
 
 bool SkipDistantLayer() {
@@ -511,11 +601,21 @@ void LogEffectiveSettings() {
 	std::printf("  %-28s %u\n", "pipeline_depth", g_pipeline_depth.load(std::memory_order_relaxed));
 	std::printf("  %-28s %u\n", "eop_flush_interval", g_eop_flush_interval.load(std::memory_order_relaxed));
 	std::printf("  %-28s %u\n", "stream_repeat_threshold", g_stream_repeat_threshold.load(std::memory_order_relaxed));
+	std::printf("  %-28s %s\n", "stream_read_census", g_stream_read_census.load(std::memory_order_relaxed) ? "true" : "false");
 	std::printf("  %-28s %u\n", "warmup_frames", g_warmup_frames.load(std::memory_order_relaxed));
 	std::printf("  %-28s %s\n", "backing_fast_path", g_backing_fast_path.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "texture_single_walk", g_texture_single_walk.load(std::memory_order_relaxed) ? "true" : "false");
 	std::printf("  %-28s %s\n", "backing_lock_sample", g_backing_lock_sample.load(std::memory_order_relaxed) ? "true" : "false");
 	std::printf("  %-28s %s\n", "batch_census", g_batch_census.load(std::memory_order_relaxed) ? "true" : "false");
 	std::printf("  %-28s %s\n", "worker_resolve_images", g_worker_resolve_images.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "compiled_srt", g_compiled_srt.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "dma_census", g_dma_census.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %u\n", "blocked_poll_us", g_blocked_poll_us.load(std::memory_order_relaxed));
+	std::printf("  %-28s %u\n", "blocked_poll_tries", g_blocked_poll_tries.load(std::memory_order_relaxed));
+	std::printf("  %-28s %s\n", "buffer_census", g_buffer_census.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "image_census", g_image_census.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "buffer_growth", g_buffer_growth.load(std::memory_order_relaxed) ? "true" : "false");
+	std::printf("  %-28s %s\n", "binding_publish", g_binding_publish.load(std::memory_order_relaxed) ? "true" : "false");
 	std::fflush(stdout);
 }
 

@@ -1,5 +1,6 @@
 #include <chrono>
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/blockedQueueWait.h"
 
 #include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/drawStateSnapshot.h"
@@ -192,6 +193,7 @@ void NoteEventWrite(uint32_t event_type) {
 
 std::atomic<uint64_t> g_blocked_polls {0};
 std::atomic<uint64_t> g_blocked_poll_ns {0};
+BlockedPollStats      g_blocked_poll_stats {};
 std::chrono::steady_clock::time_point g_census_start {};
 
 void ReportFrameThreadCensus(int frame) {
@@ -221,6 +223,28 @@ void ReportFrameThreadCensus(int frame) {
 		            static_cast<double>(polls) / frames,
 		            static_cast<double>(poll_ns) / frames / 1e6,
 		            100.0 * static_cast<double>(poll_ns) / wall_ns);
+		const auto waits    = g_blocked_poll_stats.timed_waits.exchange(0, std::memory_order_relaxed);
+		const auto early    = g_blocked_poll_stats.wake_before_timeout.exchange(0, std::memory_order_relaxed);
+		const auto expired  = g_blocked_poll_stats.timed_out.exchange(0, std::memory_order_relaxed);
+		const auto pauses   = g_blocked_poll_stats.short_pauses.exchange(0, std::memory_order_relaxed);
+		const auto advanced = g_blocked_poll_stats.retry_advanced.exchange(0, std::memory_order_relaxed);
+		const auto stuck    = g_blocked_poll_stats.retry_still_blocked.exchange(0, std::memory_order_relaxed);
+		// "woke early" counts returns before the deadline. It does NOT mean a producer notified
+		// us about the blocking condition: spurious wakes and unrelated submit/command signals
+		// land here too.
+		std::printf("    timed waits %llu (woke early %llu = %.0f%%, timed out %llu) | short "
+		            "pauses %llu | retries advanced %llu, still blocked %llu "
+		            "(%.0f%% bought nothing)\n",
+		            static_cast<unsigned long long>(waits),
+		            static_cast<unsigned long long>(early),
+		            waits > 0 ? 100.0 * static_cast<double>(early) / static_cast<double>(waits) : 0.0,
+		            static_cast<unsigned long long>(expired),
+		            static_cast<unsigned long long>(pauses),
+		            static_cast<unsigned long long>(advanced),
+		            static_cast<unsigned long long>(stuck),
+		            (advanced + stuck) > 0
+		                ? 100.0 * static_cast<double>(stuck) / static_cast<double>(advanced + stuck)
+		                : 0.0);
 		std::fflush(stdout);
 	}
 	g_census_start = now;
@@ -634,6 +658,26 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
                                uint64_t src_address_or_offset_or_immediate, uint32_t num_bytes,
                                uint8_t wait_for_previous, uint8_t write_confirm,
                                uint8_t block_engine) {
+	// Diagnostic, off by default. Times the whole handler including any early return, so the
+	// figure is what the submission thread actually spent here.
+	struct DmaCensusScope {
+		bool                                           on;
+		uint32_t                                       bytes;
+		std::chrono::steady_clock::time_point          start;
+		explicit DmaCensusScope(uint32_t n)
+		    : on(Config::DmaCensusEnabled()), bytes(n),
+		      start(on ? std::chrono::steady_clock::now()
+		               : std::chrono::steady_clock::time_point {}) {}
+		~DmaCensusScope() {
+			if (on) {
+				DmaCensusAdd(bytes, static_cast<uint64_t>(
+				                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+				                            std::chrono::steady_clock::now() - start)
+				                            .count()));
+			}
+		}
+	} dma_census_scope {num_bytes};
+
 	EXIT_NOT_IMPLEMENTED(engine > 1);
 	if (num_bytes == 0) {
 		return;
@@ -757,6 +801,12 @@ void GuestGpu::ThreadRun(void* data) {
 	g_gpu_thread = true;
 	g_gpu_state  = gpu;
 
+	// Set when the previous iteration ended in a blocked-queue wait, so the next processed
+	// submission can be classified: did retrying the blocked packet let the queue move, or did
+	// it block again on the same comparison?
+	bool after_poll = false;
+	// Bounds the short-pause budget to one blocking episode: reset whenever a retry advances.
+	BlockedPollState poll_state {};
 	for (;;) {
 		Submission                   submission;
 		Common::UniqueFunction<void> command;
@@ -790,18 +840,55 @@ void GuestGpu::ThreadRun(void* data) {
 				if (selected_queue < 0) {
 					gpu->m_processing = false;
 					const auto poll_start = std::chrono::steady_clock::now();
-					gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+					// A local class in a member function may touch GuestGpu privates. It exists
+					// so the offline harness can drive the same wait algorithm against a fake
+					// producer whose readiness time it controls.
+					struct Backend {
+						GuestGpu* gpu;
+						bool      Runnable() const {
+							if (!gpu->m_commands.empty()) {
+								return true;
+							}
+							for (const auto& queue: gpu->m_queues) {
+								if (!queue.empty() && !queue.front().blocked) {
+									return true;
+								}
+							}
+							return false;
+						}
+						bool Stopping() const { return gpu->m_stopping; }
+						void ClearBlocked() const {
+							for (auto& queue: gpu->m_queues) {
+								if (!queue.empty()) {
+									queue.front().blocked = false;
+								}
+							}
+						}
+						BlockedWaitWake TimedWait(uint32_t micros) const {
+							return gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, micros)
+							           ? BlockedWaitWake::BeforeTimeout
+							           : BlockedWaitWake::TimedOut;
+						}
+						// Releases the queue mutex for the pause: producers take the same mutex
+						// to enqueue, so holding it here would block the work being waited on.
+						void PauseUnlocked(uint32_t micros) const {
+							gpu->m_queue_mutex.Unlock();
+							Common::Thread::SleepMicro(micros);
+							gpu->m_queue_mutex.Lock();
+						}
+					} backend {gpu};
+					const BlockedPollConfig poll_config {
+					    .short_micros = Config::BlockedPollMicros(),
+					    .short_tries  = Config::BlockedPollTries(),
+					};
+					AwaitBlockedQueues(backend, poll_config, poll_state, g_blocked_poll_stats);
 					g_blocked_polls.fetch_add(1, std::memory_order_relaxed);
 					g_blocked_poll_ns.fetch_add(
 					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 					                              std::chrono::steady_clock::now() - poll_start)
 					                              .count()),
 					    std::memory_order_relaxed);
-					for (auto& queue: gpu->m_queues) {
-						if (!queue.empty()) {
-							queue.front().blocked = false;
-						}
-					}
+					after_poll = true;
 					continue;
 				}
 				auto& queue = gpu->m_queues[static_cast<uint32_t>(selected_queue)];
@@ -821,6 +908,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		if (command) {
+			after_poll = false;
 			EXIT_IF(g_current_processor != nullptr);
 			command();
 
@@ -835,6 +923,18 @@ void GuestGpu::ThreadRun(void* data) {
 		EXIT_IF(!has_submission);
 		const auto process_start = std::chrono::steady_clock::now();
 		const bool complete      = gpu->Process(submission);
+		if (after_poll) {
+			// Advanced: the retry consumed packets or finished the submission.
+			// Still blocked: it re-tested the same condition and suspended again, so that poll
+			// bought nothing. Neither says WHEN the awaited value actually became ready.
+			const bool advanced = complete || submission.command_execution.MadeProgress() ||
+			                      submission.constant_execution.MadeProgress();
+			NoteBlockedRetry(g_blocked_poll_stats, advanced);
+			if (advanced) {
+				poll_state.Reset();
+			}
+			after_poll = false;
+		}
 		g_gpu_busy_ns.fetch_add(
 		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 		                              std::chrono::steady_clock::now() - process_start)
