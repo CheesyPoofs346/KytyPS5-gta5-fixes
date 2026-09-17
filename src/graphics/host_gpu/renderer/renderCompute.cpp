@@ -498,8 +498,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			m_context.GetGpuResources().PrepareBda();
 		}
 	}
-	RebindBuffers(bindings);
-	RebindImages(bindings);
+	// One call, so rebinding without publishing is not expressible. Publication owns the
+	// user_data and flattened_srt uploads; skipping it left every dispatch committing with
+	// unbound descriptors, which is how the first smoke test died.
+	PreparedBindings* stages[1] = {&bindings};
+	FinalizeBindings(std::span<PreparedBindings* const> {stages, 1u});
 
 	auto              vk_buffer        = buffer.Handle();
 	PreparedBindings* descriptor_stage = &bindings;

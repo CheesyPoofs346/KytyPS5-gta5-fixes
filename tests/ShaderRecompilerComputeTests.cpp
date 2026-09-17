@@ -83,6 +83,8 @@
 #include <set>
 #include <span>
 #include <sstream>
+#include <functional>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -212,7 +214,7 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<TrackingSharedLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 
@@ -467,10 +469,6 @@ struct RenderExecutorTestAccess {
       device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout,
                                         nullptr);
     }
-  }
-
-  static const auto &PushConstants(const RenderExecutor &executor) {
-    return executor.m_push_constants;
   }
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
@@ -989,6 +987,9 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
   std::string expected_compile_error;
+  // Test-only: rewire the translated IR before SPIR-V is re-emitted (emitter coverage shapes that
+  // guest code alone does not produce).
+  std::function<void(ShaderRecompiler::IR::Program &)> mutate_ir;
 };
 
 struct GraphicsCase {
@@ -1241,6 +1242,16 @@ CompiledShader CompileCase(const TestCase &test) {
                 std::ranges::count(binding->resources, resource) ==
                     test.expected_storage_mip_descriptors,
             "dynamic storage image did not receive one descriptor per mip");
+  }
+  if (test.mutate_ir) {
+    test.mutate_ir(result.program);
+    std::vector<u32> mutated_spirv;
+    if (!ShaderRecompiler::Spirv::EmitProgram(result.program, result.resources,
+                                              options.input_info, mutated_spirv,
+                                              &error)) {
+      Fail(test.name, "SPIR-V emit (mutated IR)", error.c_str());
+    }
+    result.spirv = std::move(mutated_spirv);
   }
   if (test.expand_shader_data_storage) {
     auto &block = *result.program.blocks.front();
@@ -1607,15 +1618,8 @@ public:
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
-    const auto &bank =
-        RenderExecutorTestAccess::PushConstants(context.GetRenderExecutor());
-    Require(name, "packing",
-            bank[0] == 0x11111111u && bank[1] == 0x22222222u &&
-                bank[2] == 0x33333333u && bank[3] == 0x44444444u &&
-                std::ranges::all_of(bank.begin() + 4, bank.end(),
-                                    [](uint32_t value) { return value == 0; }) &&
-                vertex.committed && pixel.committed,
-            "graphics stages were not packed into one zero-filled push bank");
+    Require(name, "commit", vertex.committed && pixel.committed,
+            "graphics stages did not commit their push-constant bindings");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
@@ -7403,6 +7407,26 @@ public:
                                    vk::ImageUsageFlagBits::eStorage);
       const auto storage_id = texture_cache.FindImage(storage);
       (void)texture_cache.FindTexture(storage_id, storage);
+      const auto ordinary_epoch_before = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      auto ordinary_storage = MakeAtlasDesc(BindingType::Storage, vk::Format::eR8Uint,
+                                             Prospero::BufferFormat::k8UInt,
+                                             vk::ImageUsageFlagBits::eStorage);
+      const auto ordinary_storage_id = texture_cache.FindImage(ordinary_storage);
+      const auto ordinary_epoch_after = TextureCacheTestAccess::QueryEpoch(texture_cache);
+	  const auto expected_walks = Config::TextureSingleWalkEnabled() ? 1u : 2u;
+      Require(name, "same-format storage cache hit",
+              storage_id && ordinary_storage_id == storage_id,
+              "identical storage descriptor did not reuse its cache image");
+      Require(name, "ordinary hit takes one region walk",
+              ordinary_epoch_after - ordinary_epoch_before == expected_walks,
+              "ordinary storage cache hit repeated image-region discovery");
+	  std::printf("[host]    storage cache hit walks=%u texture_single_walk=%s\n",
+	              ordinary_epoch_after - ordinary_epoch_before,
+	              Config::TextureSingleWalkEnabled() ? "true" : "false");
+      texture_cache.MarkGpuWritten(storage_id);
+      Require(name, "GPU-modified storage setup",
+              texture_cache.GetImage(storage_id).IsGpuModified(),
+              "storage image did not enter the GPU-owned state before reinterpretation");
       auto sampled = MakeAtlasDesc(BindingType::Texture, vk::Format::eR8Unorm,
                                    Prospero::BufferFormat::k8UNorm,
                                    vk::ImageUsageFlagBits::eSampled);
@@ -9981,7 +10005,9 @@ public:
                 const Image *sampled_image = nullptr,
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
-                vk::Sampler sampler = nullptr) {
+                vk::Sampler sampler = nullptr, u32 warm_dispatches = 0,
+                u32 timed_dispatches = 0, uint64_t *elapsed_ticks = nullptr,
+                float *timestamp_period = nullptr) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto Binding = [&](Kind kind) {
@@ -10402,7 +10428,36 @@ public:
                         layout.push_constant_size,
                         compiled.packed_user_data.data());
     }
-    cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    vk::QueryPool timing_pool = nullptr;
+    if (elapsed_ticks != nullptr) {
+      // Benchmark path: pipeline, descriptors and buffers were created above and submission
+      // happens below, so the TOP..BOTTOM bracket covers only the repeated dispatch commands.
+      u32 family_count = 0;
+      m_physical_device.getQueueFamilyProperties(&family_count, nullptr);
+      std::vector<vk::QueueFamilyProperties> families(family_count);
+      m_physical_device.getQueueFamilyProperties(&family_count, families.data());
+      Require(test.name, "timed dispatch",
+              families[m_queue_family].timestampValidBits >= 64u,
+              "queue family does not provide 64-bit timestamps");
+      vk::QueryPoolCreateInfo query_info{};
+      query_info.sType = vk::StructureType::eQueryPoolCreateInfo;
+      query_info.queryType = vk::QueryType::eTimestamp;
+      query_info.queryCount = 2;
+      RequireVk(test.name, "timed dispatch",
+                m_device.createQueryPool(&query_info, nullptr, &timing_pool),
+                "vkCreateQueryPool");
+      cmd.resetQueryPool(timing_pool, 0, 2);
+      for (u32 i = 0; i < warm_dispatches; i++) {
+        cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+      }
+      cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, timing_pool, 0);
+      for (u32 i = 0; i < timed_dispatches; i++) {
+        cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+      }
+      cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, timing_pool, 1);
+    } else {
+      cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
+    }
 
     if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
@@ -10435,6 +10490,24 @@ public:
                           &barrier, 0, nullptr);
     }
     EndSubmitAndFree(test.name, "dispatch", cmd);
+    if (timing_pool != nullptr) {
+      // The fence already completed; availability is checked, never waited for.
+      std::array<uint64_t, 4> data{};
+      const auto result = m_device.getQueryPoolResults(
+          timing_pool, 0, 2, sizeof(data), data.data(), 2 * sizeof(uint64_t),
+          vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+      Require(test.name, "timed dispatch",
+              result == vk::Result::eSuccess && data[1] != 0 && data[3] != 0 &&
+                  data[2] >= data[0],
+              "timestamps unavailable after the command buffer completed");
+      *elapsed_ticks = data[2] - data[0];
+      if (timestamp_period != nullptr) {
+        vk::PhysicalDeviceProperties properties{};
+        m_physical_device.getProperties(&properties);
+        *timestamp_period = properties.limits.timestampPeriod;
+      }
+      m_device.destroyQueryPool(timing_pool, nullptr);
+    }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
     }
@@ -16097,6 +16170,343 @@ TestCase VectorSpecialF32FlushesDenormalInputs() {
           {O::V_MOV_B32, O::V_LOG_F32, O::V_RCP_F32, O::V_RSQ_F32,
            O::V_SQRT_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
+
+TestCase VectorDenormFlushReusesBitcastSource(u32 repeats = 1) {
+  using O = ShaderOpcode;
+
+  // Runtime (buffer-loaded) f32 bits, so the u32->f32 bitcast cannot be constant folded and reaches
+  // every denormal-flushing unary op. Outputs occupy dwords [0, 85); inputs follow them so that
+  // no store overwrites an input before it is read.
+  constexpr std::array<u32, 17> inputs = {
+      0x00000000u, // +0
+      0x80000000u, // -0
+      0x00000001u, // min +subnormal
+      0x007fffffu, // max +subnormal
+      0x80000001u, // min -subnormal
+      0x807fffffu, // max -subnormal
+      0x00800000u, // min +normal
+      0x3f800000u, // 1.0
+      0x40800000u, // 4.0
+      0xc0000000u, // -2.0
+      0x7f7fffffu, // max finite
+      0x7f800000u, // +inf
+      0xff800000u, // -inf
+      0x7fc00000u, // qNaN
+      0x7fc12345u, // qNaN payload
+      0x7f800001u, // sNaN min payload
+      0xffa5a5a5u, // -sNaN payload
+  };
+  constexpr std::array<u32, 5> ops = {0x33u, 0x2eu, 0x27u, 0x25u, 0x2au};
+  std::vector<u32> code;
+  // Benchmark workload: the whole body repeats; every repeat rewrites the same outputs.
+  for (u32 repeat = 0; repeat < repeats; repeat++)
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendVMovU32(&code, 30, (85u + i) * 4u);
+    AppendBufferLoadDword(&code, 14, 30);
+    for (u32 k = 0; k < ops.size(); k++) {
+      code.push_back(EncodeVop1(ops[k], 15 + k, Vgpr(14)));
+    }
+    for (u32 k = 0; k < ops.size(); k++) {
+      AppendStoreVgpr(&code, 15 + k, i * ops.size() + k);
+    }
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDenormFlushReusesBitcastSource";
+  test.code = std::move(code);
+  test.initial.assign(85u, 0u);
+  test.initial.insert(test.initial.end(), inputs.begin(), inputs.end());
+  // Per input, in order: sqrt, rsqrt, log2, exp2, reciprocal.
+  test.expected = {
+      0x00000000u, 0x7f800000u, 0xff800000u, 0x3f800000u, 0x7f800000u, // +0
+      0x80000000u, 0xff800000u, 0xff800000u, 0x3f800000u, 0xff800000u, // -0
+      0x00000000u, 0x7f800000u, 0xff800000u, 0x3f800000u, 0x7f800000u, // min +subnormal
+      0x00000000u, 0x7f800000u, 0xff800000u, 0x3f800000u, 0x7f800000u, // max +subnormal
+      0x80000000u, 0xff800000u, 0xff800000u, 0x3f800000u, 0xff800000u, // min -subnormal
+      0x80000000u, 0xff800000u, 0xff800000u, 0x3f800000u, 0xff800000u, // max -subnormal
+      0x20000000u, 0x5f000000u, 0xc2fbffffu, 0x3f800000u, 0x7e800000u, // min +normal
+      0x3f800000u, 0x3f800000u, 0x00000000u, 0x40000000u, 0x3f800000u, // 1.0
+      0x40000000u, 0x3f000000u, 0x40000000u, 0x41800000u, 0x3e800000u, // 4.0
+      0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x3e800000u, 0xbf000000u, // -2.0
+      0x5f7fffffu, 0x1f800000u, 0x42ffffffu, 0x7f800000u, 0x00000000u, // max finite
+      0x7f800000u, 0x00000000u, 0x7f800000u, 0x7f800000u, 0x00000000u, // +inf
+      0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x00000000u, 0x80000000u, // -inf
+      0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, // qNaN
+      0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, // qNaN payload
+      0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, // sNaN min payload
+      0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, 0x7fffffffu, // -sNaN payload
+  };
+  test.opcodes = {O::V_MOV_B32,  O::BUFFER_LOAD_DWORD, O::V_SQRT_F32,
+                  O::V_RSQ_F32,  O::V_LOG_F32,          O::V_EXP_F32,
+                  O::V_RCP_F32,  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// Counts OpBitcast u32 instructions whose operand is an OpBitcast f32 of a u32 value: a u32 that is
+// cast to f32 and straight back. Test-only; parses the plain (numeric id) disassembly.
+size_t CountU32F32U32BitcastRoundTrips(const char *name,
+                                       const std::vector<u32> &spirv) {
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  if (!tools.Disassemble(spirv, &text, SPV_BINARY_TO_TEXT_OPTION_NO_HEADER)) {
+    Fail(name, "SPIR-V disassembly", "failed to disassemble emitted SPIR-V");
+  }
+  std::unordered_map<std::string, std::string> scalar_kind;
+  std::unordered_map<std::string, std::string> value_type;
+  std::unordered_map<std::string, std::pair<std::string, std::string>> bitcasts;
+  std::istringstream lines(text);
+  std::string line;
+  while (std::getline(lines, line)) {
+    std::istringstream words(line);
+    std::vector<std::string> tokens;
+    for (std::string token; words >> token;) {
+      tokens.push_back(token);
+    }
+    if (tokens.size() < 3 || tokens[1] != "=") {
+      continue;
+    }
+    const auto &result = tokens[0];
+    const auto &opcode = tokens[2];
+    if (opcode == "OpTypeInt" && tokens.size() >= 5 && tokens[3] == "32" &&
+        tokens[4] == "0") {
+      scalar_kind[result] = "u32";
+    } else if (opcode == "OpTypeFloat" && tokens.size() >= 4 &&
+               tokens[3] == "32") {
+      scalar_kind[result] = "f32";
+    } else if (opcode.rfind("OpType", 0) != 0 && tokens.size() >= 4) {
+      value_type[result] = tokens[3];
+      if (opcode == "OpBitcast" && tokens.size() >= 5) {
+        bitcasts[result] = {tokens[3], tokens[4]};
+      }
+    }
+  }
+  size_t count = 0;
+  for (const auto &[result, cast] : bitcasts) {
+    if (scalar_kind[cast.first] != "u32") {
+      continue;
+    }
+    const auto middle = bitcasts.find(cast.second);
+    if (middle == bitcasts.end() || scalar_kind[middle->second.first] != "f32") {
+      continue;
+    }
+    const auto source = value_type.find(middle->second.second);
+    if (source != value_type.end() && scalar_kind[source->second] == "u32") {
+      count++;
+    }
+  }
+  return count;
+}
+
+namespace DenormCoverage {
+
+using IrInst = ShaderRecompiler::IR::Inst;
+using IrOp = ShaderRecompiler::IR::ValueOpcode;
+
+constexpr std::array<u32, 17> kAllInputs = {
+    0x00000000u, 0x80000000u, 0x00000001u, 0x007fffffu, 0x80000001u, 0x807fffffu,
+    0x00800000u, 0x3f800000u, 0x40800000u, 0xc0000000u, 0x7f7fffffu, 0x7f800000u,
+    0xff800000u, 0x7fc00000u, 0x7fc12345u, 0x7f800001u, 0xffa5a5a5u};
+// +0, -0, max +subnormal, max -subnormal, 1.0, -2.0, +inf, qNaN payload.
+constexpr std::array<u32, 8> kBranchInputs = {0x00000000u, 0x80000000u, 0x007fffffu,
+                                              0x807fffffu, 0x3f800000u, 0xc0000000u,
+                                              0x7f800000u, 0x7fc12345u};
+
+struct Case {
+  TestCase test;
+  u32 outputs = 0;
+};
+
+std::vector<IrInst *> Find(ShaderRecompiler::IR::Program &program, IrOp op) {
+  std::vector<IrInst *> found;
+  for (auto *block : program.blocks) {
+    for (auto &inst : block->Instructions()) {
+      if (inst.GetOpcode() == op) {
+        found.push_back(&inst);
+      }
+    }
+  }
+  return found;
+}
+
+IrInst *F32BitcastProducer(const IrInst &inst) {
+  auto *producer = inst.Arg(0).Resolve().TryInstruction();
+  return producer != nullptr && producer->GetOpcode() == IrOp::BitCastF32U32 ? producer
+                                                                             : nullptr;
+}
+
+// True when `value` is `source`, or a phi web whose every non-phi incoming value is `source`. The
+// irreducible loop reaches the consumer through such phis; the register is never rewritten.
+bool SameRegisterValue(ShaderRecompiler::IR::Value value, ShaderRecompiler::IR::Value source) {
+  value = value.Resolve();
+  source = source.Resolve();
+  if (value == source) {
+    return true;
+  }
+  if (!value.IsPhi()) {
+    return false;
+  }
+  std::vector<IrInst *> pending{value.Instruction()};
+  std::set<IrInst *> seen;
+  while (!pending.empty()) {
+    auto *phi = pending.back();
+    pending.pop_back();
+    if (!seen.insert(phi).second) {
+      continue;
+    }
+    for (size_t i = 0; i < phi->NumArgs(); i++) {
+      const auto incoming = phi->Arg(i).Resolve();
+      if (incoming == source) {
+        continue;
+      }
+      if (!incoming.IsPhi()) {
+        return false;
+      }
+      pending.push_back(incoming.Instruction());
+    }
+  }
+  return true;
+}
+
+// Point each `consumer` op (i-th in program order) at the u32->f32 bitcast feeding the i-th `source`
+// op. Both read the same register bits, so program semantics are unchanged; only which bitcast
+// instance the consumer uses changes.
+void RewireToSourceBitcast(const char *name, ShaderRecompiler::IR::Program &program,
+                           IrOp consumer_op, IrOp source_op, size_t count,
+                           bool want_cross_block, bool want_dispatcher) {
+  Require(name, "coverage IR", program.dispatcher_fallback == want_dispatcher,
+          want_dispatcher ? "expected the dispatcher fallback" : "expected structured emission");
+  const auto consumers = Find(program, consumer_op);
+  const auto sources = Find(program, source_op);
+  Require(name, "coverage IR", consumers.size() == count && sources.size() == count,
+          "unexpected consumer/source op counts");
+  for (size_t i = 0; i < count; i++) {
+    auto *producer = F32BitcastProducer(*sources[i]);
+    auto *own = F32BitcastProducer(*consumers[i]);
+    Require(name, "coverage IR", producer != nullptr && own != nullptr,
+            "consumer and source must both be fed by u32->f32 bitcasts");
+    Require(name, "coverage IR", SameRegisterValue(own->Arg(0), producer->Arg(0)),
+            "consumer and source do not read the same u32 bits");
+    Require(name, "coverage IR",
+            (producer->Parent() != consumers[i]->Parent()) == want_cross_block,
+            "block placement differs from the intended shape");
+    consumers[i]->SetArg(0, ShaderRecompiler::IR::Value(producer));
+  }
+}
+
+std::vector<u32> InitialWith(u32 outputs, const u32 *inputs, size_t count) {
+  std::vector<u32> initial(outputs, 0u);
+  initial.insert(initial.end(), inputs, inputs + count);
+  return initial;
+}
+
+void PatchBranch(std::vector<u32> *code, size_t at, u32 opcode, size_t target) {
+  const auto offset = static_cast<int64_t>(target) - static_cast<int64_t>(at + 1);
+  (*code)[at] = EncodeSopp(opcode, static_cast<u32>(offset) & 0xffffu);
+}
+
+// Single block. The flushing sqrt keeps its f32 bitcast for a second, non-flushing consumer
+// (floor), so after the fix that f32 value stays live while the flush reuses the u32.
+Case SharedF32Consumer() {
+  const u32 outputs = 2u * kAllInputs.size();
+  std::vector<u32> code;
+  for (u32 i = 0; i < kAllInputs.size(); i++) {
+    AppendVMovU32(&code, 30, (outputs + i) * 4u);
+    AppendBufferLoadDword(&code, 14, 30);
+    code.push_back(EncodeVop1(0x33, 15, Vgpr(14)));  // V_SQRT_F32 (flush)
+    code.push_back(EncodeVop1(0x24, 16, Vgpr(14)));  // V_FLOOR_F32
+    AppendStoreVgpr(&code, 15, 2u * i);
+    AppendStoreVgpr(&code, 16, 2u * i + 1u);
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "DenormFlushSharedF32Consumer";
+  test.code = std::move(code);
+  test.initial = InitialWith(outputs, kAllInputs.data(), kAllInputs.size());
+  test.opcodes = {ShaderOpcode::V_SQRT_F32, ShaderOpcode::V_FLOOR_F32};
+  test.mutate_ir = [](ShaderRecompiler::IR::Program &program) {
+    RewireToSourceBitcast("DenormFlushSharedF32Consumer", program, IrOp::FPFloor32,
+                          IrOp::FPSqrt, kAllInputs.size(), false, false);
+  };
+  return {std::move(test), outputs};
+}
+
+// Entry loads every input and floors it; the flushing sqrt runs in a later block and is pointed at
+// the entry block's bitcast. `irreducible` wraps the sqrt block in the irreducible loop shape from
+// DispatcherIrreducibleControlFlow so emission takes the dispatcher fallback.
+Case CrossBlock(bool irreducible) {
+  const u32 n = static_cast<u32>(kBranchInputs.size());
+  const u32 outputs = 2u * n;
+  std::vector<u32> code;
+  for (u32 i = 0; i < n; i++) {
+    AppendVMovU32(&code, 30, (outputs + i) * 4u);
+    AppendBufferLoadDword(&code, i, 30);
+    code.push_back(EncodeVop1(0x24, 8, Vgpr(i)));  // V_FLOOR_F32
+    AppendStoreVgpr(&code, 8, i);
+  }
+  const auto append_sqrt_block = [&] {
+    for (u32 i = 0; i < n; i++) {
+      code.push_back(EncodeVop1(0x33, 9, Vgpr(i)));  // V_SQRT_F32 (flush)
+      AppendStoreVgpr(&code, 9, n + i);
+    }
+  };
+  if (!irreducible) {
+    // entry -> join when SCC is zero, else through a one-word block; join runs the flushes.
+    const auto branch = code.size();
+    code.push_back(0u);
+    code.push_back(EncodeVop1(0x01, 10, InlineU32(0)));
+    PatchBranch(&code, branch, 0x04, code.size());  // S_CBRANCH_SCC0
+    append_sqrt_block();
+  } else {
+    // entry -> B (SCC set) or A; A exits while SCC is zero, else falls to B; B -> A.
+    const auto to_b = code.size();
+    code.push_back(0u);
+    const auto block_a = code.size();
+    append_sqrt_block();
+    const auto exit_branch = code.size();
+    code.push_back(0u);
+    const auto block_b = code.size();
+    code.push_back(0u);
+    PatchBranch(&code, to_b, 0x05, block_b);        // S_CBRANCH_SCC1
+    PatchBranch(&code, block_b, 0x02, block_a);     // S_BRANCH
+    PatchBranch(&code, exit_branch, 0x04, code.size());  // S_CBRANCH_SCC0 -> end
+  }
+  AppendEnd(&code);
+  TestCase test;
+  test.name = irreducible ? "DenormFlushCrossBlockDispatcher" : "DenormFlushCrossBlockStructured";
+  test.code = std::move(code);
+  test.initial = InitialWith(outputs, kBranchInputs.data(), kBranchInputs.size());
+  test.opcodes = {ShaderOpcode::V_SQRT_F32, ShaderOpcode::V_FLOOR_F32};
+  test.mutate_ir = [irreducible, n](ShaderRecompiler::IR::Program &program) {
+    RewireToSourceBitcast(irreducible ? "DenormFlushCrossBlockDispatcher"
+                                      : "DenormFlushCrossBlockStructured",
+                          program, IrOp::FPSqrt, IrOp::FPFloor32, n, true, irreducible);
+  };
+  return {std::move(test), outputs};
+}
+
+void WriteSpirv(const std::string &path, const std::vector<u32> &spirv) {
+  std::FILE *out = std::fopen(path.c_str(), "wb");
+  Require(path.c_str(), "SPIR-V dump", out != nullptr, "cannot open dump file");
+  std::fwrite(spirv.data(), sizeof(u32), spirv.size(), out);
+  std::fclose(out);
+}
+
+std::vector<u32> ReadSpirv(const std::string &path) {
+  std::FILE *in = std::fopen(path.c_str(), "rb");
+  Require(path.c_str(), "SPIR-V load", in != nullptr, "cannot open SPIR-V file");
+  std::fseek(in, 0, SEEK_END);
+  const auto bytes = std::ftell(in);
+  std::fseek(in, 0, SEEK_SET);
+  Require(path.c_str(), "SPIR-V load", bytes > 0 && bytes % 4 == 0, "bad SPIR-V size");
+  std::vector<u32> words(static_cast<size_t>(bytes) / 4u);
+  const auto read = std::fread(words.data(), sizeof(u32), words.size(), in);
+  std::fclose(in);
+  Require(path.c_str(), "SPIR-V load", read == words.size(), "short SPIR-V read");
+  return words;
+}
+
+} // namespace DenormCoverage
 
 TestCase VectorRcpIflagF32IntegerReciprocal() {
   using O = ShaderOpcode;
@@ -25755,6 +26165,126 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuCommandLane();
     return 0;
   }
+  if (argc == 3 && std::strcmp(argv[1], "--denorm-coverage-only") == 0) {
+    // Writes <dir>/<case>.spv and <dir>/<case>.words (one hex word per line) for comparison
+    // between emitter builds. CompileCase validates the SPIR-V.
+    const std::string dir = argv[2];
+    std::vector<DenormCoverage::Case> cases;
+    cases.push_back(DenormCoverage::SharedF32Consumer());
+    cases.push_back(DenormCoverage::CrossBlock(false));
+    cases.push_back(DenormCoverage::CrossBlock(true));
+    VulkanHarness vulkan;
+    for (const auto &item : cases) {
+      const auto &test = item.test;
+      const auto compiled = CompileCase(test);
+      DenormCoverage::WriteSpirv(dir + "/" + test.name + ".spv", compiled.spirv);
+      auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+      vulkan.Dispatch(test, compiled, buffer);
+      const auto words = vulkan.ReadBuffer(test.name, buffer, item.outputs);
+      vulkan.DestroyBuffer(&buffer);
+      std::FILE *out = std::fopen((dir + "/" + test.name + ".words").c_str(), "w");
+      Require(test.name, "words dump", out != nullptr, "cannot open words file");
+      for (const auto word : words) {
+        std::fprintf(out, "0x%08x\n", word);
+      }
+      std::fclose(out);
+      std::printf("[denorm-coverage] %s dispatcher=%d u32->f32->u32 round trips=%zu words=%zu\n",
+                  test.name, compiled.program.dispatcher_fallback ? 1 : 0,
+                  CountU32F32U32BitcastRoundTrips(test.name, compiled.spirv), words.size());
+    }
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--denorm-dump-bench") == 0) {
+    const auto test = VectorDenormFlushReusesBitcastSource(16);
+    const auto compiled = CompileCase(test);
+    DenormCoverage::WriteSpirv(argv[2], compiled.spirv);
+    std::printf("[denorm-bench] dumped %zu words, round trips=%zu\n", compiled.spirv.size(),
+                CountU32F32U32BitcastRoundTrips(test.name, compiled.spirv));
+    return 0;
+  }
+  if (argc == 6 && std::strcmp(argv[1], "--denorm-bench") == 0) {
+    // argv: baseline.spv batches warm_dispatches timed_dispatches. The candidate is compiled by
+    // this build; both share the same compiled program, bindings, user data, inputs and buffer.
+    constexpr u32 kRepeats = 16;
+    const auto test = VectorDenormFlushReusesBitcastSource(kRepeats);
+    const auto candidate = CompileCase(test);
+    auto baseline = CompileCase(test);
+    baseline.spirv = DenormCoverage::ReadSpirv(argv[2]);
+    ValidateSpirv("denorm-bench baseline", baseline.spirv);
+    const auto baseline_trips = CountU32F32U32BitcastRoundTrips(test.name, baseline.spirv);
+    const auto candidate_trips = CountU32F32U32BitcastRoundTrips(test.name, candidate.spirv);
+    Require(test.name, "benchmark shaders", baseline_trips == 85u * kRepeats && candidate_trips == 0,
+            "baseline must be the pre-fix module and candidate the fixed one");
+    const u32 batches = static_cast<u32>(std::strtoul(argv[3], nullptr, 10));
+    const u32 warm = static_cast<u32>(std::strtoul(argv[4], nullptr, 10));
+    const u32 timed = static_cast<u32>(std::strtoul(argv[5], nullptr, 10));
+    std::printf("[denorm-bench] repeats=%u baseline words=%zu trips=%zu candidate words=%zu "
+                "trips=%zu batches=%u warm=%u timed=%u\n",
+                kRepeats, baseline.spirv.size(), baseline_trips, candidate.spirv.size(),
+                candidate_trips, batches, warm, timed);
+    VulkanHarness vulkan;
+    for (u32 batch = 0; batch < batches; batch++) {
+      for (u32 slot = 0; slot < 2; slot++) {
+        // Even batches run baseline first, odd batches candidate first.
+        const bool is_candidate = ((batch + slot) % 2u) == 1u;
+        const auto &shader = is_candidate ? candidate : baseline;
+        auto buffer = vulkan.CreateStorageBuffer(test.name, test.initial, test.initial.size());
+        uint64_t ticks = 0;
+        float period = 0.0f;
+        vulkan.Dispatch(test, shader, buffer, nullptr, nullptr, nullptr, nullptr, nullptr, warm,
+                        timed, &ticks, &period);
+        const auto words = vulkan.ReadBuffer(test.name, buffer, test.expected.size());
+        vulkan.DestroyBuffer(&buffer);
+        Require(test.name, "benchmark readback", words == test.expected,
+                "benchmark output differs from the recorded pre-fix words");
+        std::printf("[denorm-bench] batch=%u slot=%u variant=%s ticks=%llu period=%.6f\n", batch,
+                    slot, is_candidate ? "candidate" : "baseline",
+                    static_cast<unsigned long long>(ticks), static_cast<double>(period));
+      }
+    }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--compute-cases-only") == 0) {
+    // Every table-driven compute and graphics shader case, without the host checks that run
+    // before them in the default order.
+    VulkanHarness vulkan;
+    const auto tests = MakeCases();
+    const auto graphics_tests = MakeGraphicsCases();
+    for (const auto &test : tests) {
+      RunCase(&vulkan, test);
+    }
+    for (const auto &test : graphics_tests) {
+      RunGraphicsCase(&vulkan, test);
+    }
+    std::printf("ShaderRecompilerComputeTests: %zu compute and %zu graphics cases passed\n",
+                tests.size(), graphics_tests.size());
+    return 0;
+  }
+  if (argc >= 2 && std::strcmp(argv[1], "--denorm-flush-bitcast-only") == 0) {
+    // GPU readback first (aborts with expected/actual words on any difference), then the emitted
+    // pattern check. An optional second argument names a file for the compiled SPIR-V binary.
+    const auto test = VectorDenormFlushReusesBitcastSource();
+    const auto compiled = CompileCase(test);
+    if (argc == 3) {
+      std::FILE *out = std::fopen(argv[2], "wb");
+      Require(test.name, "SPIR-V dump", out != nullptr, "cannot open dump file");
+      std::fwrite(compiled.spirv.data(), sizeof(u32), compiled.spirv.size(), out);
+      std::fclose(out);
+    }
+    const auto round_trips =
+        CountU32F32U32BitcastRoundTrips(test.name, compiled.spirv);
+    std::printf("[denorm-flush] spirv words=%zu u32->f32->u32 round trips=%zu\n",
+                compiled.spirv.size(), round_trips);
+    {
+      VulkanHarness vulkan;
+      RunCase(&vulkan, test);
+      RunCase(&vulkan, VectorSpecialF32FlushesDenormalInputs());
+    }
+    Require(test.name, "flush bitcast reuse", round_trips == 0,
+            "a u32->f32 bitcast feeding the denormal flush is still cast back to u32 (" +
+                std::to_string(round_trips) + " round trips)");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
@@ -25847,6 +26377,17 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageSampledFormatSeparation();
+    return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--storage-sampled-only") == 0 &&
+      std::strcmp(argv[2], "--texture-single-walk") == 0 &&
+      (std::strcmp(argv[3], "true") == 0 || std::strcmp(argv[3], "false") == 0)) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::OutputDirection::Silent;
+    options.texture_single_walk = std::strcmp(argv[3], "true") == 0;
+    Config::Load(options);
     VulkanHarness vulkan;
     vulkan.CheckStorageSampledFormatSeparation();
     return 0;

@@ -301,6 +301,21 @@ uint32_t EmitUnpackHalf(EmitterState& state, uint32_t bits) {
 	return result;
 }
 
+// The flush works on its argument's u32 bits. When that argument is an IR u32->f32 bitcast, hand the
+// flush the original u32 instead of bitcasting the f32 straight back; the f32 value itself is left
+// for any other consumer. The producer's operand dominates the producer and therefore this use.
+// Under the dispatcher fallback only same-block producers are taken, so the operand is resolved by
+// Def exactly as the producer's own emission resolves it.
+uint32_t EmitFlushDenormArg(ValueEmitContext& ctx, const IR::Inst& inst) {
+	// Resolve, not ResolveInstruction: the argument may be an immediate (a folded f32 constant).
+	const auto* producer = inst.Arg(0).Resolve().TryInstruction();
+	if (producer != nullptr && producer->GetOpcode() == IR::ValueOpcode::BitCastF32U32 &&
+	    (ctx.dispatcher_spills == nullptr || producer->Parent() == ctx.current_block)) {
+		return EmitFlushF32BitsDenormToSignedZero(ctx.state, ctx.Arg(*producer, 0));
+	}
+	return EmitFlushF32DenormToSignedZero(ctx.state, ctx.Arg(inst, 0));
+}
+
 } // namespace
 
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -643,7 +658,7 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			           EmitFMed3(state, ctx.Arg(inst, 0), ctx.Arg(inst, 1), ctx.Arg(inst, 2)));
 			return true;
 		case IR::ValueOpcode::FPRecip32: {
-			const auto source = EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0));
+			const auto source = EmitFlushDenormArg(ctx, inst);
 			ctx.Define(inst, NewBinary(state, OpFDiv, TypeF32(state),
 			                           ConstantF32(state, 0x3f800000u), source));
 			return true;
@@ -655,11 +670,11 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return true;
 		case IR::ValueOpcode::FPRecipSqrt32:
 			ctx.Define(inst, EmitExt(state, TypeF32(state), GlslInverseSqrt,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
+			                         {EmitFlushDenormArg(ctx, inst)}));
 			return true;
 		case IR::ValueOpcode::FPSqrt:
 			ctx.Define(inst, EmitExt(state, TypeF32(state), GlslSqrt,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
+			                         {EmitFlushDenormArg(ctx, inst)}));
 			return true;
 		case IR::ValueOpcode::FPSin:
 		case IR::ValueOpcode::FPCos: {
@@ -672,11 +687,11 @@ bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		case IR::ValueOpcode::FPExp2:
 			ctx.Define(inst, EmitExt(state, TypeF32(state), GlslExp2,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
+			                         {EmitFlushDenormArg(ctx, inst)}));
 			return true;
 		case IR::ValueOpcode::FPLog2:
 			ctx.Define(inst, EmitExt(state, TypeF32(state), GlslLog2,
-			                         {EmitFlushF32DenormToSignedZero(state, ctx.Arg(inst, 0))}));
+			                         {EmitFlushDenormArg(ctx, inst)}));
 			return true;
 		case IR::ValueOpcode::FPLdexp: {
 			const auto exponent = NewUnary(state, OpBitcast, TypeI32(state), ctx.Arg(inst, 1));

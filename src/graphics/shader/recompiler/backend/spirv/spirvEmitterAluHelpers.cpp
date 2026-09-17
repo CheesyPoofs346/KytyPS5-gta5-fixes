@@ -315,8 +315,12 @@ uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value) {
 	return ret;
 }
 
-uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
-	const auto bits      = state.builder.AllocateId();
+// `value_bits` is 0 when only the f32 value exists; otherwise it is the u32 the f32 was bitcast from,
+// and the cast back to u32 is skipped. OpBitcast preserves the bit pattern, so both paths flush the
+// same bits. Ids are allocated in the original order.
+static uint32_t EmitFlushDenormToSignedZero(EmitterState& state, uint32_t value,
+                                            uint32_t value_bits) {
+	const auto bits      = value_bits != 0 ? value_bits : state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();
 	const auto non_zero  = state.builder.AllocateId();
@@ -324,7 +328,9 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	const auto flush     = state.builder.AllocateId();
 	const auto selected  = state.builder.AllocateId();
 	const auto ret       = state.builder.AllocateId();
-	state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
+	if (value_bits == 0) {
+		state.builder.AddFunction({OpBitcast, TypeU32(state), bits, value});
+	}
 	state.builder.AddFunction(
 	    {OpBitwiseAnd, TypeU32(state), abs_bits, bits, ConstantU32(state, 0x7fffffffu)});
 	state.builder.AddFunction(
@@ -337,6 +343,14 @@ uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
 	state.builder.AddFunction({OpSelect, TypeU32(state), selected, flush, sign_bits, bits});
 	state.builder.AddFunction({OpBitcast, TypeF32(state), ret, selected});
 	return ret;
+}
+
+uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	return EmitFlushDenormToSignedZero(state, value, 0);
+}
+
+uint32_t EmitFlushF32BitsDenormToSignedZero(EmitterState& state, uint32_t bits) {
+	return EmitFlushDenormToSignedZero(state, 0, bits);
 }
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero) {

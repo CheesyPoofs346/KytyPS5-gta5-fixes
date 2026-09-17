@@ -847,6 +847,8 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 uint32_t EmitTruncF32Value(EmitterState& state, uint32_t value);
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value);
+// Same flush, given the u32 bits of the f32 value rather than the value itself.
+uint32_t EmitFlushF32BitsDenormToSignedZero(EmitterState& state, uint32_t bits);
 
 uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signed_zero);
 
