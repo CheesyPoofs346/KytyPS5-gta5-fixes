@@ -68,6 +68,49 @@ bool UsesGds(const Program& program, bool& uses_gds) {
 
 } // namespace
 
+std::vector<uint32_t> CollectNativeBufferResources(const Program& program) {
+	std::vector<bool> used(program.info.buffers.size());
+	const auto retain_all = [&] { std::fill(used.begin(), used.end(), true); };
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = BufferAccessOf(inst.GetOpcode());
+			if (access != BufferAccess::None) {
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= program.memory_info.size()) {
+					retain_all();
+					continue;
+				}
+				const auto& memory = program.memory_info[flags.index];
+				if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer && memory.planning_only) {
+					continue;
+				}
+				if (memory.resource >= used.size()) {
+					retain_all();
+					continue;
+				}
+				used[memory.resource] = true;
+				continue;
+			}
+			if (inst.GetOpcode() == ValueOpcode::GetBufferResource) {
+				for (const auto& use: inst.Uses()) {
+					if (use.user == nullptr || BufferAccessOf(use.user->GetOpcode()) == BufferAccess::None) {
+						// New BufferResource consumers must opt into the classification above.
+						retain_all();
+					}
+				}
+			}
+		}
+	}
+	std::vector<uint32_t> resources;
+	resources.reserve(used.size());
+	for (uint32_t index = 0; index < used.size(); index++) {
+		if (used[index]) {
+			resources.push_back(index);
+		}
+	}
+	return resources;
+}
+
 bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::string* error) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		if (error != nullptr) {
@@ -92,15 +135,12 @@ bool AllocateBindings(Program& program, uint32_t push_constant_offset, std::stri
 		}
 		return false;
 	}
+	auto buffer_resources    = CollectNativeBufferResources(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.memory_offset_count = static_cast<uint32_t>(buffer_resources.size());
 
-	if (!program.info.buffers.empty()) {
-		std::vector<uint32_t> resources(program.info.buffers.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
-		}
-		AddBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
+	if (!buffer_resources.empty()) {
+		AddBinding(next, DescriptorBindingKind::Buffers, std::move(buffer_resources));
 	}
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;

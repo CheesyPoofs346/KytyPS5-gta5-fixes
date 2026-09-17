@@ -18,6 +18,8 @@
 #include "kernel/memory.h"
 #include "libs/errno.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -252,6 +254,154 @@ void InitSubsystems() {
 	subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
 }
 
+// ---------------------------------------------------------------- throughput
+
+// What does the redundant traversal actually cost?
+//
+// With the flag OFF, TryTransferBacking validates the whole request with one walk of the mapping
+// map and then transfers it with a second walk. With it ON, a request contained in a single
+// mapping takes one lookup. Historical logs show that case is essentially universal: a run with
+// the flag on recorded fast=29999376 (100.0%) against two-pass=624 (0.002% spanning).
+//
+// The compiled-ON diagnostic measured TryReadBacking at 7.90% exclusive self-time, 787 ns/draw,
+// with the flag OFF - so every one of that run's 86,000,000 transfers paid the second walk.
+//
+// This measures the difference directly. Transfer sizes are swept because the traversal is a fixed
+// cost per call while the copy scales with size: the smaller the transfer, the more the second
+// walk matters. Sizes here are CHOSEN, not observed - no per-transfer size histogram exists.
+void BenchmarkTransferSizes() {
+	const char* test = "Throughput";
+	auto        m    = MapTwoPages(test);
+	if (!m.ok) {
+		return;
+	}
+	auto* base = reinterpret_cast<uint8_t*>(m.vaddr);
+	std::memset(base, 0xab, SceKernelPageSize * 2);
+
+	std::printf("\nTryReadBacking throughput: one mapping, request contained in it.\n");
+	std::printf("The flag-off arm walks the map twice; the flag-on arm once.\n\n");
+	std::printf("%10s %14s %14s %10s %12s\n", "bytes", "two-pass ns", "fast ns", "saved ns",
+	            "speedup");
+	std::printf("%s\n", std::string(64, '-').c_str());
+
+	for (const uint64_t size: {uint64_t {64}, uint64_t {256}, uint64_t {1024}, uint64_t {4096},
+	                           uint64_t {16384}}) {
+		std::vector<uint8_t> dst(static_cast<size_t>(size));
+		double               timing[2] = {0.0, 0.0};
+		bool                 ok        = true;
+
+		for (int arm = 0; arm < 2; arm++) {
+			Config::ConfigOptions options {};
+			options.backing_fast_path = arm == 1;
+			Config::Load(options);
+
+			// Warm.
+			for (int i = 0; i < 1000; i++) {
+				ok = ok && Libs::LibKernel::Memory::TryReadBacking(m.vaddr, dst.data(), size);
+			}
+			constexpr size_t kIterations = 200000;
+			const auto       start       = std::chrono::steady_clock::now();
+			for (size_t i = 0; i < kIterations; i++) {
+				ok = ok && Libs::LibKernel::Memory::TryReadBacking(m.vaddr, dst.data(), size);
+			}
+			timing[arm] =
+			    std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start)
+			        .count() /
+			    static_cast<double>(kIterations);
+		}
+		if (!ok) {
+			Fail(test, "TryReadBacking failed during timing");
+			return;
+		}
+		std::printf("%10llu %14.1f %14.1f %10.1f %11.2fx\n",
+		            static_cast<unsigned long long>(size), timing[0], timing[1],
+		            timing[0] - timing[1], timing[0] / timing[1]);
+	}
+
+	std::printf("\nThe saving is per TRANSFER, not per draw or per frame. Converting it needs a\n"
+	            "transfers-per-frame figure this benchmark does not measure, and the in-game\n"
+	            "7.90%% self-time is a share of one profiled thread, not of frame time.\n");
+}
+
+// How much does the redundant traversal cost as the mapping map grows?
+//
+// FindContainingUnlocked is a std::map::upper_bound - O(log n) over a red-black tree, so its cost
+// is pointer chasing that grows with the number of live mappings. The single-mapping benchmark
+// above therefore measures the fast path's BEST case for the copy and its WORST case for the
+// lookup: with one entry the tree walk is nearly free and the saving disappears into noise.
+//
+// This maps many regions first, so the second traversal costs what it would in a process with a
+// realistic mapping count, and times a small transfer where the copy cannot mask the lookup.
+void BenchmarkMappingCount() {
+	const char* test = "MappingCount";
+
+	std::printf("\nSame transfer (256 B), increasing live mappings. The flag-off arm walks the\n");
+	std::printf("mapping map twice per transfer, the flag-on arm once.\n\n");
+	std::printf("%10s %14s %14s %10s %12s\n", "mappings", "two-pass ns", "fast ns", "saved ns",
+	            "speedup");
+	std::printf("%s\n", std::string(64, '-').c_str());
+
+	std::vector<uint64_t> held;
+	constexpr uint64_t    kSize = 256;
+	std::vector<uint8_t>  dst(static_cast<size_t>(kSize));
+
+	for (const int target: {1, 64, 512}) {
+		while (static_cast<int>(held.size()) < target) {
+			auto m = MapTwoPages(test);
+			if (!m.ok) {
+				Fail(test, "could not map enough regions");
+				return;
+			}
+			held.push_back(m.vaddr);
+		}
+		// Read from the FIRST mapping every time, so only the map size varies.
+		const auto vaddr = held.front();
+		std::memset(reinterpret_cast<uint8_t*>(vaddr), 0xcd, static_cast<size_t>(kSize));
+
+		// Arms are INTERLEAVED and repeated, and the median of each is reported. A single
+		// A-then-B pass gave physically impossible results here - the fast path measured 0.60x
+		// while doing strictly less work - because the per-call difference is a few nanoseconds
+		// and drift between two sequential timing windows is the same size.
+		constexpr int    kRounds     = 9;
+		constexpr size_t kIterations = 300000;
+		std::vector<double> samples[2];
+		bool                ok = true;
+		for (int round = 0; round < kRounds; round++) {
+			for (int arm = 0; arm < 2; arm++) {
+				Config::ConfigOptions options {};
+				options.backing_fast_path = arm == 1;
+				Config::Load(options);
+				for (int i = 0; i < 2000; i++) {
+					ok = ok && Libs::LibKernel::Memory::TryReadBacking(vaddr, dst.data(), kSize);
+				}
+				const auto start = std::chrono::steady_clock::now();
+				for (size_t i = 0; i < kIterations; i++) {
+					ok = ok && Libs::LibKernel::Memory::TryReadBacking(vaddr, dst.data(), kSize);
+				}
+				samples[arm].push_back(
+				    std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() -
+				                                            start)
+				        .count() /
+				    static_cast<double>(kIterations));
+			}
+		}
+		double timing[2];
+		double spread[2];
+		for (int arm = 0; arm < 2; arm++) {
+			std::sort(samples[arm].begin(), samples[arm].end());
+			timing[arm] = samples[arm][samples[arm].size() / 2];
+			spread[arm] = samples[arm].back() - samples[arm].front();
+		}
+		if (!ok) {
+			Fail(test, "TryReadBacking failed during timing");
+			return;
+		}
+		std::printf("%10d %14.1f %14.1f %10.1f %11.2fx   (spread off %.1f / on %.1f ns)\n",
+		            static_cast<int>(held.size()), timing[0], timing[1], timing[0] - timing[1],
+		            timing[0] / timing[1], spread[0], spread[1]);
+	}
+}
+
 } // namespace
 
 int main(int /*argc*/, char** /*argv*/) {
@@ -263,6 +413,9 @@ int main(int /*argc*/, char** /*argv*/) {
 	TestInvalidRanges();
 	TestNoPartialCopyPastMappingEnd();
 
+	BenchmarkTransferSizes();
+	BenchmarkMappingCount();
+
 	if (g_failures != 0) {
 		std::printf("\n%d check(s) failed\n", g_failures);
 		return 1;

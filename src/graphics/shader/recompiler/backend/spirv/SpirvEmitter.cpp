@@ -30,8 +30,8 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 		present[index]   = true;
 		expected[index]  = std::move(resources);
 	};
-	if (!program.info.buffers.empty()) {
-		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
+	if (auto resources = IR::CollectNativeBufferResources(program); !resources.empty()) {
+		Expect(Kind::Buffers, std::move(resources));
 	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
@@ -105,7 +105,7 @@ bool ValidateNativeProgram(const IR::Program& program, std::string* error) {
 	    program.bindings.push_constant_offset + program.bindings.push_constant_size >
 	        IR::NativePushConstantSize ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.memory_offset_count != IR::CollectNativeBufferResources(program).size() ||
 	    (!has_user_storage &&
 	     program.bindings.push_constant_size != program.bindings.ShaderDataDwords() * 4u) ||
 	    (has_user_storage && program.bindings.push_constant_size != 0) ||

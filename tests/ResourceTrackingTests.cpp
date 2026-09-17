@@ -1204,6 +1204,71 @@ void TestShaderInfoAndBindingLayout() {
         "binding layout did not collect live typed user-data values");
 }
 
+// Binding layout is intentionally derived from the post-cleanup native IR, not from the
+// resource snapshot.  Snapshot slots remain dense/original because compiled SRT evaluates
+// those sources independently; only Vulkan's storage-buffer array and its packed offsets are
+// compacted.  This must retain writes and atomics, not just loads.
+void TestNativeBufferBindingLayout() {
+  const auto layout_for = [](bool with_native_accesses) {
+    Program program{};
+    program.stage = ShaderType::Compute;
+    program.shader_info_complete = true;
+    program.info.buffers.resize(with_native_accesses ? 5u : 1u);
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.block_info.push_back({.id = 0});
+
+    const auto add_memory = [&](uint32_t resource, bool planning_only) {
+      MemoryInfo memory{};
+      memory.kind = planning_only ? ResourceKind::ScalarBuffer : ResourceKind::Buffer;
+      memory.resource = resource;
+      memory.planning_only = planning_only;
+      const auto index = static_cast<uint32_t>(program.memory_info.size());
+      program.memory_info.push_back(memory);
+      return MemoryFlags{index, 0x1000u + resource};
+    };
+    const auto append = [&](ValueOpcode opcode, std::initializer_list<Value> args,
+                            MemoryFlags flags) {
+      uint64_t bits = 0;
+      std::memcpy(&bits, &flags, sizeof(flags));
+      block->AppendNewInst(opcode, args, bits);
+    };
+
+    // CPU resource planning may read this descriptor, but it has no surviving native use.
+    append(ValueOpcode::ReadConstBuffer, {Value(0u), Value(0u)}, add_memory(0u, true));
+    if (with_native_accesses) {
+      // Deliberately sparse original indices.  Store and atomic must remain native bindings.
+      append(ValueOpcode::LoadBufferU32,
+             {Value(0u), Value(0u), Value(0u), Value(0u), Value(true)},
+             add_memory(1u, false));
+      append(ValueOpcode::StoreBufferU32,
+             {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(true)},
+             add_memory(3u, false));
+      append(ValueOpcode::BufferAtomicIAdd32,
+             {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(true)},
+             add_memory(4u, false));
+    }
+    std::string error;
+    Check(AllocateBindings(program, 0, &error), error.c_str());
+    return program.bindings;
+  };
+
+  const auto sparse = layout_for(true);
+  const auto *buffers = FindBinding(sparse, DescriptorBindingKind::Buffers);
+  Check(buffers != nullptr, "surviving native buffers did not receive a binding");
+  Check(buffers->resources == std::vector<uint32_t>({1u, 3u, 4u}),
+        "layout did not retain sparse read/write/atomic buffer indices");
+  Check(sparse.memory_offset_count == 3u,
+        "packed native offsets were not compacted to surviving buffers");
+
+  const auto planning_only = layout_for(false);
+  Check(FindBinding(planning_only, DescriptorBindingKind::Buffers) == nullptr,
+        "planning-only buffer retained a native binding");
+  Check(planning_only.memory_offset_count == 0u,
+        "planning-only buffer retained packed native offset storage");
+}
+
 void TestGraphicsPushConstantLayout() {
   const auto AddUserData = [](Fixture &fixture, uint32_t count) {
     for (uint32_t index = 0; index < count; index++) {
@@ -1359,7 +1424,17 @@ void TestMalformedMemoryKindsRejected() {
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--native-buffer-layout-only") == 0) {
+    try {
+      TestNativeBufferBindingLayout();
+      std::cout << "native buffer binding layout passed\n";
+      return 0;
+    } catch (const std::exception &exception) {
+      std::cerr << "native buffer binding layout failed: " << exception.what() << '\n';
+      return 1;
+    }
+  }
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -1368,6 +1443,9 @@ int main() {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    // Keep this regression first: the pre-existing phi-validation failure below otherwise
+    // prevents a test-first run from reaching the binding-layout assertion.
+    Run("native buffer binding layout", TestNativeBufferBindingLayout);
     Run("dense buffers", TestDenseBufferTracking);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);

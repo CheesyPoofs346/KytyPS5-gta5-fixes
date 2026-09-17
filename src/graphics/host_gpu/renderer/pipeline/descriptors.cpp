@@ -207,6 +207,9 @@ struct DrawBufferCacheEntry {
 	uint32_t   alignment     = 0;
 	uint32_t   buffer_offset = 0;
 	BufferView view;
+	// Whether the cached view points at a throwaway ring allocation. Publication republishes
+	// stream entries verbatim and re-derives cache-backed ones from the guest range.
+	bool       stream        = false;
 };
 
 const DrawBufferCacheEntry* FindDrawBufferCache(uint64_t address, uint64_t size, bool formatted,
@@ -239,7 +242,8 @@ static BufferView NativeStorageBuffer(RenderContext&                            
                                       const ShaderBufferResource&                 descriptor,
                                       const ShaderRecompiler::IR::BufferResource& resource,
                                       ShaderType stage, uint32_t slot, uint32_t& buffer_offset,
-                                      BufferId id, uint64_t clamped_size) {
+                                      BufferId id, uint64_t clamped_size,
+                                      PreparedBindings::PublishedBuffer* publish) {
 	BufferView result;
 	buffer_offset = 0;
 
@@ -252,7 +256,7 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 	if (address == 0 || requested_size == 0) {
 		BindNullStorageBuffer(context, result);
-		return result;
+		return result;   // publish->resolved stays false: nothing to re-derive.
 	}
 	// Already clamped by FindBuffers for this exact descriptor; asking again costs a query that
 	// blocks on a contended lock roughly 4% of the time.
@@ -278,6 +282,16 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 		if (const auto* hit = FindDrawBufferCache(address, size, resource.formatted, id,
 		                                          static_cast<uint32_t>(alignment))) {
 			buffer_offset = hit->buffer_offset;
+			// A dedup hit returns a view captured EARLIER in this draw, so it can already be
+			// stale. Record its identity anyway: publication re-derives every resolved entry, so
+			// a hit cannot bypass final-owner validation.
+			if (publish != nullptr) {
+				publish->address   = address;
+				publish->size      = size;
+				publish->alignment = static_cast<uint32_t>(alignment);
+				publish->stream    = hit->stream;
+				publish->resolved  = true;
+			}
 			return hit->view;
 		}
 	}
@@ -291,12 +305,23 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	}
 	const auto aligned_offset = offset - offset % alignment;
 	const auto adjustment     = offset - aligned_offset;
+	const bool stream_backed  = context.GetBufferCache().IsStreamAllocation(buffer);
+	if (publish != nullptr) {
+		publish->address   = address;
+		publish->size      = size;
+		publish->alignment = static_cast<uint32_t>(alignment);
+		// Stream-backed: a throwaway ring allocation holding a private copy. It is not owned by
+		// any guest range and must be republished verbatim, allocation and offset intact.
+		publish->stream   = stream_backed;
+		publish->resolved = true;
+	}
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported\n");
 	}
-	buffer_offset = static_cast<uint32_t>(adjustment);
-	result.buffer = buffer->Handle();
+	buffer_offset            = static_cast<uint32_t>(adjustment);
+	result.publish_adjustment = buffer_offset;
+	result.buffer            = buffer->Handle();
 	result.offset = aligned_offset;
 	result.range  = static_cast<vk::DeviceSize>(size + adjustment);
 	if (resource.formatted && resource.written) {
@@ -309,7 +334,8 @@ static BufferView NativeStorageBuffer(RenderContext&                            
 	    resource.written ? (resource.read ? "ReadWrite" : "Write") : "Read", resource.formatted);
 	if (!resource.written && Config::BufferDedupEnabled() && DrawBufferCache().size() < 32) {
 		DrawBufferCache().push_back({address, size, resource.formatted, id,
-		                             static_cast<uint32_t>(alignment), buffer_offset, result});
+		                             static_cast<uint32_t>(alignment), buffer_offset, result,
+		                             stream_backed});
 	}
 	return result;
 }
@@ -776,8 +802,37 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	return view;
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
-                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+// ---------------------------------------------------------------- texture descriptor decode
+//
+// Split out of ResolveTexture so the PURE half can be cached without touching the texture cache.
+//
+// Purity, checked rather than assumed: this reads only `resource` (six fields: dimension, kind,
+// mip_mode, r128, read, written) and the eight descriptor dwords. It calls
+// TextureGetSurfaceFormatInfo, PopulateTextureMipLayout and TextureViewInfo, none of which read
+// Config, renderer context or any mutable global. There is therefore NO cache state, NO generation
+// and NO invalidation: a decode result for given inputs is valid for the life of the process, and
+// this deliberately does not become another invalidation framework.
+//
+// Everything cache-dependent stays in ResolveTexture and still runs on every call: FindImage
+// (overlap reconciliation, LRU touch, tick_accessed_last, resource creation, PrepareStorage-
+// SampledOverlap) and FindTexture (refresh, page-watcher re-arm, DCC clear, view creation).
+void DecodeTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                   const ShaderRecompiler::IR::DescriptorValue& value, DecodedTexture& out) {
+	// Reset FIRST, before anything else touches `out`.
+	//
+	// This function writes into a destination the caller may reuse - the flag-off production path
+	// decodes into one persistent thread_local scratch - and NOT every field is assigned on every
+	// path. `is_null` is set only in the null branch below and never cleared, so without this a
+	// real texture decoded after a null one on the same thread inherits is_null = true. The caller
+	// then takes the null branch for a real texture: the wrong FindImage overload (exact_format
+	// defaulted), no depth_id remap, and none of the depth/storage view validation. Skipping the
+	// depth_id remap is what produced the abort
+	// "TextureCache: texture requires rediscovery before final acquisition" - FindTextureLocked
+	// rejects an id whose image still has depth_id set, which is exactly what the remap resolves.
+	//
+	// The original code had no such hazard because it built a fresh value-initialised
+	// DecodedTexture-equivalent per call. Resetting restores that exactly.
+	out = {};
 	ShaderTextureResource descriptor;
 	CopyNativeDescriptor(value, descriptor.fields);
 	const bool storage = resource.written;
@@ -785,12 +840,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageImageResource(resource);
 	}
 
-	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
-		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
-		                                                    : TextureCache::BindingType::Texture);
-		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		out.is_null = true;
+		out.desc    = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
+		                                                : TextureCache::BindingType::Texture);
+		return;
 	}
 
 	const auto address      = descriptor.Base40();
@@ -881,7 +935,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                                     ? storage_view_format
 	                                     : pixel_format;
 	const auto block_bytes         = Prospero::BlockCompressedBytesPerBlock(format);
-	TextureCache::ImageDesc desc {};
+	auto& desc = out.desc;
 	desc.info.data         = {address, size.size};
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
@@ -901,8 +955,53 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, shader_conversion, storage,
 	                                 view_levels, desc.info.resources.layers);
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
+	out.descriptor        = descriptor;
+	out.pixel_format      = pixel_format;
+	out.view_format       = view_format;
+	out.size_bytes        = size.size;
+	out.storage           = storage;
+	out.shader_conversion = shader_conversion;
+}
+
+
+// Test seam. Decoding is a pure function of the resource fields and descriptor dwords, so this is
+// simply the decode with no wrapper - it exists so the differential test can call it without
+// standing up a RenderExecutor.
+void DecodeTextureUncachedForTest(const ShaderRecompiler::IR::ImageResource&   resource,
+                                  const ShaderRecompiler::IR::DescriptorValue& value,
+                                  DecodedTexture&                              out) {
+	DecodeTexture(resource, value, out);
+}
+
+TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+                                              const ShaderRecompiler::IR::DescriptorValue& value) {
+	// A FRESH local per call, deliberately. An earlier version decoded into a persistent
+	// thread_local scratch; because `is_null` is written only on the null path, a real texture
+	// decoded after a null one inherited it, skipped the depth_id remap, and aborted with
+	// "texture requires rediscovery before final acquisition". DecodeTexture also resets `out`,
+	// so this is belt and braces on purpose.
+	DecodedTexture decoded;
+	DecodeTexture(resource, value, decoded);
+
+	auto& texture_cache = m_context.GetTextureCache();
+	// COPY, never a reference into the cache entry: FindImage takes ImageDesc& and mutates it
+	// (ValidateImageDesc, overlap merging). Handing it the cached object would corrupt the entry
+	// for every later hit.
+	auto desc = decoded.desc;
+	if (decoded.is_null) {
+		const auto id = texture_cache.FindImage(desc);
+		return {id, nullptr, std::move(desc)};
+	}
+	const auto& descriptor        = decoded.descriptor;
+	const auto  storage           = decoded.storage;
+	const auto  pixel_format      = decoded.pixel_format;
+	const auto  view_format       = decoded.view_format;
+	const auto  shader_conversion = decoded.shader_conversion;
+	const auto  size_bytes        = decoded.size_bytes;
+
 
 	auto id = texture_cache.FindImage(desc, shader_conversion);
+
 	if (!id) {
 		// A worker bailed inside FindImage rather than create an image. Return the empty binding
 		// immediately: the draw is already flagged for serial retry and its prepared entry will be
@@ -919,7 +1018,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateDepthTargetBinding(resource, descriptor, image, pixel_format, size.size);
+		ValidateDepthTargetBinding(resource, descriptor, image, pixel_format, size_bytes);
 		(void)SelectSampledDepthView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	} else if (storage) {
@@ -1267,6 +1366,8 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime&      
 
 void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	// Re-resolving ids invalidates any previous publication.
+	prepared.published = false;
 	DrawPhaseTimer draw_phase_timer(DrawPhase::BindFindBuffers);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
@@ -1274,12 +1375,18 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_ids.clear();
-	prepared.buffer_ids.reserve(program.info.buffers.size());
+	prepared.buffer_ids.resize(program.info.buffers.size());
 	prepared.buffer_descriptors.clear();
 	prepared.buffer_descriptors.resize(program.info.buffers.size());
 	prepared.buffer_sizes.clear();
 	prepared.buffer_sizes.resize(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+	const auto* binding = ShaderRecompiler::IR::FindBinding(
+	    program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+	if (binding == nullptr) {
+		return;
+	}
+	for (const auto i: binding->resources) {
+		EXIT_IF(i >= program.info.buffers.size() || i >= snapshot.buffers.size());
 		ShaderBufferResource& descriptor = prepared.buffer_descriptors[i];
 		CopyNativeDescriptor(snapshot.buffers[i], descriptor.fields);
 		const auto address = descriptor.Base48();
@@ -1288,7 +1395,6 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		EXIT_IF(stride != 0 && records > UINT64_MAX / stride);
 		const auto requested_size = stride != 0 ? static_cast<uint64_t>(stride) * records : records;
 		if (address == 0 || requested_size == 0) {
-			prepared.buffer_ids.emplace_back();
 			continue;
 		}
 		uint64_t size = 0;
@@ -1300,13 +1406,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		}
 		g_draw_profile.buffers++;
 		prepared.buffer_sizes[i] = size;
-		prepared.buffer_ids.push_back(cache.FindBuffer(address, size));
+		prepared.buffer_ids[i] = cache.FindBuffer(address, size);
 	}
 
 }
 
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	// Rebinding rebuilds the views and publish records, so anything published earlier is
+	// stale from here until PublishBuffers runs again.
+	prepared.published = false;
 	DrawPhaseTimer draw_phase_timer(DrawPhase::BindRebindBuffers);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program   = *prepared.program;
@@ -1315,7 +1424,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.buffer_ids.size() != program.info.buffers.size());
 
 	resources.buffers.clear();
-	resources.buffers.reserve(program.info.buffers.size());
+	resources.buffers.resize(program.info.buffers.size());
 	EXIT_IF(prepared.user_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.user_data.begin() + layout.memory_offset_dword, prepared.user_data.end(), 0);
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
@@ -1328,19 +1437,148 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	{
 		// The per-buffer resolve. Deduped within a draw by FindDrawBufferCache, but the cache is
 		// cleared every draw, so a buffer bound by 4000 consecutive draws is resolved 4000 times.
+		//
+		// KNOWN, PRE-EXISTING, NOT FIXED HERE: this loop captures a handle, offset and device
+		// address per buffer, and a later range-changing operation can retire the buffer one of
+		// them points at. The old handle stays usable (retirement is deferred past GPU completion)
+		// but stops being current. A stabilise-and-refresh loop was tried HERE and removed: it is
+		// the wrong place. RebindImages runs AFTER both RebindBuffers calls
+		// (ResolveTexture -> FindImage -> InitializeImage -> ObtainBufferForImage -> CreateBuffer),
+		// and the packed memory offsets are already committed to a stream buffer at the end of
+		// this function, so refreshing here cannot cover either. See StaleBindingTests.cpp.
 		DrawPhaseTimer native_buffers_timer(DrawPhase::BindNativeBuffers);
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		prepared.buffer_publish.assign(program.info.buffers.size(), {});
+		const auto* binding = ShaderRecompiler::IR::FindBinding(
+		    layout, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+		if (binding == nullptr) {
+			return;
+		}
+		uint32_t native_index = 0;
+		for (const auto i: binding->resources) {
+			EXIT_IF(i >= program.info.buffers.size());
 			const ShaderBufferResource& descriptor = prepared.buffer_descriptors[i];
 			uint32_t buffer_offset = 0;
-			resources.buffers.push_back(NativeStorageBuffer(
+			// `resources.buffers` is indexed by the original IR resource index. The Vulkan
+			// descriptor array is dense, but only its packed memory-offset ordinal is dense.
+			// Appending here would leave every original sparse slot empty and shift views.
+			resources.buffers[i] = NativeStorageBuffer(
 			    m_context, descriptor, program.info.buffers[i], program.stage, i, buffer_offset,
-			    prepared.buffer_ids[i], prepared.buffer_sizes[i]));
-			pack_memory_offset(i, buffer_offset);
+			    prepared.buffer_ids[i], prepared.buffer_sizes[i], &prepared.buffer_publish[i]);
+			pack_memory_offset(native_index++, buffer_offset);
+		}
+	}
+	// The user_data upload used to happen here. It carries the packed memory offsets, so it has
+	// to come from the SETTLED state - see PublishBuffers.
+}
+
+// Re-derives every cache-backed binding from its guest range and republishes the descriptor, the
+// packed offset and the device address from one settled snapshot, then uploads user_data from
+// that same snapshot.
+//
+// Runs after ALL range-changing work for the draw: both stages' buffers AND both stages' images.
+// RebindImages reaches CreateBuffer through
+// ResolveTexture -> FindImage -> InitializeImage -> ObtainBufferForImage, so a per-stage refresh
+// inside RebindBuffers cannot cover it.
+//
+// This performs NO obtain-side work: no allocation, no join, no synchronize, no upload into a
+// buffer, no dirty-state change, no LRU touch. Those effects happened once, in order, during
+// RebindBuffers, and must not be repeated.
+void RenderExecutor::PublishBuffers(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(prepared.program == nullptr);
+	prepared.published = true;
+	const auto& program   = *prepared.program;
+	auto&       resources = prepared.resources;
+	const auto& layout    = program.bindings;
+
+	if (Config::BindingPublishEnabled() &&
+	    prepared.buffer_publish.size() == resources.buffers.size()) {
+		auto& cache = m_context.GetBufferCache();
+		std::fill(prepared.user_data.begin() + layout.memory_offset_dword,
+		          prepared.user_data.end(), 0);
+		const auto* binding = ShaderRecompiler::IR::FindBinding(
+		    layout, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+		uint32_t native_index = 0;
+		if (binding != nullptr) {
+		for (const auto i: binding->resources) {
+			EXIT_IF(i >= prepared.buffer_publish.size() || i >= resources.buffers.size());
+			const auto& entry = prepared.buffer_publish[i];
+			const auto packed_index = native_index++;
+			if (!entry.resolved) {
+				continue;   // null binding: nothing was resolved for it
+			}
+			if (entry.stream) {
+				// Verbatim. The ring allocation holds this binding's private copy of the guest
+				// bytes; re-resolving by address would hand back a cache buffer instead and
+				// discard it. Its offset and lifetime are already correct.
+				const auto dword = layout.memory_offset_dword + packed_index / 4u;
+				const auto shift = (packed_index % 4u) * 8u;
+				prepared.user_data[dword] |= resources.buffers[i].publish_adjustment << shift;
+				continue;
+			}
+			const auto owner = cache.FindPublishedOwner(entry.address, entry.size);
+			if (owner.first == nullptr) {
+				// Never silently allocate and never publish a view we could not confirm:
+				// allocating here would itself be a range-changing operation, after the point
+				// where everything was supposed to have settled.
+				EXIT("binding publication found no owner for guest range 0x%016" PRIx64
+				     " size 0x%" PRIx64 "\n",
+				     entry.address, entry.size);
+			}
+			const auto alignment      = entry.alignment != 0 ? entry.alignment : 1;
+			const auto aligned_offset = owner.second - owner.second % alignment;
+			const auto adjustment     = static_cast<uint32_t>(owner.second - aligned_offset);
+			// The same contract NativeStorageBuffer enforces on the obtain side, enforced here
+			// too. The packed memory offset is an 8-BIT LANE (adjustment << (i % 4) * 8), so an
+			// adjustment of 256 or more does not merely truncate - it spills into the
+			// neighbouring binding's lane and silently moves THAT buffer's base. Obtain EXITs on
+			// this; publication was packing whatever it computed.
+			const auto max_range =
+			    m_context.GetGraphics().GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
+			if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 ||
+			    entry.size > max_range - adjustment) {
+				EXIT("binding publication produced an unsupported offset adjustment %u for guest "
+				     "range 0x%016" PRIx64 " size 0x%" PRIx64 "\n",
+				     adjustment, entry.address, entry.size);
+			}
+			auto&      view           = resources.buffers[i];
+			// Does publication ever actually CHANGE a binding? If the owning buffer was not
+			// retired, FindPublishedOwner returns the very buffer obtain used at the very same
+			// offset, and everything below is a no-op. Counted so one run can say whether this
+			// path is inert in practice instead of the question being argued from the source.
+			if (Config::BufferCensusEnabled()) {
+				static std::atomic<uint64_t> s_examined {0};
+				static std::atomic<uint64_t> s_changed {0};
+				const bool same = view.buffer == owner.first->Handle() &&
+				                  view.offset == aligned_offset &&
+				                  view.range == static_cast<vk::DeviceSize>(entry.size + adjustment);
+				s_changed.fetch_add(same ? 0 : 1, std::memory_order_relaxed);
+				const auto n = s_examined.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (n % 200000 == 0) {
+					std::printf("PublishCensus: examined=200000 changed=%llu\n",
+					            static_cast<unsigned long long>(
+					                s_changed.exchange(0, std::memory_order_relaxed)));
+					std::fflush(stdout);
+				}
+			}
+			view.buffer               = owner.first->Handle();
+			view.offset               = aligned_offset;
+			// range MUST be republished with the offset. The descriptor window is
+			// [offset, offset + range), and a replacement usually places the guest address at a
+			// different alignment remainder, so a stale range leaves the window shifted and
+			// mis-sized - the shader then fetches vertex data from the wrong bytes.
+			view.range                = static_cast<vk::DeviceSize>(entry.size + adjustment);
+			view.publish_adjustment   = adjustment;
+			const auto dword          = layout.memory_offset_dword + packed_index / 4u;
+			const auto shift          = (packed_index % 4u) * 8u;
+			prepared.user_data[dword] |= adjustment << shift;
+		}
 		}
 	}
 	{
 		// Two unconditional stream-buffer map+memcpy+commit per stage, 256-byte aligned, whether
-		// or not the payload changed since the last draw.
+		// or not the payload changed since the last draw. Uploaded HERE so the offsets it carries
+		// match the handles published above.
 		DrawPhaseTimer native_upload_timer(DrawPhase::BindNativeUpload);
 		if (!prepared.flattened_srt.empty()) {
 			resources.flattened_srt = NativeUpload(m_context, prepared.flattened_srt);
@@ -1355,6 +1593,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
+	// Image resolution reaches CreateBuffer through ResolveTexture -> FindImage ->
+	// InitializeImage -> ObtainBufferForImage, so it can retire a buffer an earlier publish
+	// resolved. Clearing only in the buffer methods was not sufficient.
+	prepared.published = false;
 	DrawPhaseTimer draw_phase_timer(DrawPhase::BindRebindImages);
 	EXIT_IF(prepared.program == nullptr || prepared.snapshot == nullptr);
 	const auto& program  = *prepared.program;
@@ -1384,6 +1626,53 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		// serial retry and its bindings are discarded.
 		if (!binding.image_id) {
 			continue;
+		}
+		// --image-census: is this image about to be sampled with contents nothing ever wrote?
+		//
+		// A VkImage whose backing was never uploaded, copied, resolved, cleared or written by a
+		// GPU pass has undefined contents; in practice it samples as a flat colour, which is what
+		// "the asset went black" looks like. This does not guess at a cause - it answers whether
+		// the black surface is an EMPTY IMAGE at all, or a correctly-filled image being shaded
+		// black. Those need completely different fixes, and nothing so far distinguishes them.
+		if (Config::ImageCensusEnabled()) {
+			static std::atomic<uint64_t> s_binds {0};
+			static std::atomic<uint64_t> s_empty {0};
+			static std::atomic<uint32_t> s_logged {0};
+			if (const auto* img = texture_cache.m_slot_images.try_get(binding.image_id);
+			    img != nullptr && img->backing.image != nullptr) {
+				s_binds.fetch_add(1, std::memory_order_relaxed);
+				if (!img->IsHostInitialized()) {
+					s_empty.fetch_add(1, std::memory_order_relaxed);
+					if (s_logged.fetch_add(1, std::memory_order_relaxed) < 40) {
+						std::printf("ImageCensus EMPTY: guest=0x%016llx size=0x%llx fmt=%u "
+						            "extent=%ux%ux%u mips=%u layers=%u rt=%d depth=%d storage=%d "
+						            "tex=%d cpu_dirty=%d buf_mod=%d gpu_mod=%d\n",
+						            static_cast<unsigned long long>(img->info.data.address),
+						            static_cast<unsigned long long>(img->info.data.size),
+						            static_cast<uint32_t>(img->info.pixel_format),
+						            img->info.extent.width, img->info.extent.height,
+						            img->info.extent.depth, img->info.resources.levels,
+						            img->info.resources.layers,
+						            static_cast<int>(img->usage.render_target),
+						            static_cast<int>(img->usage.depth_target),
+						            static_cast<int>(img->usage.storage),
+						            static_cast<int>(img->usage.texture),
+						            static_cast<int>(img->IsDefinitelyCpuDirty()),
+						            static_cast<int>(img->IsBufferModified()),
+						            static_cast<int>(img->IsGpuModified()));
+						std::fflush(stdout);
+					}
+				}
+			}
+			const auto n = s_binds.load(std::memory_order_relaxed);
+			if (n != 0 && n % 200000 == 0) {
+				std::printf("ImageCensus: sampled_binds=%llu empty=%llu (%.3f%%)\n",
+				            static_cast<unsigned long long>(n),
+				            static_cast<unsigned long long>(s_empty.load(std::memory_order_relaxed)),
+				            100.0 * static_cast<double>(s_empty.load(std::memory_order_relaxed)) /
+				                static_cast<double>(n));
+				std::fflush(stdout);
+			}
 		}
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage) {
@@ -1464,15 +1753,49 @@ GraphicsBindings RenderExecutor::AcquireGraphicsBindings(
 // creation bail-outs inside FindImage, ExpandImage, CreateBuffer and ObtainBuffer stay as
 // tripwires: if one fires now, acquisition missed something, and a loud abort naming the line is
 // how the three previous routes were found.
+// The single entry point both the graphics and compute paths use to finalize bindings.
+//
+// THREE PASSES OVER THE WHOLE SPAN, in this order, and never stage-at-a-time: finalizing one
+// stage completely before starting the next is exactly the cross-stage invalidation bug - the
+// second stage's rebinding can retire a buffer the first stage already published.
+//
+//   1. rebind buffers, every stage
+//   2. rebind images,  every stage   (these reach CreateBuffer via ObtainBufferForImage)
+//   3. publish,        every stage   (nothing after this changes ranges)
+//
+// It exists as one call so a caller cannot rebind without publishing. renderCompute did exactly
+// that when publication owned the user_data upload, and every dispatch committed with unbound
+// descriptors.
+void RenderExecutor::FinalizeBindings(std::span<PreparedBindings* const> stages) {
+	KYTY_PROFILER_FUNCTION();
+	// Entry: no stage in this span carries publication state from an earlier draw.
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			stage->published = false;
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			RebindBuffers(*stage);
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			RebindImages(*stage);
+		}
+	}
+	for (auto* stage: stages) {
+		if (stage != nullptr) {
+			PublishBuffers(*stage);
+		}
+	}
+}
+
 void RenderExecutor::BindGraphicsResources(GraphicsBindings& bindings) {
-	RebindBuffers(bindings.vertex);
-	if (bindings.pixel) {
-		RebindBuffers(*bindings.pixel);
-	}
-	RebindImages(bindings.vertex);
-	if (bindings.pixel) {
-		RebindImages(*bindings.pixel);
-	}
+	PreparedBindings* stages[2] = {&bindings.vertex,
+	                               bindings.pixel ? &*bindings.pixel : nullptr};
+	const size_t      count     = bindings.pixel ? 2u : 1u;
+	FinalizeBindings(std::span<PreparedBindings* const> {stages, count});
 }
 
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
@@ -1481,6 +1804,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     std::span<PreparedBindings* const> prepared_bindings,
                                     vk::CommandBuffer                  record_target) {
 	KYTY_PROFILER_FUNCTION();
+	// Publication owns the user_data and flattened_srt uploads, so a stage that reaches commit
+	// unpublished has unbound descriptors. Fail here, naming the cause, rather than at the
+	// first null view several frames of confusion later.
+	for (const auto* stage: prepared_bindings) {
+		EXIT_IF(stage != nullptr && stage->program != nullptr && !stage->published);
+	}
 	auto   vk_buffer        = buffer.Handle();
 	// Image layout transitions and barriers must stay on the primary, outside the render pass -
 	// a secondary recorded inside one may not contain them. Only the binds follow the draw.
