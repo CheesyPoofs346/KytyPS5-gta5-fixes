@@ -369,11 +369,11 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 	       CheckWidth(snapshot.samplers, 4, "sampler");
 }
 
-bool ValidateResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot,
-                                    std::string* error) {
-	if (!ValidateResourceSnapshot(program, snapshot, error)) {
-		return false;
-	}
+// The specialization checks proper. Precondition: ValidateResourceSnapshot passed on exactly this
+// snapshot (its size checks are what make the indexing below safe).
+static bool ValidateSpecializationOfValidatedSnapshot(const Program&          program,
+                                                      const ResourceSnapshot& snapshot,
+                                                      std::string*            error) {
 	if (!snapshot.indirect_images.empty()) {
 		if (error != nullptr) {
 			*error = "indirect image snapshot was not specialized";
@@ -511,6 +511,18 @@ bool ValidateResourceSpecialization(const Program& program, const ResourceSnapsh
 		}
 	}
 	return true;
+}
+
+bool ValidateResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot,
+                                    std::string* error) {
+	return ValidateResourceSnapshot(program, snapshot, error) &&
+	       ValidateSpecializationOfValidatedSnapshot(program, snapshot, error);
+}
+
+bool ValidateMaterializedResourceSpecialization(const Program&          program,
+                                                const ResourceSnapshot& snapshot,
+                                                std::string*            error) {
+	return ValidateSpecializationOfValidatedSnapshot(program, snapshot, error);
 }
 
 bool MaterializeResources(const Program& program, const SrtRuntime& runtime,

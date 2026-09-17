@@ -31,9 +31,12 @@ bool ShaderMaterializeStageRuntime(std::shared_ptr<const ShaderRecompiler::IR::P
 		}
 	}
 	{
-		// The copy of this in PrepareBindings is behind --hw-check; this one never was.
+		// MaterializeResources returned true only after ValidateResourceSnapshot passed on exactly
+		// this content, so only the specialization checks remain to run here. The full copy in
+		// PrepareBindings is behind --hw-check; this one never was.
 		DrawPhaseTimer validate_timer(DrawPhase::SrtValidate);
-		if (!ShaderRecompiler::IR::ValidateResourceSpecialization(*program, snapshot, error)) {
+		if (!ShaderRecompiler::IR::ValidateMaterializedResourceSpecialization(*program, snapshot,
+		                                                                      error)) {
 			return false;
 		}
 	}

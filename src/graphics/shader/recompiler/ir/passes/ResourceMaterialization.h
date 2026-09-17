@@ -26,6 +26,11 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
                               std::string* error);
 bool ValidateResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot,
                                     std::string* error);
+// Specialization checks only, for a snapshot MaterializeResources has just returned: it succeeds
+// only after ValidateResourceSnapshot passed on that exact content. Any other snapshot must use
+// ValidateResourceSpecialization.
+bool ValidateMaterializedResourceSpecialization(const Program& program, const ResourceSnapshot& snapshot,
+                                                std::string* error);
 
 // Resolves the immutable dense resource topology against one runtime user-data/SRT snapshot.
 // On failure the destination is unchanged.
