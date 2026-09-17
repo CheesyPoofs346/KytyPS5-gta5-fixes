@@ -22,7 +22,7 @@ moved it.** Read §0 before proposing anything.
 6. **Heredoc `\n` escapes get eaten** by the shell used here; they land as literal newlines inside
    string literals and break the build. Use the edit tool for format strings.
 7. `git stash -u` in this repo stashes **209 untracked files** including `run-gta5.sh`. Use a
-   worktree for baseline builds. One already exists: `C:/Users/konze/kyty-baseline` at `435cba4`.
+   worktree for baseline builds. One already exists at commit `435cba4`.
 
 ---
 

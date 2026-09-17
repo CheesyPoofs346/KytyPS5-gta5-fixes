@@ -18,7 +18,7 @@ state and should stay uncommitted.
    finds no save slots, creates a blank profile, and starts a **new game in North Yankton**.
    The user has said, in caps, more than once, that this must never happen. `run-gta5.sh`
    does `cd "$ROOT"` and then *refuses to launch* if no `SAVEDATASGTA5*` slots are visible.
-   It also backs the save up to `C:/Users/konze/KytyPS5-SaveBackups/` on every launch.
+   It also backs the save up before every launch.
 
 2. **Do not launch the game unless the user explicitly says to.** They test manually and have
    done 20+ runs already. Reading logs and code is expected; launching is not, unless asked.

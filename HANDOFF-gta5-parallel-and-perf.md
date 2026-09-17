@@ -18,7 +18,7 @@ parallel architecture now works correctly and does not scale. Four independent m
 3. **`µs/draw` does not normalise scene differences.** A lighter scene can have more expensive
    draws. Only within-run phase percentages are safe to compare across runs.
 4. **`git stash -u` stashes 209 untracked files including `run-gta5.sh`.** Use the worktree at
-   `C:/Users/konze/kyty-baseline` for baseline builds.
+   the existing baseline worktree for baseline builds.
 5. **The test suite has a pre-existing flake** (`GpuCommandLane`, ~1 in 5). Run it 3–5 times.
 6. Heredoc `\n` escapes get eaten by this shell and land as literal newlines inside string
    literals. Use the edit tool for format strings.
