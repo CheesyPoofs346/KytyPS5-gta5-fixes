@@ -15,6 +15,8 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <mutex>
+#include <atomic>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -482,6 +484,20 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct CompiledSrt;
+
+// Mutable per-program compiled-SRT state. Defined here rather than in SrtWalker.cpp so it is
+// the SAME type as the one Program's shared_ptr names - defining it inside that file's
+// anonymous namespace made it a distinct, unrelated type.
+struct CompiledSrtState {
+	std::mutex                         mutex;
+	std::shared_ptr<const CompiledSrt> compiled;
+	bool                               attempted = false;
+	// Runtime safeguard only; the offline differential tests are the correctness argument.
+	std::atomic<uint32_t>              verify_left {64};
+	std::atomic<bool>                  disabled {false};
+};
+
 struct Program {
 	Program() = default;
 	~Program();
@@ -517,6 +533,24 @@ struct Program {
 	bool                          shader_info_complete       = false;
 	BindingLayout                 bindings;
 	bool                          binding_layout_complete = false;
+
+	// --- compiled SRT materialization (selective port of Almo7aya 0713aeb) ---
+	//
+	// Their version hangs this off an extracted ResourcePlan (98200fe). Our Program already
+	// carries every input the compiler reads, so the compiled evaluator is retargeted onto
+	// Program directly and that 27-file rework is not required. Our fallible BuildSrtPlan, error
+	// propagation and shader-recovery behaviour are unchanged: compilation is attempted only
+	// AFTER our plan already succeeded, and every failure falls back to the interpreter.
+	//
+	// Dense numbering over the descriptor-reachable subgraph; 0 disables the compiled path.
+	uint32_t eval_slot_count = 0;
+
+	// All mutable compiled state lives behind one shared_ptr, NOT as direct members: a std::mutex
+	// or std::atomic member would delete Program's copy constructor, and Program is copied (shader
+	// cache, CompileResult, tests). A shared_ptr keeps Program exactly as copyable as before.
+	// Copies share the state, which is sound because the compiled form is derived purely from the
+	// value graph, and a copy has the same graph.
+	mutable std::shared_ptr<CompiledSrtState> compiled_state;
 
 	std::optional<SpirvRequirements> spirv_requirements;
 };
