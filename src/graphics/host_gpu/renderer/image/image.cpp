@@ -226,6 +226,7 @@ void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destina
 void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
                    uint64_t size) {
 	EXIT_IF(m_scheduler == nullptr || copies.empty() || buffer == nullptr || size == 0);
+	m_host_initialized = true;
 	m_scheduler->EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -330,6 +331,7 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 
 void Image::CopyImage(Image& source) {
 	EXIT_IF(m_scheduler == nullptr || source.backing.samples != backing.samples);
+	m_host_initialized = true;
 	m_scheduler->EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
 	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
@@ -412,6 +414,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	resolved_destination_range.layer_count = layers;
 	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
 
+	m_host_initialized = true;
 	m_scheduler->EndRendering();
 	auto command = m_scheduler->Current().Handle();
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
@@ -453,6 +456,7 @@ uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) no
 void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	EXIT_IF(m_scheduler == nullptr || buffer.Handle() == nullptr || source.backing.samples != 1 ||
 	        backing.samples != 1);
+	m_host_initialized = true;
 	m_scheduler->EndRendering();
 	const uint32_t levels = std::min(source.backing.mip_levels, backing.mip_levels);
 	const auto     source_aspect =
@@ -549,6 +553,7 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(m_scheduler == nullptr || source.backing.samples != backing.samples ||
 	        mip >= backing.mip_levels || layer >= backing.layers);
+	m_host_initialized = true;
 	m_scheduler->EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);

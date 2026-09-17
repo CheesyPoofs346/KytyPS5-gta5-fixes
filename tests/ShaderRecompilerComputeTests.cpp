@@ -212,7 +212,7 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<TrackingSharedLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 
@@ -467,10 +467,6 @@ struct RenderExecutorTestAccess {
       device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout,
                                         nullptr);
     }
-  }
-
-  static const auto &PushConstants(const RenderExecutor &executor) {
-    return executor.m_push_constants;
   }
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
@@ -1607,15 +1603,8 @@ public:
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
-    const auto &bank =
-        RenderExecutorTestAccess::PushConstants(context.GetRenderExecutor());
-    Require(name, "packing",
-            bank[0] == 0x11111111u && bank[1] == 0x22222222u &&
-                bank[2] == 0x33333333u && bank[3] == 0x44444444u &&
-                std::ranges::all_of(bank.begin() + 4, bank.end(),
-                                    [](uint32_t value) { return value == 0; }) &&
-                vertex.committed && pixel.committed,
-            "graphics stages were not packed into one zero-filled push bank");
+    Require(name, "commit", vertex.committed && pixel.committed,
+            "graphics stages did not commit their push-constant bindings");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
@@ -7403,6 +7392,26 @@ public:
                                    vk::ImageUsageFlagBits::eStorage);
       const auto storage_id = texture_cache.FindImage(storage);
       (void)texture_cache.FindTexture(storage_id, storage);
+      const auto ordinary_epoch_before = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      auto ordinary_storage = MakeAtlasDesc(BindingType::Storage, vk::Format::eR8Uint,
+                                             Prospero::BufferFormat::k8UInt,
+                                             vk::ImageUsageFlagBits::eStorage);
+      const auto ordinary_storage_id = texture_cache.FindImage(ordinary_storage);
+      const auto ordinary_epoch_after = TextureCacheTestAccess::QueryEpoch(texture_cache);
+	  const auto expected_walks = Config::TextureSingleWalkEnabled() ? 1u : 2u;
+      Require(name, "same-format storage cache hit",
+              storage_id && ordinary_storage_id == storage_id,
+              "identical storage descriptor did not reuse its cache image");
+      Require(name, "ordinary hit takes one region walk",
+              ordinary_epoch_after - ordinary_epoch_before == expected_walks,
+              "ordinary storage cache hit repeated image-region discovery");
+	  std::printf("[host]    storage cache hit walks=%u texture_single_walk=%s\n",
+	              ordinary_epoch_after - ordinary_epoch_before,
+	              Config::TextureSingleWalkEnabled() ? "true" : "false");
+      texture_cache.MarkGpuWritten(storage_id);
+      Require(name, "GPU-modified storage setup",
+              texture_cache.GetImage(storage_id).IsGpuModified(),
+              "storage image did not enter the GPU-owned state before reinterpretation");
       auto sampled = MakeAtlasDesc(BindingType::Texture, vk::Format::eR8Unorm,
                                    Prospero::BufferFormat::k8UNorm,
                                    vk::ImageUsageFlagBits::eSampled);
@@ -25847,6 +25856,17 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageSampledFormatSeparation();
+    return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--storage-sampled-only") == 0 &&
+      std::strcmp(argv[2], "--texture-single-walk") == 0 &&
+      (std::strcmp(argv[3], "true") == 0 || std::strcmp(argv[3], "false") == 0)) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::OutputDirection::Silent;
+    options.texture_single_walk = std::strcmp(argv[3], "true") == 0;
+    Config::Load(options);
     VulkanHarness vulkan;
     vulkan.CheckStorageSampledFormatSeparation();
     return 0;

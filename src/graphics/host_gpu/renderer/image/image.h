@@ -139,8 +139,18 @@ public:
 	}
 	// Set from resolution, which will run on workers; cleared only by the main thread outside a
 	// batch, so a set can never race a clear.
-	void MarkGpuModified() noexcept { m_gpu_modified.store(true, std::memory_order_relaxed); }
+	void MarkGpuModified() noexcept {
+		m_gpu_modified.store(true, std::memory_order_relaxed);
+		m_host_initialized = true;   // a GPU pass wrote it
+	}
 	void ClearGpuModified() noexcept { m_gpu_modified.store(false, std::memory_order_relaxed); }
+
+	// Has anything ever written host-side contents into this image - a guest upload, an
+	// image-to-image copy, a resolve, or a GPU pass? A sampled image for which this is false has
+	// undefined backing and reads as a flat colour, which is the "asset went black" symptom. Used
+	// only by the --image-census diagnostic.
+	[[nodiscard]] bool IsHostInitialized() const noexcept { return m_host_initialized; }
+	void               MarkHostInitialized() noexcept { m_host_initialized = true; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
@@ -194,6 +204,7 @@ private:
 	bool              m_maybe_hash_valid = false;
 	std::atomic<bool> m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	bool              m_host_initialized = false;
 };
 
 namespace ImageOps {
