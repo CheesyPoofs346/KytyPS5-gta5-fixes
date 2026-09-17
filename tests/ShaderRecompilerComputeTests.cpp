@@ -30,6 +30,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/drawWorkerContext.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -84,6 +85,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -96,6 +98,12 @@
 #endif
 
 namespace Libs::Graphics {
+
+// descriptors.cpp owns the per-thread graphics push-constant bank. It deliberately keeps this
+// out of RenderExecutor, so the test observes the current production storage through its actual
+// translation-unit interface rather than the removed RenderExecutor member.
+std::array<uint32_t, ShaderRecompiler::IR::NativePushConstantSize / sizeof(uint32_t)>&
+PushConstants();
 
 template <typename Cache>
 concept HasGetDownloadBuffer =
@@ -212,7 +220,7 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<TrackingSharedLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 
@@ -469,8 +477,14 @@ struct RenderExecutorTestAccess {
     }
   }
 
+  static void BindGraphicsResources(RenderExecutor &executor,
+                                    GraphicsBindings &bindings) {
+    executor.BindGraphicsResources(bindings);
+  }
+
   static const auto &PushConstants(const RenderExecutor &executor) {
-    return executor.m_push_constants;
+    (void)executor;
+    return Libs::Graphics::PushConstants();
   }
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
@@ -8588,6 +8602,94 @@ public:
           sampled_runtime.program,
           std::make_shared<const ShaderRecompiler::IR::ResourceSnapshot>(
               std::move(ordered_snapshot))};
+
+      // The worker-only image slice must retain a cache hit, but turn a cache miss into a
+      // per-slot ticket. The caller then performs the normal acquisition and final rebinding in
+      // guest order. This deliberately does not use BindQueuedResources: that is the separate,
+      // known-unsafe full parallel-binding experiment.
+      Config::ConfigOptions worker_image_options{};
+      worker_image_options.printf_direction = Config::OutputDirection::Silent;
+      worker_image_options.worker_resolve_images = true;
+      worker_image_options.draw_workers = 2;
+      Config::Load(worker_image_options);
+
+      PreparedShaders worker_hit{};
+      worker_hit.valid = true;
+      worker_hit.vs_input_info.stage = sampled_runtime;
+      PreparedShaders worker_miss{};
+      worker_miss.valid = true;
+      worker_miss.vs_input_info.stage = ordered_sampled_runtime;
+
+      // ParallelFor keeps batches of <= 16 inline on runner 0. Use a 17-item batch and hold
+      // runner 0 until the background runner has processed the miss, so this exercises the
+      // same staging branch that an actual worker uses rather than accidentally creating it on
+      // the caller.
+      constexpr uint32_t worker_items = 17;
+      std::array<PreparedShaders, worker_items> worker_hits {};
+      for (auto &prepared : worker_hits) {
+        prepared.valid = true;
+        prepared.vs_input_info.stage = sampled_runtime;
+      }
+      std::atomic_bool miss_taken {false};
+      std::atomic_bool miss_finished {false};
+      context.GetDrawWorkerPool().ParallelFor(
+          worker_items,
+          [&executor, &worker_hits, &worker_miss, &miss_taken,
+           &miss_finished](uint32_t index, uint32_t worker) {
+            ScopedDrawWorker slot(worker);
+            (void)TakeWorkerBailout();
+            if (worker != 0 && !miss_taken.exchange(true,
+                                                    std::memory_order_acq_rel)) {
+              executor.PreResolveQueuedImages(worker_miss);
+              miss_finished.store(true, std::memory_order_release);
+              return;
+            }
+            if (worker == 0) {
+              while (!miss_finished.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+              }
+            }
+            executor.PreResolveQueuedImages(worker_hits[index]);
+          });
+      worker_hit = std::move(worker_hits[0]);
+      Require(name, "worker image cache hit retained",
+              worker_hit.vertex_images.attempted &&
+                  worker_hit.vertex_images.ok.size() == 1 &&
+                  worker_hit.vertex_images.ok[0] != 0 &&
+                  worker_hit.vertex_images.bindings[0].image_id == storage_id,
+              "worker image preparation did not retain an existing image binding");
+      Require(name, "worker image cache miss ticketed",
+              worker_miss.vertex_images.attempted &&
+                  worker_miss.vertex_images.ok.size() == 1 &&
+                  worker_miss.vertex_images.ok[0] == 0 &&
+                  !worker_miss.vertex_images.bindings[0].image_id,
+              "worker image preparation created or retained an uncached image");
+
+      // The caller resolves the tickets and publishes descriptors in guest order after the
+      // range-changing work. Workers retain only image bindings; they do not bind or record.
+      executor.AcquireQueuedBindings(worker_hit);
+      RenderExecutorTestAccess::BindGraphicsResources(executor, worker_hit.bindings);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), worker_hit.bindings.vertex));
+      Require(name, "worker image hit caller finalization",
+              worker_hit.bindings.vertex.resources.images[0].image_id == storage_id &&
+                  worker_hit.bindings.vertex.resources.images[0].image_view != nullptr &&
+                  worker_hit.bindings.vertex.committed,
+              "caller-side acquisition/rebinding changed a worker-resolved image");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      executor.AcquireQueuedBindings(worker_miss);
+      RenderExecutorTestAccess::BindGraphicsResources(executor, worker_miss.bindings);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), worker_miss.bindings.vertex));
+      const auto ticketed_image_id = worker_miss.bindings.vertex.resources.images[0].image_id;
+      Require(name, "worker image miss caller finalization",
+              ticketed_image_id &&
+                  worker_miss.bindings.vertex.resources.images[0].image_view != nullptr &&
+                  worker_miss.bindings.vertex.committed,
+              "caller did not create and finalize the ticketed image");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
       const auto ordered_sampled_id =
@@ -8595,7 +8697,7 @@ public:
       Require(
           name, "VS-before-PS retained-owner order",
           ordered_bindings.vertex.resources.images[0].image_id == storage_id &&
-              ordered_sampled_id != storage_id &&
+              ordered_sampled_id == ticketed_image_id && ordered_sampled_id != storage_id &&
               RenderExecutorTestAccess::BoundImagesInOrder(executor, storage_id,
                                                            ordered_sampled_id),
           "production graphics binding did not retain vertex resources "
