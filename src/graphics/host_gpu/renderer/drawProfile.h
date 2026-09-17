@@ -211,6 +211,32 @@ struct DrawProfileState {
 	uint64_t                              tsc_start = 0;
 };
 
+// Guest DMA (PM4 IT_DMA_DATA) accounting for the capture, gated on --dma-census.
+//
+// Process-wide rather than thread_local: DMA packets are handled on the submission thread, but the
+// capture sample is closed elsewhere, so a thread_local counter would not be visible to the writer.
+// Both are relaxed - they are a diagnostic, and losing an update to a race would not change a
+// conclusion drawn from thousands of samples.
+//
+// IMPORTANT for interpretation: this attributes a packet to whichever sample was open when the
+// handler RETURNED. Work spanning a sample boundary lands in one sample, GPU work a DMA defers can
+// surface in a later one, and time blocked inside the handler is charged to the handler. These
+// counters can show ASSOCIATION between DMA activity and slow samples. They cannot establish that
+// DMA caused a slow sample.
+inline std::atomic<uint64_t> g_dma_bytes {0};
+inline std::atomic<uint64_t> g_dma_ns {0};
+
+inline void DmaCensusAdd(uint64_t bytes, uint64_t ns) {
+	g_dma_bytes.fetch_add(bytes, std::memory_order_relaxed);
+	g_dma_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+// Reads and zeroes both counters, so each capture sample reports only its own DMA.
+inline void DmaCensusTake(uint64_t* bytes, uint64_t* ns) {
+	*bytes = g_dma_bytes.exchange(0, std::memory_order_relaxed);
+	*ns    = g_dma_ns.exchange(0, std::memory_order_relaxed);
+}
+
 inline thread_local DrawProfileState g_draw_profile;
 // The draw phase profile is thread_local and was previously reported per thread on that
 // thread's own cumulative draw count since process start. For attribution we need every

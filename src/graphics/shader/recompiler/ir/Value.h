@@ -109,6 +109,14 @@ public:
 	Inst& operator=(const Inst&) = delete;
 	Inst(Inst&&)                 = delete;
 	Inst& operator=(Inst&&)      = delete;
+
+	// Dense index over the descriptor-reachable value subgraph, assigned once after the SRT
+	// plan succeeds (NumberEvalSlots). Lets per-draw evaluation memoize in a flat array
+	// instead of hashing and probing per node. NoEvalSlot when this value is not part of
+	// that subgraph, in which case the compiled path is not used for it.
+	static constexpr uint32_t NoEvalSlot = 0xffffffffu;
+	[[nodiscard]] uint32_t    GetEvalSlot() const { return eval_slot; }
+	void                      SetEvalSlot(uint32_t slot) { eval_slot = slot; }
 
 	[[nodiscard]] ValueOpcode             GetOpcode() const;
 	[[nodiscard]] Type                    GetType() const;
@@ -150,6 +158,7 @@ private:
 	void ClearArgs();
 
 	ValueOpcode         opcode;
+	uint32_t    eval_slot = NoEvalSlot;
 	uint64_t            flags;
 	Block*              parent = nullptr;
 	std::vector<Value>  args;

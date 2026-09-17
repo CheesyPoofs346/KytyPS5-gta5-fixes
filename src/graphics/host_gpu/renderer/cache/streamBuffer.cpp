@@ -364,7 +364,7 @@ bool StreamBuffer::WaitPendingOperations(const std::vector<Watch>& watches,
 	}
 	while (requested_upper_bound > wait_bound && wait_cursor < *invalidation_mark) {
 		const auto& watch = watches[wait_cursor];
-		if (!Scheduler().IsFree(watch.tick) && !allow_wait) {
+		if (!allow_wait && !Scheduler().IsFree(watch.tick)) {
 			return false;
 		}
 		Scheduler().Wait(watch.tick);

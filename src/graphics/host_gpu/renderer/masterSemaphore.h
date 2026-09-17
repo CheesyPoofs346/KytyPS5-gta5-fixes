@@ -27,6 +27,12 @@ public:
 		return m_current_tick.fetch_add(1, std::memory_order_release);
 	}
 	[[nodiscard]] vk::Semaphore Handle() const noexcept { return m_semaphore; }
+#ifdef KYTY_MASTER_SEMAPHORE_REFRESH_COUNT
+	// Test builds only: number of timeline counter queries issued.
+	[[nodiscard]] uint64_t RefreshCount() const noexcept {
+		return m_refresh_count.load(std::memory_order_relaxed);
+	}
+#endif
 
 	void Refresh();
 	void Wait(uint64_t tick);
@@ -36,6 +42,9 @@ private:
 	vk::Semaphore         m_semaphore = nullptr;
 	std::atomic<uint64_t> m_gpu_tick {0};
 	std::atomic<uint64_t> m_current_tick {1};
+#ifdef KYTY_MASTER_SEMAPHORE_REFRESH_COUNT
+	std::atomic<uint64_t> m_refresh_count {0};
+#endif
 };
 
 } // namespace Libs::Graphics
