@@ -344,7 +344,26 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			const int32_t hdr_start = Common::ToInt32(value);
 			options.config.hdr_probe_start = static_cast<uint32_t>(hdr_start < 0 ? 0 : hdr_start);
 		} else if (arg == "--skip-ps-chksum") {
-			options.config.skip_ps_chksum.push_back(std::strtoull(value.c_str(), nullptr, 0));
+			uint64_t chksum = 0;
+			if (!Config::ParsePixelShaderChksum(value.c_str(), chksum)) {
+				::printf("invalid pixel shader checksum for %s: %s (expected a nonzero 32-bit value)\n",
+				         arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.skip_ps_chksum.push_back(chksum);
+		} else if (arg == "--gpu-timestamps") {
+			if (!ParseBool(value, options.config.gpu_timestamps)) {
+				::printf("invalid boolean for --gpu-timestamps\n");
+				return false;
+			}
+		} else if (arg == "--gpu-timestamps-ps-chksum") {
+			uint64_t chksum = 0;
+			if (!Config::ParsePixelShaderChksum(value.c_str(), chksum)) {
+				::printf("invalid pixel shader checksum for %s: %s (expected a nonzero 32-bit value)\n",
+				         arg.c_str(), value.c_str());
+				return false;
+			}
+			options.config.gpu_timestamps_ps_chksum.push_back(chksum);
 		} else if (arg == "--cache-descriptors") {
 			if (!ParseBool(value, options.config.cache_descriptors)) {
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
@@ -361,6 +380,40 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			if (options.config.eop_flush_interval == 0) {
 				options.config.eop_flush_interval = 1;
 			}
+		} else if (arg == "--binding-publish") {
+			if (!ParseBool(value, options.config.binding_publish)) {
+				::printf("invalid boolean for --binding-publish\n");
+				return false;
+			}
+		} else if (arg == "--buffer-growth") {
+			if (!ParseBool(value, options.config.buffer_growth)) {
+				::printf("invalid boolean for --buffer-growth\n");
+				return false;
+			}
+		} else if (arg == "--image-census") {
+			if (!ParseBool(value, options.config.image_census)) {
+				::printf("invalid boolean for --image-census\n");
+				return false;
+			}
+		} else if (arg == "--buffer-census") {
+			if (!ParseBool(value, options.config.buffer_census)) {
+				::printf("invalid boolean for --buffer-census\n");
+				return false;
+			}
+		} else if (arg == "--blocked-poll-us") {
+			options.config.blocked_poll_us = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+		} else if (arg == "--blocked-poll-tries") {
+			options.config.blocked_poll_tries = static_cast<uint32_t>(strtoul(value.c_str(), nullptr, 10));
+		} else if (arg == "--dma-census") {
+			if (!ParseBool(value, options.config.dma_census)) {
+				::printf("invalid boolean for --dma-census\n");
+				return false;
+			}
+		} else if (arg == "--compiled-srt") {
+			if (!ParseBool(value, options.config.compiled_srt)) {
+				::printf("invalid boolean for --compiled-srt\n");
+				return false;
+			}
 		} else if (arg == "--worker-resolve-images") {
 			if (!ParseBool(value, options.config.worker_resolve_images)) {
 				::printf("invalid boolean for --worker-resolve-images\n");
@@ -376,6 +429,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for --backing-fast-path\n");
 				return false;
 			}
+		} else if (arg == "--texture-single-walk") {
+			if (!ParseBool(value, options.config.texture_single_walk)) {
+				::printf("invalid boolean for --texture-single-walk\n");
+				return false;
+			}
 		} else if (arg == "--backing-lock-sample") {
 			if (!ParseBool(value, options.config.backing_lock_sample)) {
 				::printf("invalid boolean for --backing-lock-sample\n");
@@ -387,6 +445,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--stream-repeat-threshold") {
 			options.config.stream_repeat_threshold =
 			    static_cast<uint32_t>(std::strtoul(value.c_str(), nullptr, 0));
+		} else if (arg == "--stream-read-census") {
+			if (!ParseBool(value, options.config.stream_read_census)) {
+				::printf("invalid boolean for --stream-read-census\n");
+				return false;
+			}
 		} else if (arg == "--light-partial-flush") {
 			if (!ParseBool(value, options.config.light_partial_flush)) {
 				::printf("invalid boolean for --light-partial-flush\n");

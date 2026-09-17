@@ -608,6 +608,13 @@ static vk::Device VulkanCreateDevice(vk::PhysicalDevice physical_device, const V
 	features12.timelineSemaphore = VK_TRUE;
 	features12.shaderOutputLayer = VK_TRUE;
 	features12.bufferDeviceAddress = VK_TRUE;
+	// --gpu-timestamps resets timestamp queries on the host once their buffer has completed, so the
+	// feature is requested only for that diagnostic and only when the device offers it.
+	graphics.host_query_reset_enabled = false;
+	if (Config::GpuTimestampsEnabled() && supported_features12.hostQueryReset == VK_TRUE) {
+		features12.hostQueryReset         = VK_TRUE;
+		graphics.host_query_reset_enabled = true;
+	}
 
 	vk::PhysicalDeviceFeatures device_features {};
 	device_features.fragmentStoresAndAtomics = VK_TRUE;
@@ -1100,6 +1107,15 @@ void WindowContext::CreateVulkan() {
 	graphic_ctx.queue_family = queue_family;
 	graphic_ctx.device.getQueue(queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	{
+		// Recorded for --gpu-timestamps: 0 means this queue family cannot write timestamps.
+		uint32_t family_count = 0;
+		graphic_ctx.physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		graphic_ctx.physical_device.getQueueFamilyProperties(&family_count, families.data());
+		graphic_ctx.timestamp_valid_bits =
+		    queue_family < family_count ? families[queue_family].timestampValidBits : 0;
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
