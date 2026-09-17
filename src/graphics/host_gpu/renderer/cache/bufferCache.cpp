@@ -2,6 +2,9 @@
 #include "graphics/host_gpu/renderer/drawProfile.h"
 #include "graphics/host_gpu/renderer/secondaryBatch.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/bufferCensus.h"
+#include "graphics/host_gpu/renderer/cache/bufferGrowth.h"
+#include "graphics/host_gpu/renderer/cache/streamReadCensus.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -18,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <tuple>
@@ -112,6 +116,12 @@ void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* 
 // uploads only dirty sub-ranges and clears them, which is the behaviour that already works.
 class StreamRepeatTracker {
 public:
+	void Reset() noexcept {
+		m_slots.fill({});
+		m_taken    = 0;
+		m_declined = 0;
+	}
+
 	// Saturating per-address counter. Open addressed, no eviction policy beyond overwrite: a
 	// collision costs one extra full copy, never a correctness problem, because the fast path is
 	// an optimisation and the fallback is the authoritative path.
@@ -164,6 +174,7 @@ private:
 };
 
 thread_local StreamRepeatTracker t_stream_repeat;
+thread_local StreamReadCensus    t_stream_read_census;
 
 struct BufferCache::DownloadCopy {
 	Buffer*  buffer        = nullptr;
@@ -171,6 +182,14 @@ struct BufferCache::DownloadCopy {
 	uint64_t address       = 0;
 	uint64_t size          = 0;
 };
+
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+void BufferCache::ResetStreamRepeatTestStats() noexcept {
+	m_stream_repeat_test_stats    = {};
+	m_stream_repeat_test_fallback = false;
+	t_stream_repeat.Reset();
+}
+#endif
 
 void BufferCache::Register(BufferId id) {
 	ChangeRegister<true>(id);
@@ -456,6 +475,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	// The census summary hangs off this destructor because std::atexit alone produced nothing
+	// on the first capture. Reported before the teardown checks below, which can EXIT.
+	if (Config::BufferCensusEnabled()) {
+		ReportBufferCensusFinal();
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -589,6 +613,22 @@ void BufferCache::ReadMemoryOnGpu(uint64_t vaddr, uint64_t size, bool is_write) 
 	}
 }
 
+std::pair<Buffer*, uint64_t> BufferCache::FindPublishedOwner(uint64_t vaddr, uint64_t size) {
+	if (vaddr == 0 || size == 0) {
+		return {nullptr, 0};
+	}
+	MaybeSharedLock lock(m_page_table_lock, m_concurrent);
+	const auto*     owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner) {
+		return {nullptr, 0};
+	}
+	auto& buffer = m_slot_buffers[*owner];
+	if (buffer.is_deleted || !buffer.IsInBounds(vaddr, size)) {
+		return {nullptr, 0};
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -619,21 +659,39 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(MustStageForWorker());
 	auto& command = m_scheduler.Current();
 	EXIT_IF(command.IsInvalid());
-	auto       begin = vaddr & ~(CACHING_PAGESIZE - 1);
-	auto       end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
-	auto       first = m_buffers.lower_bound(begin);
-	if (first != m_buffers.begin()) {
-		const auto previous = std::prev(first);
-		if (const auto& buffer = m_slot_buffers[previous->second];
-		    buffer.CpuAddress() + buffer.Size() > begin) {
-			first = previous;
-		}
-	}
-	auto last = first;
-	for (; last != m_buffers.end() && last->first < end; ++last) {
-		const auto& buffer = m_slot_buffers[last->second];
-		begin              = std::min(begin, buffer.CpuAddress());
-		end                = std::max(end, buffer.CpuAddress() + buffer.Size());
+	const auto requested_begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	const auto requested_end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+
+	BufferGrowthConfig growth {};
+	growth.enabled = Config::BufferGrowthEnabled();
+	// Upstream 74a78f3 constants. Not tuned here: whether 16 and 128 pages suit this workload is
+	// exactly what an A/B has to answer, and the census cannot.
+	growth.threshold          = 16;
+	growth.leap_size          = CACHING_PAGESIZE * 128;
+	growth.address_space_size = PageTable::kAddressSpaceSize;
+	growth.min_address        = CACHING_PAGESIZE * 2;
+
+	const auto plan = ResolveOverlapsWithLeap(
+	    m_buffers,
+	    [this](auto it) {
+		    const auto& b = m_slot_buffers[it->second];
+		    return BufferGrowthRange {b.CpuAddress(), b.CpuAddress() + b.Size(), b.stream_score};
+	    },
+	    requested_begin, requested_end, growth);
+
+	const auto begin = plan.begin;
+	const auto end   = plan.end;
+
+	if (Config::BufferCensusEnabled()) {
+		// Registered on the first counted create so a short run still reports. Function-local
+		// static initialisation is thread-safe and happens exactly once. Kept as a backstop only;
+		// the summary is printed from ~BufferCache, which is the path observed to run.
+		static const bool registered = std::atexit([] { ReportBufferCensusFinal(); }) == 0;
+		(void)registered;
+		AccumulateBufferCreate(g_buffer_census, plan.overlap_count, plan.overlap_bytes,
+		                       plan.expands_left, plan.expands_right, requested_begin,
+		                       requested_end, end - begin);
+		ReportBufferCensus();
 	}
 
 	const auto id = m_slot_buffers.insert(
@@ -642,14 +700,32 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	auto&      buffer = m_slot_buffers[id];
 	SetVulkanObjectNameF(m_graphics.device, buffer.Handle(),
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", begin, end - begin);
-	for (auto overlap = first; overlap != last;) {
+	for (auto overlap = plan.first; overlap != plan.last;) {
 		const auto current = overlap++;
 		const auto old_id  = current->second;
 		const auto& old    = m_slot_buffers[old_id];
+		// Unchanged: every joined buffer is copied to its own offset in the replacement before it
+		// is retired, so a wider replacement preserves exactly the same bytes it did before.
 		buffer.CopyFrom(command, old, 0, old.CpuAddress() - begin, old.Size());
+		if (!plan.leaped) {
+			// Carry the join history forward. Suppressed on the create that leaped, so the padded
+			// buffer starts from zero and has to earn the next leap rather than triggering one
+			// immediately on its first subsequent join.
+			buffer.stream_score += old.stream_score + 1;
+		}
+		if (Config::BufferCensusEnabled()) {
+			NoteBufferDelete(old.CpuAddress(), old.Size(), BufferDeleteReason::Merged);
+		}
 		DeleteBuffer(old_id);
 	}
 	Register(id);
+	m_replacements++;
+	if (Config::BufferCensusEnabled()) {
+		// After Register, so m_total_used_memory includes the replacement and excludes everything
+		// retired above.
+		NoteBufferMemory(g_buffer_census, m_total_used_memory, m_buffers.size(),
+		                 plan.leaped ? 1 : 0, plan.pad_bytes);
+	}
 	return id;
 }
 
@@ -665,6 +741,12 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+	// Every invocation below is the real persistent path, including clean calls after the first
+	// fallback. Count those separately from bytes so a zero-byte sync is not mistaken for free.
+	m_stream_repeat_test_stats.persistent_sync_calls++;
+	m_stream_repeat_test_stats.persistent_upload_bytes += total_size;
+#endif
 	if (source && !Config::DeferUploadsEnabled() && !MustStageForWorker()) {
 		// Immediate path, unchanged and still the default. Deferral is correct only if every
 		// consumer of an upload drains the list first, and enumerating those by hand missed one
@@ -757,13 +839,25 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 
 	bool tracker_fast_path = false;
+	bool tracker_gpu_dirty = false;
+	bool tracker_cpu_dirty = false;
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+	m_stream_repeat_test_fallback = false;
+#endif
 	{
 		// These query the region bitmaps and can take the region tracking lock, so they are timed
 		// apart from the lookup and the sync they gate.
 		DrawPhaseTimer tracker_timer(DrawPhase::ObtTracker);
 		if (!is_written && size <= CACHING_PAGESIZE) {
-			tracker_fast_path = !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
-			                    m_memory_tracker.IsRegionCpuModified(vaddr, size);
+			tracker_gpu_dirty = m_memory_tracker.IsRegionGpuModified(vaddr, size);
+			tracker_cpu_dirty = m_memory_tracker.IsRegionCpuModified(vaddr, size);
+			tracker_fast_path = !tracker_gpu_dirty && tracker_cpu_dirty;
+		}
+	}
+	if (Config::StreamReadCensusEnabled()) {
+		t_stream_read_census.ObserveRequest(vaddr, size, is_written, tracker_gpu_dirty, tracker_cpu_dirty);
+		if (t_stream_read_census.ShouldReport()) {
+			t_stream_read_census.Report();
 		}
 	}
 	// Past the repeat threshold the fast path is a guaranteed redundant full copy; the
@@ -772,6 +866,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		if (const auto threshold = Config::StreamRepeatThreshold();
 		    threshold != 0 && t_stream_repeat.Exceeded(vaddr, threshold)) {
 			tracker_fast_path = false;
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+			m_stream_repeat_test_fallback = true;
+#endif
 		}
 	}
 	if (tracker_fast_path) {
@@ -802,11 +899,17 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			DrawPhaseTimer read_timer(DrawPhase::ObtStreamRead);
 			read_ok = Libs::LibKernel::Memory::TryReadBacking(vaddr, mapped, size);
 		}
+		if (Config::StreamReadCensusEnabled()) {
+			t_stream_read_census.ObserveReadResult(vaddr, size, read_ok);
+		}
 		if (read_ok) {
 			{
 				DrawPhaseTimer commit_timer(DrawPhase::ObtStreamCommit);
 				stream.Commit();
 			}
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+			m_stream_repeat_test_stats.stream_bytes += size;
+#endif
 			return {&stream, offset};
 		}
 	}
@@ -823,8 +926,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				RequestWorkerBailout();
 				return {nullptr, 0};
 			}
+			const auto replacements_before = m_replacements;
 			id     = FindBuffer(vaddr, size);
 			buffer = &m_slot_buffers[id];
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+			if (m_stream_repeat_test_fallback && m_replacements != replacements_before) {
+				m_stream_repeat_test_stats.persistent_allocations++;
+			}
+#endif
 		}
 	}
 	TouchBuffer(*buffer);
@@ -1170,6 +1279,9 @@ void BufferCache::RunGarbageCollector() {
 				});
 			dirty_buffers.push_back(id);
 		} else {
+			if (Config::BufferCensusEnabled()) {
+				NoteBufferDelete(buffer.CpuAddress(), buffer.Size(), BufferDeleteReason::Evicted);
+			}
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
 			DeleteBuffer(id);
 		}

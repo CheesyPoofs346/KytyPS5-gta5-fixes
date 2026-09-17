@@ -335,7 +335,11 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		}
 		return true;
 	};
-	std::unordered_set<uint32_t> indirect_resources;
+	// Constructing the set allocates; only snapshots that carry indirect tables use it.
+	std::optional<std::unordered_set<uint32_t>> indirect_resources;
+	if (!snapshot.indirect_images.empty()) {
+		indirect_resources.emplace();
+	}
 	for (const auto& table: snapshot.indirect_images) {
 		const auto* source = table.resource < program.info.images.size()
 		                         ? Source(program, program.info.images[table.resource].source)
@@ -344,7 +348,7 @@ bool ValidateResourceSnapshot(const Program& program, const ResourceSnapshot& sn
 		    program.info.images[table.resource].indirect_root != ImageResource::NoIndirectImage ||
 		    table.keys.empty() || table.keys.size() != table.candidates.size() ||
 		    table.capacity < table.keys.size() || table.descriptors.empty() ||
-		    !indirect_resources.insert(table.resource).second) {
+		    !indirect_resources->insert(table.resource).second) {
 			if (error != nullptr) {
 				*error = "indirect image snapshot does not match the shader plan";
 			}

@@ -69,6 +69,11 @@ public:
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted = false;
+	// Accumulated count of how many times this range has been rebuilt by joining. Carried
+	// forward through each join, so a range that keeps being widened climbs; reset to 0 on the
+	// replacement that actually leaps, so it must re-earn the next one. Only read when
+	// --buffer-growth is on.
+	int    stream_score = 0;
 	size_t lru_id     = 0;
 	// Hot-readback tracking: once the CPU has read this buffer after a GPU write, every slice
 	// that writes it records a host-visible shadow copy so later CPU reads avoid a GPU drain.

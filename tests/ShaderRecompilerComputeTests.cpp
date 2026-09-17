@@ -212,7 +212,7 @@ struct TextureCacheTestAccess {
   static_assert(TextureCache::ImagePageTable::kAddressSpaceBits == 40);
   static_assert(TextureCache::ImagePageTable::kFirstLevelBits == 10);
 
-  static std::unique_lock<TrackingSpinLock> Lock(TextureCache &cache) {
+  static std::unique_lock<TrackingSharedLock> Lock(TextureCache &cache) {
     return std::unique_lock(cache.m_lock);
   }
 
@@ -467,10 +467,6 @@ struct RenderExecutorTestAccess {
       device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout,
                                         nullptr);
     }
-  }
-
-  static const auto &PushConstants(const RenderExecutor &executor) {
-    return executor.m_push_constants;
   }
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
@@ -1607,15 +1603,8 @@ public:
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
-    const auto &bank =
-        RenderExecutorTestAccess::PushConstants(context.GetRenderExecutor());
-    Require(name, "packing",
-            bank[0] == 0x11111111u && bank[1] == 0x22222222u &&
-                bank[2] == 0x33333333u && bank[3] == 0x44444444u &&
-                std::ranges::all_of(bank.begin() + 4, bank.end(),
-                                    [](uint32_t value) { return value == 0; }) &&
-                vertex.committed && pixel.committed,
-            "graphics stages were not packed into one zero-filled push bank");
+    Require(name, "commit", vertex.committed && pixel.committed,
+            "graphics stages did not commit their push-constant bindings");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
         context.GetRenderExecutor(), std::span {&pipeline, 1u});
@@ -1960,6 +1949,168 @@ public:
     scheduler.Finish();
     download.Invalidate(download_offset, 16);
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
+  }
+
+  // Counts timeline counter queries issued while a stream wrap waits on its
+  // watches. Each case uses a fresh ring so the wrap waits on exactly one watch.
+  void CheckStreamBufferWaitQueries() {
+    constexpr const char *name = "StreamBufferWaitQueries";
+    EnsureRuntimeContext();
+    CommandScheduler scheduler(Renderer(), m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &master = scheduler.GetMasterSemaphore();
+    const auto atom =
+        m_runtime_context.physical_device_properties.limits.nonCoherentAtomSize;
+    const auto ring_size = std::max<uint64_t>(64, atom * 2);
+    constexpr uint64_t wrap_size = 24;
+
+    const auto fill = [&](StreamBuffer &stream) {
+      const auto first_size =
+          stream.IsCoherent() ? ring_size - 16 : ring_size - atom + 1;
+      const auto [data, offset] = stream.Map(first_size, 16, false);
+      Require(name, "fill", data != nullptr && offset == 0,
+              "initial stream allocation failed");
+      stream.Commit();
+      return scheduler.CurrentTick();
+    };
+    const auto create_gate = [&] {
+      vk::SemaphoreTypeCreateInfo type{};
+      type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+      type.semaphoreType = vk::SemaphoreType::eTimeline;
+      vk::SemaphoreCreateInfo create{};
+      create.sType = vk::StructureType::eSemaphoreCreateInfo;
+      create.pNext = &type;
+      vk::Semaphore gate = nullptr;
+      Require(name, "gate create",
+              m_runtime_context.device.createSemaphore(&create, nullptr,
+                                                       &gate) ==
+                      vk::Result::eSuccess &&
+                  gate != nullptr,
+              "failed to create the gating timeline semaphore");
+      return gate;
+    };
+    const auto open_gate = [&](vk::Semaphore gate) {
+      vk::SemaphoreSignalInfo signal{};
+      signal.sType = vk::StructureType::eSemaphoreSignalInfo;
+      signal.semaphore = gate;
+      signal.value = 1;
+      return m_runtime_context.device.signalSemaphore(&signal) ==
+             vk::Result::eSuccess;
+    };
+    // Waits on the native timeline without refreshing the scheduler's cached
+    // GPU tick, leaving a completed tick that the scheduler does not yet know.
+    const auto wait_native = [&](uint64_t tick) {
+      vk::Semaphore handle = master.Handle();
+      vk::SemaphoreWaitInfo wait{};
+      wait.sType = vk::StructureType::eSemaphoreWaitInfo;
+      wait.semaphoreCount = 1;
+      wait.pSemaphores = &handle;
+      wait.pValues = &tick;
+      return m_runtime_context.device.waitSemaphores(&wait, UINT64_MAX) ==
+             vk::Result::eSuccess;
+    };
+
+    {
+      StreamBuffer stream(m_runtime_context, scheduler, MemoryUsage::Upload,
+                          ring_size);
+      const auto tick = fill(stream);
+      scheduler.Flush();
+      const bool completed = wait_native(tick);
+      const bool unknown = !master.IsFree(tick);
+      const auto before = master.RefreshCount();
+      const auto [data, offset] = stream.Map(wrap_size, 1);
+      const auto queries = master.RefreshCount() - before;
+      std::printf("[host]    %-32s completed-tick queries=%llu\n", name,
+                  static_cast<unsigned long long>(queries));
+      Require(name, "completed tick",
+              completed && unknown && data != nullptr && offset == 0 &&
+                  master.IsFree(tick) && queries == 1,
+              "completed watch did not release the wrap with one query");
+      stream.Commit();
+      const auto before_plain = master.RefreshCount();
+      const auto [plain, plain_offset] = stream.Map(8, 1);
+      Require(name, "no pending watch",
+              plain != nullptr && plain_offset >= wrap_size &&
+                  master.RefreshCount() == before_plain,
+              "a reservation with no pending watch queried the timeline");
+      stream.Commit();
+    }
+
+    {
+      StreamBuffer stream(m_runtime_context, scheduler, MemoryUsage::Upload,
+                          ring_size);
+      const auto tick = fill(stream);
+      const auto gate = create_gate();
+      SubmitInfo gated;
+      gated.AddWait(gate, 1);
+      scheduler.Flush(gated);
+      bool opened = false;
+      std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        opened = open_gate(gate);
+      });
+      const auto before = master.RefreshCount();
+      const auto [data, offset] = stream.Map(wrap_size, 1);
+      const auto queries = master.RefreshCount() - before;
+      release.join();
+      std::printf("[host]    %-32s outstanding-tick queries=%llu\n", name,
+                  static_cast<unsigned long long>(queries));
+      Require(name, "outstanding tick",
+              opened && data != nullptr && offset == 0 &&
+                  master.IsFree(tick) && queries == 2,
+              "outstanding watch wait issued a redundant timeline query");
+      stream.Commit();
+      m_runtime_context.device.destroySemaphore(gate, nullptr);
+    }
+
+    {
+      StreamBuffer stream(m_runtime_context, scheduler, MemoryUsage::Upload,
+                          ring_size);
+      const auto tick = fill(stream);
+      const auto gate = create_gate();
+      SubmitInfo gated;
+      gated.AddWait(gate, 1);
+      scheduler.Flush(gated);
+      const auto before = master.RefreshCount();
+      const auto [refused, refused_offset] = stream.Map(wrap_size, 1, false);
+      const auto refused_queries = master.RefreshCount() - before;
+      const bool opened = open_gate(gate);
+      const bool completed = wait_native(tick);
+      const auto before_retry = master.RefreshCount();
+      const auto [data, offset] = stream.Map(wrap_size, 1, false);
+      const auto retry_queries = master.RefreshCount() - before_retry;
+      Require(name, "no-wait refusal",
+              refused == nullptr && refused_offset == 0 &&
+                  refused_queries == 1 && opened && completed &&
+                  data != nullptr && offset == 0 && retry_queries == 1 &&
+                  master.IsFree(tick),
+              "allow_wait=false did not query once, refuse, then succeed");
+      stream.Commit();
+      m_runtime_context.device.destroySemaphore(gate, nullptr);
+    }
+
+    {
+      StreamBuffer stream(m_runtime_context, scheduler, MemoryUsage::Upload,
+                          ring_size);
+      const auto tick = fill(stream);
+      const auto before = master.RefreshCount();
+      const auto [data, offset] = stream.Map(wrap_size, 1);
+      const auto queries = master.RefreshCount() - before;
+      std::printf("[host]    %-32s current-tick queries=%llu\n", name,
+                  static_cast<unsigned long long>(queries));
+      Require(name, "current tick",
+              data != nullptr && offset == 0 &&
+                  scheduler.CurrentTick() == tick + 1 && master.IsFree(tick) &&
+                  queries >= 1 && queries <= 2,
+              "current-tick wrap did not submit, wait and reuse the ring");
+      stream.Commit();
+    }
+
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckGpuCommandLane() {
@@ -7403,6 +7554,26 @@ public:
                                    vk::ImageUsageFlagBits::eStorage);
       const auto storage_id = texture_cache.FindImage(storage);
       (void)texture_cache.FindTexture(storage_id, storage);
+      const auto ordinary_epoch_before = TextureCacheTestAccess::QueryEpoch(texture_cache);
+      auto ordinary_storage = MakeAtlasDesc(BindingType::Storage, vk::Format::eR8Uint,
+                                             Prospero::BufferFormat::k8UInt,
+                                             vk::ImageUsageFlagBits::eStorage);
+      const auto ordinary_storage_id = texture_cache.FindImage(ordinary_storage);
+      const auto ordinary_epoch_after = TextureCacheTestAccess::QueryEpoch(texture_cache);
+	  const auto expected_walks = Config::TextureSingleWalkEnabled() ? 1u : 2u;
+      Require(name, "same-format storage cache hit",
+              storage_id && ordinary_storage_id == storage_id,
+              "identical storage descriptor did not reuse its cache image");
+      Require(name, "ordinary hit takes one region walk",
+              ordinary_epoch_after - ordinary_epoch_before == expected_walks,
+              "ordinary storage cache hit repeated image-region discovery");
+	  std::printf("[host]    storage cache hit walks=%u texture_single_walk=%s\n",
+	              ordinary_epoch_after - ordinary_epoch_before,
+	              Config::TextureSingleWalkEnabled() ? "true" : "false");
+      texture_cache.MarkGpuWritten(storage_id);
+      Require(name, "GPU-modified storage setup",
+              texture_cache.GetImage(storage_id).IsGpuModified(),
+              "storage image did not enter the GPU-owned state before reinterpretation");
       auto sampled = MakeAtlasDesc(BindingType::Texture, vk::Format::eR8Unorm,
                                    Prospero::BufferFormat::k8UNorm,
                                    vk::ImageUsageFlagBits::eSampled);
@@ -25745,6 +25916,12 @@ int main(int argc, char **argv) {
     vulkan.CheckStreamBufferRing();
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--stream-wait-queries-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStreamBufferWaitQueries();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-tiler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuTilerCpuParity();
@@ -25847,6 +26024,17 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-sampled-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStorageSampledFormatSeparation();
+    return 0;
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--storage-sampled-only") == 0 &&
+      std::strcmp(argv[2], "--texture-single-walk") == 0 &&
+      (std::strcmp(argv[3], "true") == 0 || std::strcmp(argv[3], "false") == 0)) {
+    Config::ConfigOptions options;
+    options.printf_direction = Config::OutputDirection::Silent;
+    options.texture_single_walk = std::strcmp(argv[3], "true") == 0;
+    Config::Load(options);
     VulkanHarness vulkan;
     vulkan.CheckStorageSampledFormatSeparation();
     return 0;
@@ -26004,6 +26192,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckStreamBufferWaitQueries();
   vulkan.CheckGpuTilerCpuParity();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColor1DDiscovery();

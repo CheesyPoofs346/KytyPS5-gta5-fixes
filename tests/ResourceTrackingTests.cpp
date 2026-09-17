@@ -7,14 +7,45 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// Test-only allocation counting. This focused executable replaces the global allocation
+// functions so validator allocations can be counted without any production hook. Counting is
+// off unless a test enables it around a single call.
+namespace {
+std::atomic<bool> g_count_allocations{false};
+std::atomic<uint64_t> g_allocations{0};
+} // namespace
+
+void *operator new(std::size_t size) {
+  if (g_count_allocations.load(std::memory_order_relaxed)) {
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+  }
+  if (void *pointer = std::malloc(size == 0 ? 1 : size)) {
+    return pointer;
+  }
+  throw std::bad_alloc();
+}
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void *pointer) noexcept { std::free(pointer); }
+void operator delete[](void *pointer) noexcept { std::free(pointer); }
+void operator delete(void *pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete[](void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
 
 namespace {
 
@@ -1357,16 +1388,251 @@ void TestMalformedMemoryKindsRejected() {
   }
 }
 
+// Builds the unspecialized indirect-image fixture and materializes one snapshot carrying a single
+// indirect table, using the same memory layout as TestInvariantIndirectImageMaterialization.
+std::unique_ptr<Fixture>
+MakeIndirectValidationInputs(ResourceSnapshot &non_empty) {
+  auto fixture = MakeIndirectImageFixture(false);
+  fixture->PlanAndTrack();
+  EliminateDeadCode(fixture->program.blocks);
+  std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
+                                    16u << 16u, 4u,          0u, 7u};
+  LinearTestMemory memory;
+  std::array<uint32_t, 8> image_descriptor{};
+  image_descriptor[0] = 0x20u;
+  image_descriptor[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  image_descriptor[2] = 3u | (3u << 14u);
+  image_descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x2020u - memory.base) / 4u] ^= 1u;
+  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  std::string error;
+  Check(MaterializeResources(fixture->program, runtime, non_empty, &error) &&
+            non_empty.indirect_images.size() == 1 &&
+            non_empty.indirect_images[0].descriptors.size() == 2,
+        "indirect validation fixture did not materialize one indirect table");
+  return fixture;
+}
+
+struct ValidationCaseResult {
+  bool ok = false;
+  std::string error;
+  uint64_t allocations = 0;
+};
+
+// Runs ValidateResourceSnapshot once with allocation counting enabled around the call only. The
+// error string is reserved first so assigning a failure message is not counted.
+ValidationCaseResult RunValidationCase(const Program &program,
+                                       const ResourceSnapshot &snapshot) {
+  std::string error;
+  error.reserve(256);
+  g_allocations.store(0, std::memory_order_relaxed);
+  g_count_allocations.store(true, std::memory_order_relaxed);
+  const bool ok = ValidateResourceSnapshot(program, snapshot, &error);
+  g_count_allocations.store(false, std::memory_order_relaxed);
+  ValidationCaseResult result;
+  result.ok = ok;
+  result.error = ok ? std::string() : error;
+  result.allocations = g_allocations.load(std::memory_order_relaxed);
+  return result;
+}
+
+void TestValidateIndirectImageCases() {
+  ResourceSnapshot non_empty;
+  auto fixture = MakeIndirectValidationInputs(non_empty);
+  const auto &program = fixture->program;
+
+  ResourceSnapshot specialized;
+  auto specialized_fixture = MakeIndirectValidationInputs(specialized);
+  std::string error;
+  Check(SpecializeResources(specialized_fixture->program, specialized,
+                            &error) &&
+            specialized.indirect_images.empty(),
+        "indirect validation fixture did not specialize");
+
+  auto empty = non_empty;
+  empty.indirect_images.clear();
+  auto duplicate = non_empty;
+  duplicate.indirect_images.push_back(duplicate.indirect_images[0]);
+  auto invalid_resource = non_empty;
+  invalid_resource.indirect_images[0].resource =
+      static_cast<uint32_t>(program.info.images.size());
+  auto invalid_candidate = non_empty;
+  invalid_candidate.indirect_images[0].candidates[0] = static_cast<uint32_t>(
+      invalid_candidate.indirect_images[0].descriptors.size());
+
+  struct NamedCase {
+    const char *name;
+    const Program *program;
+    const ResourceSnapshot *snapshot;
+    bool expect_ok;
+    const char *expect_error;
+    bool empty_path;
+  };
+  const NamedCase cases[] = {
+      {"empty-cleared", &program, &empty, true, "", true},
+      {"empty-specialized", &specialized_fixture->program, &specialized, true,
+       "", true},
+      {"valid-non-empty", &program, &non_empty, true, "", false},
+      {"duplicate-resource", &program, &duplicate, false,
+       "indirect image snapshot does not match the shader plan", false},
+      {"invalid-resource-index", &program, &invalid_resource, false,
+       "indirect image snapshot does not match the shader plan", false},
+      {"invalid-candidate-index", &program, &invalid_candidate, false,
+       "indirect image snapshot has an invalid candidate", false},
+  };
+
+  std::string outcome_failures;
+  std::string allocation_failures;
+  for (const auto &test_case : cases) {
+    const auto result = RunValidationCase(*test_case.program, *test_case.snapshot);
+    std::printf("validator-case name=%s ok=%d allocations=%llu error=\"%s\"\n",
+                test_case.name, result.ok ? 1 : 0,
+                static_cast<unsigned long long>(result.allocations),
+                result.error.c_str());
+    if (result.ok != test_case.expect_ok ||
+        result.error != test_case.expect_error) {
+      outcome_failures += std::string(" ") + test_case.name;
+    }
+    if (test_case.empty_path && result.allocations != 0) {
+      allocation_failures += std::string(" ") + test_case.name;
+    }
+  }
+  std::fflush(stdout);
+  Check(outcome_failures.empty(),
+        ("validation outcome changed:" + outcome_failures).c_str());
+  Check(allocation_failures.empty(),
+        ("empty indirect-image validation allocated:" + allocation_failures)
+            .c_str());
+}
+
+double Median(std::vector<double> values) {
+  std::sort(values.begin(), values.end());
+  return values.empty() ? 0.0 : values[values.size() / 2];
+}
+
+// Times the real validator on an empty and a non-empty indirect-image snapshot. Arms alternate
+// order each round; timed loops run with allocation counting off, and allocations are counted in
+// a separate untimed pass of the same length.
+int RunValidatorBenchmark(uint32_t rounds, uint32_t iterations) {
+  ResourceSnapshot non_empty;
+  auto fixture = MakeIndirectValidationInputs(non_empty);
+  auto empty = non_empty;
+  empty.indirect_images.clear();
+  std::string error;
+  error.reserve(256);
+
+  const auto timed = [&](const ResourceSnapshot &snapshot) {
+    bool all_ok = true;
+    const auto start = std::chrono::steady_clock::now();
+    for (uint32_t i = 0; i < iterations; i++) {
+      all_ok &= ValidateResourceSnapshot(fixture->program, snapshot, &error);
+    }
+    const auto end = std::chrono::steady_clock::now();
+    Check(all_ok, "benchmark input failed validation");
+    return static_cast<double>(
+               std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)
+                   .count()) /
+           iterations;
+  };
+  const auto counted = [&](const ResourceSnapshot &snapshot) {
+    g_allocations.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_relaxed);
+    for (uint32_t i = 0; i < iterations; i++) {
+      (void)ValidateResourceSnapshot(fixture->program, snapshot, &error);
+    }
+    g_count_allocations.store(false, std::memory_order_relaxed);
+    return static_cast<double>(g_allocations.load(std::memory_order_relaxed)) /
+           iterations;
+  };
+
+  (void)timed(empty);
+  (void)timed(non_empty);
+  std::vector<double> empty_ns;
+  std::vector<double> non_empty_ns;
+  for (uint32_t round = 0; round < rounds; round++) {
+    if (round % 2 == 0) {
+      empty_ns.push_back(timed(empty));
+      non_empty_ns.push_back(timed(non_empty));
+    } else {
+      non_empty_ns.push_back(timed(non_empty));
+      empty_ns.push_back(timed(empty));
+    }
+    std::printf("validator-bench round=%u empty_ns=%.2f non_empty_ns=%.2f\n",
+                round, empty_ns.back(), non_empty_ns.back());
+  }
+  const double empty_allocs = counted(empty);
+  const double non_empty_allocs = counted(non_empty);
+  std::printf("validator-bench summary iterations=%u rounds=%u "
+              "empty_median_ns=%.2f empty_min_ns=%.2f empty_allocs_per_call=%.3f "
+              "non_empty_median_ns=%.2f non_empty_min_ns=%.2f "
+              "non_empty_allocs_per_call=%.3f\n",
+              iterations, rounds, Median(empty_ns),
+              *std::min_element(empty_ns.begin(), empty_ns.end()),
+              empty_allocs, Median(non_empty_ns),
+              *std::min_element(non_empty_ns.begin(), non_empty_ns.end()),
+              non_empty_allocs);
+  return 0;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc == 4 && std::strcmp(argv[1], "--validator-bench") == 0) {
+    try {
+      return RunValidatorBenchmark(
+          static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10)),
+          static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10)));
+    } catch (const std::exception &exception) {
+      std::cerr << "validator benchmark failed: " << exception.what() << '\n';
+      return 1;
+    }
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--validator-cases-only") == 0) {
+    try {
+      TestValidateIndirectImageCases();
+    } catch (const std::exception &exception) {
+      std::cerr << "validator cases failed: " << exception.what() << '\n';
+      return 1;
+    }
+    std::cout << "validator cases passed\n";
+    return 0;
+  }
+  // --all-results runs every registered test even after a failure and prints one line per test,
+  // so outcomes can be compared across builds when an unrelated test already fails.
+  const bool all_results =
+      argc == 2 && std::strcmp(argv[1], "--all-results") == 0;
+  int failures = 0;
   try {
-    const auto Run = [](const char *name, auto test) {
+    const auto Run = [all_results, &failures](const char *name, auto test) {
       try {
         test();
+        if (all_results) {
+          std::printf("test-result name=\"%s\" result=pass\n", name);
+        }
       } catch (const std::exception &exception) {
-        throw std::runtime_error(std::string(name) + ": " + exception.what());
+        if (!all_results) {
+          throw std::runtime_error(std::string(name) + ": " + exception.what());
+        }
+        failures++;
+        std::printf("test-result name=\"%s\" result=fail message=\"%s\"\n", name,
+                    exception.what());
       }
+      std::fflush(stdout);
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
@@ -1387,8 +1653,13 @@ int main() {
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("validator indirect cases", TestValidateIndirectImageCases);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
+    return 1;
+  }
+  if (failures != 0) {
+    std::cout << "resource tracking tests failed: " << failures << '\n';
     return 1;
   }
   std::cout << "resource tracking tests passed\n";

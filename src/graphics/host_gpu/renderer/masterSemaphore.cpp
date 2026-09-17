@@ -27,6 +27,9 @@ MasterSemaphore::~MasterSemaphore() {
 
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
+#ifdef KYTY_MASTER_SEMAPHORE_REFRESH_COUNT
+	m_refresh_count.fetch_add(1, std::memory_order_relaxed);
+#endif
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
