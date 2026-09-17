@@ -390,7 +390,7 @@ first 2 frames after each toggle** (cold caches, and the print itself costs a fr
 
 ## 11. Memory notes worth reading
 
-In `C:\Users\konze\.claude\projects\C--Users-konze-KytyPS5-brandostrong\memory\`:
+In the local memory notes directory:
 
 - `gta5-gpu-driven-draws` — the structural finding (section 3 here)
 - `gta5-occlusion-queries-broken` — the fix and the remaining 99.6%-zero mystery

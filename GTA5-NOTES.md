@@ -60,4 +60,4 @@ Driving is R2/L2 (left/right mouse) — W and S only steer, they do not accelera
   direct memory the first one holds. Check for a live instance before blaming a crash.
 - Exit code 65 usually means a guest fault, not a clean exit. Read the log.
 - `LOGF` is silenced by default, so diagnostics must use `::printf` or be folded into `EXIT`.
-- Save backups live in `C:\Users\konze\KytyPS5-SaveBackups\`.
+- Save backups are kept outside the repository.
