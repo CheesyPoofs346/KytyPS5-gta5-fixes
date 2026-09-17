@@ -113,6 +113,14 @@ int KYTY_SYSV_ABI     PthreadGetaffinity(Pthread thread, KernelCpumask* mask);
 int                   PthreadGetUniqueId(Pthread thread);
 uint64_t              PthreadGetHostThreadId(Pthread thread);
 void                  PthreadWakeForSignal(Pthread thread);
+#if defined(KYTY_PTHREAD_COND_WAKE_COUNT)
+struct PthreadCondWakeCounts {
+	uint64_t wait_returns       = 0;
+	uint64_t notified_not_ready = 0;
+};
+// Test builds only: returns and resets condition-wait wake counters.
+PthreadCondWakeCounts PthreadCondTakeWakeCounts();
+#endif
 void                  PthreadQueuePendingSignal(Pthread thread, int signum);
 bool                  PthreadHasPendingSignal(Pthread thread, int signum);
 bool                  PthreadTakePendingSignal(Pthread thread, int signum);

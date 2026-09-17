@@ -387,12 +387,21 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+add_kyty_full_emulator_test(buffer_cache_device_harness "${KYTY_TESTS_DIR}/BufferCacheDeviceHarness.cpp")
+target_compile_definitions(buffer_cache_device_harness PRIVATE KYTY_BUFFER_CACHE_DEVICE_HARNESS=1)
+
+add_executable(stream_read_census_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/StreamReadCensusTests.cpp")
+target_include_directories(stream_read_census_tests PRIVATE ${inc_headers})
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	# SrtWalker.cpp calls Config accessors, so these lean targets need the config unit; without
+	# it they fail to link (pre-existing: Config::CacheDescriptors was already undefined here).
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 )
 target_link_libraries(scalar_provenance_tests fmt::fmt)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
@@ -438,6 +447,9 @@ add_executable(shader_stage_runtime_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderStageRuntime.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	# SrtWalker.cpp calls Config accessors, so these lean targets need the config unit; without
+	# it they fail to link (pre-existing: Config::CacheDescriptors was already undefined here).
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 )
 target_link_libraries(shader_stage_runtime_tests fmt::fmt)
 target_include_directories(shader_stage_runtime_tests PRIVATE ${inc_headers})
@@ -448,6 +460,9 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/shaderPixelParameter.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
+	# SrtWalker.cpp calls Config accessors, so these lean targets need the config unit; without
+	# it they fail to link (pre-existing: Config::CacheDescriptors was already undefined here).
+	"${KYTY_SOURCE_DIR}/common/emulatorConfig.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
@@ -514,8 +529,21 @@ target_sources(shader_recompiler_compute_tests PRIVATE
 add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/VirtualMemoryAllocationTests.cpp")
 add_kyty_full_emulator_test(draw_phase_self_time_tests "${KYTY_TESTS_DIR}/DrawPhaseSelfTimeTests.cpp")
 add_kyty_full_emulator_test(binding_storage_pool_tests "${KYTY_TESTS_DIR}/BindingStoragePoolTests.cpp")
+add_kyty_full_emulator_test(compiled_srt_differential_tests "${KYTY_TESTS_DIR}/CompiledSrtDifferentialTests.cpp")
+add_kyty_full_emulator_test(compiled_srt_correctness_tests "${KYTY_TESTS_DIR}/CompiledSrtCorrectnessTests.cpp")
+add_kyty_full_emulator_test(dma_census_tests "${KYTY_TESTS_DIR}/DmaCensusTests.cpp")
+add_kyty_full_emulator_test(worker_dispatch_benchmark "${KYTY_TESTS_DIR}/WorkerDispatchBenchmark.cpp")
+add_kyty_full_emulator_test(texture_decode_cache_tests "${KYTY_TESTS_DIR}/TextureDecodeCacheTests.cpp")
+add_kyty_full_emulator_test(snapshot_allocation_benchmark "${KYTY_TESTS_DIR}/SnapshotAllocationBenchmark.cpp")
+add_kyty_full_emulator_test(compiled_srt_benchmark "${KYTY_TESTS_DIR}/CompiledSrtBenchmark.cpp")
 add_kyty_full_emulator_test(agc_trace_cost_tests "${KYTY_TESTS_DIR}/AgcTraceCostTests.cpp")
 add_kyty_full_emulator_test(backing_transfer_fast_path_tests "${KYTY_TESTS_DIR}/BackingTransferFastPathTests.cpp")
+add_kyty_full_emulator_test(blocked_queue_wait_tests "${KYTY_TESTS_DIR}/BlockedQueueWaitTests.cpp")
+add_kyty_full_emulator_test(buffer_census_tests "${KYTY_TESTS_DIR}/BufferCensusTests.cpp")
+add_kyty_full_emulator_test(buffer_growth_tests "${KYTY_TESTS_DIR}/BufferGrowthTests.cpp")
+add_kyty_full_emulator_test(stale_binding_tests "${KYTY_TESTS_DIR}/StaleBindingTests.cpp")
+add_kyty_full_emulator_test(pthread_cond_wake_tests "${KYTY_TESTS_DIR}/PthreadCondWakeTests.cpp")
+target_compile_definitions(pthread_cond_wake_tests PRIVATE KYTY_PTHREAD_COND_WAKE_COUNT=1)
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 

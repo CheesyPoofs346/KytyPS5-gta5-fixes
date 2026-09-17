@@ -784,7 +784,14 @@ private:
 } // namespace
 
 bool TrackResources(Program& program, std::string* error) {
-	return Tracker(program).Run(error);
+	if (!Tracker(program).Run(error)) {
+		return false;
+	}
+	// Tracking is what fills descriptor_sources/srt_reads, so the compiled evaluator's slot
+	// numbering has to happen here rather than at the end of BuildSrtPlan. Additive only:
+	// it cannot fail the pass.
+	NumberEvalSlots(program);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

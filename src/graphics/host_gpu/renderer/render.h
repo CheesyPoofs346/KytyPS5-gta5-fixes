@@ -215,6 +215,12 @@ public:
 	    const PreparedShaders::PreResolvedImages* pre = nullptr);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
+	// Runs after every range-changing step of the draw and republishes each cache-backed
+	// binding from its guest range, then uploads user_data from that settled state.
+	void                           PublishBuffers(PreparedBindings& bindings);
+	// Rebind and publish every stage of a draw or dispatch: three passes over the whole span,
+	// never stage-at-a-time. Both the graphics and compute paths go through this.
+	void                           FinalizeBindings(std::span<PreparedBindings* const> stages);
 	void                           RebindImages(PreparedBindings& bindings);
 	// record_target null means record binds into buffer itself; a non-null target sends them to a
 	// secondary while barriers still go to the primary.
