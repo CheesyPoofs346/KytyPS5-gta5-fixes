@@ -2687,7 +2687,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			    g_batch_boundary.load(std::memory_order_relaxed));
 		}
 		DrawPhaseTimer emit_timer(DrawPhase::Emit);
+		// --gpu-timestamps (diagnostic, default off): bracket exactly this draw command in the primary
+		// buffer. gpuTimestamps.h documents what the interval includes. The draw is always emitted.
+		auto&                gpu_timestamps = m_context.GetGpuTimestamps();
+		GpuTimestamps::Token gpu_ts_token;
+		if (gpu_timestamps.Active()) {
+			const auto& ts_ps_regs = buffer.GetShaders().GetPs().ps_regs;
+			if (gpu_timestamps.Selects(ts_ps_regs.chksum)) {
+				if (secondary || CurrentDrawWorker() != 0) {
+					gpu_timestamps.NoteSkippedSecondary();
+				} else {
+					GpuTimestampIdentity identity;
+					identity.ps_chksum  = ts_ps_regs.chksum;
+					identity.vs_chksum  = buffer.GetShaders().GetVs().gs_regs.chksum;
+					identity.ps_program = state.pixel_program.id;
+					identity.vs_program = state.vertex_program.id;
+					gpu_ts_token        = gpu_timestamps.Begin(record, identity);
+				}
+			}
+		}
 		EmitDrawPrimitives(ucfg, record, state.vs_input_info, draw, emit);
+		gpu_timestamps.End(record, gpu_ts_token);
 	}
 
 	// Runs to the end of the function: barrier derivation and the trailing debug phases.

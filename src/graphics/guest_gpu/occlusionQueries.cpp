@@ -175,7 +175,13 @@ bool OcclusionQueries::Dump(uint64_t event_address) {
 	m_scheduler->DeferOperation([self, graphics, pool, segments, lost, event_address] {
 		// Fall back to "visible" rather than "occluded": dropping geometry the guest would have
 		// drawn is far more damaging than drawing something it would have culled.
-		constexpr uint64_t AssumeVisible = 0x00100000ull;
+		// Must EXCEED the largest coverage any object can have, or the guest compares this
+		// against a bigger expected screen area, concludes the object is mostly occluded and
+		// culls it. A full 2560x1440 frame is ~3.7M samples; 0x00100000 is 1.05M, i.e. ~28% of
+		// one frame, so this fallback was itself reading as "mostly occluded" for anything
+		// large. Matched to the synthetic path in graphicsRun.cpp, which documents the same
+		// requirement and uses 0x00800000.
+		constexpr uint64_t AssumeVisible = 0x00800000ull;
 		uint64_t           samples       = 0;
 		bool               ok            = !lost;
 		if (ok) {

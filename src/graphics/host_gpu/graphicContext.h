@@ -41,6 +41,9 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	// Set at device creation for the --gpu-timestamps diagnostic.
+	bool                               host_query_reset_enabled = false;
+	uint32_t                           timestamp_valid_bits     = 0;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

@@ -28,6 +28,17 @@ class TextureCache;
 using BufferId = Common::SlotId;
 inline constexpr BufferId NULL_BUFFER_ID {0};
 
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+// Test-build accounting for the actual ObtainBuffer path. This is deliberately not compiled into
+// the emulator: it exists to compare threshold arms without inferring bytes from elapsed timers.
+struct StreamRepeatTestStats {
+	uint64_t stream_bytes              = 0;
+	uint64_t persistent_allocations   = 0;
+	uint64_t persistent_sync_calls    = 0;
+	uint64_t persistent_upload_bytes  = 0;
+};
+#endif
+
 class BufferCache {
 public:
 	static constexpr uint32_t CACHING_PAGEBITS  = 14;
@@ -49,6 +60,18 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
+	// Bumped every time CreateBuffer replaces a range. A caller that captured buffer handles,
+	// offsets or device addresses can compare this across its resolution loop and refresh what it
+	// captured: retirement is deferred so the old handle stays USABLE, but it stops being CURRENT.
+	[[nodiscard]] uint64_t ReplacementGeneration() const noexcept { return m_replacements; }
+
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+	void ResetStreamRepeatTestStats() noexcept;
+	[[nodiscard]] StreamRepeatTestStats GetStreamRepeatTestStats() const noexcept {
+		return m_stream_repeat_test_stats;
+	}
+#endif
+
 	// Ownership rule for parallel resolve: while a batch is open, no Buffer is destroyed.
 	//
 	// CreateBuffer merges overlapping ranges and deletes what it subsumes, and GC deletes by age.
@@ -113,9 +136,43 @@ public:
 		}
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
+	// True when `buffer` is one of the utility rings rather than a cached, guest-range-owned
+	// buffer. ObtainBuffer's stream fast path (!is_written && size <= CACHING_PAGESIZE) returns a
+	// THROWAWAY RING allocation holding a private copy of the guest bytes. Such a binding is not
+	// owned by any guest range, must never be re-resolved by address, and keeps its allocation,
+	// offset and lifetime verbatim.
+	[[nodiscard]] bool IsStreamAllocation(const Buffer* buffer) const noexcept {
+		if (buffer == nullptr) {
+			return false;
+		}
+		if (buffer == &m_stream_buffer) {
+			return true;
+		}
+		for (const auto& ring: m_worker_stream_buffers) {
+			if (buffer == ring.get()) {
+				return true;
+			}
+		}
+		return false;
+	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
+	// Publication step for draw bindings.
+	//
+	// A binding captured during preparation records a VkBuffer handle, an offset and a device
+	// address. A later range-changing operation in the same draw can retire that buffer: the
+	// handle stays usable, because retirement is deferred past GPU completion, but it stops being
+	// current. Identity therefore has to be the GUEST RANGE - a BufferId is exactly what
+	// retirement invalidates.
+	//
+	// This resolves the range's CURRENT owner and does nothing else: no allocation, no join, no
+	// synchronize, no upload, no dirty-state change, no LRU touch. Those effects belong to
+	// ObtainBuffer and must not be repeated here. Returns {nullptr, 0} when the range has no
+	// in-bounds owner, which the caller must treat as a failure rather than silently creating one
+	// - creating at publication time would itself be a range-changing operation.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> FindPublishedOwner(uint64_t vaddr, uint64_t size);
+
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
@@ -170,6 +227,7 @@ private:
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	std::map<uint64_t, BufferId>                      m_buffers;
 	PageTable                                         m_page_table;
+	uint64_t                                          m_replacements = 0;
 	RangeSet                                          m_gpu_modified_ranges;
 	std::vector<BufferId>                             m_hot_written;
 	MemoryTracker                                     m_memory_tracker;
@@ -192,6 +250,10 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+#ifdef KYTY_BUFFER_CACHE_DEVICE_HARNESS
+	StreamRepeatTestStats m_stream_repeat_test_stats {};
+	bool                  m_stream_repeat_test_fallback = false;
+#endif
 };
 
 } // namespace Libs::Graphics

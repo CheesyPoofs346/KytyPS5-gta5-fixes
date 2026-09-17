@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/gpuTimestamps.h"
 #include "graphics/host_gpu/renderer/hdrProbe.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
@@ -73,6 +74,7 @@ public:
 	TextureCache&       GetTextureCache() { return m_gpu_resources.GetTextureCache(); }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 	HdrProbe&           GetHdrProbe() { return m_hdr_probe; }
+	GpuTimestamps&      GetGpuTimestamps() { return m_gpu_timestamps; }
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
 	void DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);
@@ -95,6 +97,7 @@ private:
 	SamplerCache              m_sampler_cache;
 	GpuResourceManager        m_gpu_resources;
 	HdrProbe                  m_hdr_probe;
+	GpuTimestamps             m_gpu_timestamps;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 

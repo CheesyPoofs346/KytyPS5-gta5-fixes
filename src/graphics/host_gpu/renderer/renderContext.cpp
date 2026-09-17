@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -17,11 +18,15 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_gpu_resources(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_hdr_probe.Initialize(graphics, m_command_scheduler);
+	m_gpu_timestamps.Initialize(graphics, m_command_scheduler, Config::GpuTimestampsEnabled());
+	m_gpu_timestamps.SetSelection(Config::GpuTimestampsPsChksums());
 }
 
 RenderContext::~RenderContext() {
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
+	// After the drain above has run every deferred timestamp read.
+	m_gpu_timestamps.Shutdown();
 }
 
 void RenderContext::InitializeGpu(VideoOut::VideoOutDriver* video_out) {
