@@ -97,6 +97,9 @@ struct ConfigOptions {
 	// through to the persistent FindBuffer/SynchronizeBuffer path, which uploads only
 	// dirty sub-ranges and clears them. 0 disables (original behaviour).
 	uint32_t               stream_repeat_threshold       = 0;
+	// Diagnostic only: census stream-read eligibility and same-address/same-size repeats. It does
+	// not alter stream selection or reuse the threshold tracker's state.
+	bool                   stream_read_census            = false;
 	// Frames excluded from the measured route so cold streaming is not counted as steady
 	// state. Samples are still recorded and marked "warmup" in frametimes.csv.
 	uint32_t               warmup_frames                 = 0;
@@ -106,6 +109,7 @@ struct ConfigOptions {
 	// lies in one backing range - which FindContainingUnlocked already tests - one lookup
 	// suffices. Spanning requests keep the two-pass path and its no-partial-copy semantics.
 	bool                   backing_fast_path             = false;
+	bool                   texture_single_walk           = false;
 	// DIAGNOSTIC ONLY. Samples lock acquisition wait against lock hold time on a subset of
 	// acquisitions. Never enable during a performance capture: it times the thing being
 	// measured, on the hottest lock in the process.
@@ -119,10 +123,34 @@ struct ConfigOptions {
 	// Resolution only - BindImage mutates image.binding and m_bound_images and stays on the
 	// caller, as does every creation, barrier and recording.
 	bool                   worker_resolve_images         = false;
+	// Compiled SRT materialization: flat op list instead of the recursive interpreter.
+	// Default off; every failure path falls back to the interpreter.
+	bool                   compiled_srt                  = false;
+	// Diagnostic only: record guest DMA (PM4 IT_DMA_DATA) bytes and handler time per capture
+	// sample, as two extra CSV columns. Off by default; when off nothing is counted and the CSV
+	// schema is unchanged. Exists to test whether frame-time spikes are associated with DMA.
+	bool                   dma_census                    = false;
+	// Scheduler-local bounded polling for blocked queue fronts. 0 micros keeps the existing
+	// single timed wait exactly. Diagnostic/experimental; see blockedQueueWait.h.
+	uint32_t               blocked_poll_us               = 0;
+	uint32_t               blocked_poll_tries            = 0;
+	// Diagnostic: count buffer creations, overlap merges and bytes copied, to test whether the
+	// workload repeatedly recreates overlapping buffers. Off by default; prints nothing when off.
+	bool                   buffer_census                 = false;
+	bool                   image_census                  = false;
+	// Prototype port of upstream 74a78f3: over-allocate a buffer whose range keeps being joined,
+	// so later requests land in bounds instead of reallocating. Off by default.
+	bool                   buffer_growth                 = false;
 	uint32_t               eop_flush_interval            = 1;
 	uint32_t               pipeline_depth                = 4;
 	bool                   pipeline_memo               = true;
+	// Diagnostic, default off: name graphics pipelines with guest shader identity for GPU tools.
+	bool                   pipeline_names              = false;
 	bool                   buffer_dedup                = true;
+	// Correctness fix, ON by default: finalize buffer bindings after every range-changing
+	// operation in a draw, then publish handles, offsets, device addresses and user_data from
+	// that settled state. Switchable only so the regression can prove the defect with it off.
+	bool                   binding_publish             = false;
 	bool                   show_fps_overlay            = true;
 	bool                   fullscreen_enabled          = false;
 	uint32_t               vblank_frequency            = 60;
@@ -210,6 +238,10 @@ uint32_t GetScreenHeight();
 const std::string& GetUserName();
 int32_t  GetUserId();
 PresentMode GetPresentMode();
+bool     BindingPublishEnabled();
+// Test-only: the regression must be able to run the production publication path with the fix
+// off and see it produce a stale binding.
+void     SetBindingPublishForTest(bool enabled);
 bool     DccClearOnSample();
 bool     ParallelResolveEnabled();
 bool     CacheDescriptors();
@@ -230,17 +262,30 @@ bool     CoalesceEopFlushEnabled();
 bool     LightPartialFlushEnabled();
 uint32_t EopFlushInterval();
 uint32_t StreamRepeatThreshold();
+bool     StreamReadCensusEnabled();
 uint32_t WarmupFrames();
 bool BackingFastPath();
+bool TextureSingleWalkEnabled();
 bool BackingLockSample();
 bool BatchCensusEnabled();
 bool WorkerResolveImages();
+bool CompiledSrtEnabled();
+bool DmaCensusEnabled();
+uint32_t BlockedPollMicros();
+uint32_t BlockedPollTries();
+bool BufferCensusEnabled();
+bool ImageCensusEnabled();
+bool BufferGrowthEnabled();
+// Test-only: flip the compiled-SRT gate without reloading configuration. Process-wide, so a
+// test that toggles it from worker threads races every other thread.
+void SetCompiledSrtForTest(bool enabled);
 // Every performance-relevant setting actually in effect, not just CLI overrides.
 void LogEffectiveSettings();
 uint32_t PipelineDepth();
 void     SetHwCheck(bool enabled);
 void     SetCacheDescriptors(bool enabled);
 bool     PipelineMemoEnabled();
+bool     PipelineNamesEnabled();
 bool     BufferDedupEnabled();
 void     SetPerDrawFilters(bool dyn_state, bool pipeline, bool dedup);
 uint64_t FpsSampleCount();

@@ -124,6 +124,71 @@ void NormalizeStaticParamsForDynamicState(PipelineStaticParameters& static_param
 
 } // namespace
 
+static std::atomic<uint64_t> g_pipeline_name_mismatches {0};
+
+std::string FormatGraphicsPipelineName(const ShaderProgram& vertex_program,
+                                       const ShaderProgram* pixel_program) {
+	// "ps=0x1234abcd#0" is the declared checksum --skip-ps-chksum selects, plus the permutation
+	// (specialization) index. "code:" marks a program whose declared checksum was 0 and which is
+	// identified by a hash of its code instead; the skipper cannot select those.
+	const auto identity = [](const char* stage, const ShaderProgram& program) {
+		return program.guest_hash_declared
+		           ? fmt::format("{}=0x{:08x}#{}", stage, program.guest_hash, program.permutation)
+		           : fmt::format("{}=code:0x{:016x}#{}", stage, program.guest_hash,
+		                         program.permutation);
+	};
+	return fmt::format("Kyty.GfxPipeline[{} {} vs_prog=0x{:016x} ps_prog=0x{:016x}]",
+	                   pixel_program != nullptr ? identity("ps", *pixel_program) : std::string("ps=none"),
+	                   identity("vs", vertex_program), vertex_program.id,
+	                   pixel_program != nullptr ? pixel_program->id : uint64_t {0});
+}
+
+bool GraphicsPipelineIdentityMatches(const PipelineCache::GraphicsPipeline& pipeline,
+                                     const ShaderProgram&                   vertex_program,
+                                     const ShaderProgram*                   pixel_program) {
+	return pipeline.vs_guest_hash == vertex_program.guest_hash &&
+	       pipeline.vs_permutation == vertex_program.permutation &&
+	       pipeline.ps_guest_hash == (pixel_program != nullptr ? pixel_program->guest_hash : 0) &&
+	       pipeline.ps_permutation == (pixel_program != nullptr ? pixel_program->permutation : 0);
+}
+
+uint64_t GraphicsPipelineNameMismatches() {
+	return g_pipeline_name_mismatches.load(std::memory_order_relaxed);
+}
+
+// Reuse check for --pipeline-names. Pipelines are keyed by program ids, which mix the guest hash
+// with the permutation index, so a hit should always carry the identity the pipeline was named
+// with; a mismatch would mean an id collision and a misleading name. Counted, reported once.
+static void NotePipelineReuse(bool names_enabled, const PipelineCache::GraphicsPipeline& pipeline,
+                              const ShaderProgram& vertex_program,
+                              const ShaderProgram* pixel_program) {
+	if (!names_enabled || GraphicsPipelineIdentityMatches(pipeline, vertex_program, pixel_program)) {
+		return;
+	}
+	if (g_pipeline_name_mismatches.fetch_add(1, std::memory_order_relaxed) == 0) {
+		std::printf("PipelineNames: reused pipeline identity mismatch (named vs=0x%llx#%u ps=0x%llx#%u, "
+		            "requested %s); names may mislead\n",
+		            static_cast<unsigned long long>(pipeline.vs_guest_hash), pipeline.vs_permutation,
+		            static_cast<unsigned long long>(pipeline.ps_guest_hash), pipeline.ps_permutation,
+		            FormatGraphicsPipelineName(vertex_program, pixel_program).c_str());
+		std::fflush(stdout);
+	}
+}
+
+static void NameGraphicsPipeline(vk::Device device, vk::Pipeline pipeline, const std::string& name) {
+	if (device == nullptr || pipeline == nullptr ||
+	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
+		return;
+	}
+	vk::DebugUtilsObjectNameInfoEXT info {};
+	info.sType        = vk::StructureType::eDebugUtilsObjectNameInfoEXT;
+	info.objectType   = vk::Pipeline::objectType;
+	info.objectHandle = static_cast<uint64_t>(
+	    reinterpret_cast<uintptr_t>(static_cast<vk::Pipeline::CType>(pipeline)));
+	info.pObjectName  = name.c_str();
+	(void)device.setDebugUtilsObjectNameEXT(&info);
+}
+
 struct PipelineCache::ProgramCache {
 	struct SourceKey {
 		ShaderType stage = ShaderType::Unknown;
@@ -235,7 +300,11 @@ struct PipelineCache::ProgramCache {
 		if (id == 0) {
 			id = 1;
 		}
-		const ShaderProgram handle {.id = id, .module = module};
+		const ShaderProgram handle {.id                  = id,
+		                            .module              = module,
+		                            .guest_hash          = params.hash,
+		                            .permutation         = static_cast<uint32_t>(permutations.size()),
+		                            .guest_hash_declared = params.hash_declared};
 		permutations.push_back({key_scratch, input_info.stage.program, handle});
 
 		std::printf("Num compiled %u shaders\n", ++num_compiled);
@@ -697,8 +766,11 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 		static thread_local const PipelineCache* s_owner = nullptr;
 		static thread_local GraphicsPipelineKey  s_last_key {};
 		static thread_local GraphicsPipeline*    s_last_pipeline = nullptr;
-		const bool memo_enabled = Config::PipelineMemoEnabled();
+		const bool memo_enabled  = Config::PipelineMemoEnabled();
+		const bool names_enabled = Config::PipelineNamesEnabled();
 		if (memo_enabled && s_owner == this && s_last_pipeline != nullptr && s_last_key == key) {
+			NotePipelineReuse(names_enabled, *s_last_pipeline, vertex_program,
+			                  ps_active ? &pixel_program : nullptr);
 			return *s_last_pipeline;
 		}
 		if (auto iter = m_graphics_pipelines.find(key); iter != m_graphics_pipelines.end()) {
@@ -707,6 +779,8 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 				s_last_key      = key;
 				s_last_pipeline = iter->second.get();
 			}
+			NotePipelineReuse(names_enabled, *iter->second, vertex_program,
+			                  ps_active ? &pixel_program : nullptr);
 			return *iter->second;
 		}
 	}
@@ -730,6 +804,18 @@ PipelineCache::GraphicsPipeline& PipelineCache::CreateGraphicsPipeline(
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+
+	// Identity is stored on every pipeline so the reuse check has something to compare; the object
+	// name itself is set only with --pipeline-names, once, here at creation.
+	const auto* ps_program  = ps_active ? &pixel_program : nullptr;
+	cached->vs_guest_hash  = vertex_program.guest_hash;
+	cached->vs_permutation = vertex_program.permutation;
+	cached->ps_guest_hash  = ps_program != nullptr ? ps_program->guest_hash : 0;
+	cached->ps_permutation = ps_program != nullptr ? ps_program->permutation : 0;
+	if (Config::PipelineNamesEnabled()) {
+		NameGraphicsPipeline(m_graphics.device, cached->pipeline,
+		                     FormatGraphicsPipelineName(vertex_program, ps_program));
+	}
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);

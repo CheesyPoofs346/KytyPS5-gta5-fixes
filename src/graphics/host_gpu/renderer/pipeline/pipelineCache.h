@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 
@@ -100,6 +101,11 @@ struct PipelineRenderingState {
 struct ShaderProgram {
 	uint64_t         id     = 0;
 	vk::ShaderModule module = nullptr;
+	// Guest identity recorded when the program is compiled. Used only for optional diagnostic
+	// object names (--pipeline-names); never part of a cache key.
+	uint64_t         guest_hash          = 0;
+	uint32_t         permutation         = 0;
+	bool             guest_hash_declared = false;
 
 	explicit operator bool() const {
 		return id != 0 && module != nullptr;
@@ -123,6 +129,12 @@ public:
 	struct GraphicsPipeline: Pipeline {
 		uint64_t vs_shader_id = 0;
 		uint64_t ps_shader_id = 0;
+		// Guest identity the pipeline was created for. Compared on reuse when --pipeline-names is on,
+		// so a shared pipeline can never carry a misleading name unnoticed.
+		uint64_t vs_guest_hash  = 0;
+		uint64_t ps_guest_hash  = 0;
+		uint32_t vs_permutation = 0;
+		uint32_t ps_permutation = 0;
 	};
 
 	struct ComputePipeline: Pipeline {
@@ -269,6 +281,13 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// Diagnostic graphics-pipeline names (--pipeline-names). Pure; exposed for tests.
+[[nodiscard]] std::string FormatGraphicsPipelineName(const ShaderProgram& vertex_program,
+                                                     const ShaderProgram* pixel_program);
+[[nodiscard]] bool GraphicsPipelineIdentityMatches(const PipelineCache::GraphicsPipeline& pipeline,
+                                                   const ShaderProgram&                   vertex_program,
+                                                   const ShaderProgram*                   pixel_program);
+[[nodiscard]] uint64_t GraphicsPipelineNameMismatches();
 void CreatePipelineInternal(
     GraphicContext& graphics, PipelineCache::GraphicsPipeline& pipeline,
     const PipelineRenderingState& rendering, const ShaderVertexInputInfo& vs_input_info,

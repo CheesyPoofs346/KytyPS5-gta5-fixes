@@ -14,6 +14,9 @@ struct ShaderParams {
 	std::span<const uint32_t> code;
 	std::span<const uint32_t> user_data;
 	uint64_t                  hash = 0;
+	// True when hash is the guest's declared shader checksum, false when it fell back to a hash of
+	// the code because the declared checksum was 0. Diagnostic identity only; never a cache key.
+	bool                      hash_declared = false;
 
 	[[nodiscard]] uint64_t Base() const {
 		return reinterpret_cast<uint64_t>(code.data());

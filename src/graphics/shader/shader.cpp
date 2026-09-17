@@ -190,6 +190,7 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	    .user_data = user_data,
 	    .hash      = declared_hash != 0 ? declared_hash
 	                                    : XXH3_64bits(code.data(), code.size_bytes()),
+	    .hash_declared = declared_hash != 0,
 	};
 }
 
